@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-HypeMachine discovery via API.
-Fetches popular tracks with cover art URLs.
+AubeSonore discovery orchestrator (v3 — multi-source).
+
+Aggregates tracks from:
+- HypeMachine "popular" API (legacy, kept as one source among many)
+- Curated RSS feeds (config.RSS_FEEDS) parsed by feedparser
+- Last.fm tag charts (config.LASTFM_TAGS) — fills the hip-hop angle
+- data/custom_feeds.json — arbitrary user-added RSS (e.g. rss.app)
+
+discover_manual.py (manual picks) still runs separately after this step
+via run.sh; we don't touch its UX.
+
+Dedup is done globally on a normalized (artist, title) key, capped to
+config.DISCOVER_MAX_TRACKS. Writes tracks-to-download.json with the same
+shape as before (TypedDict-compatible).
 """
 
 from __future__ import annotations
@@ -9,152 +21,184 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s"
+# Make sibling imports work both as script and as module.
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from discovery_sources import (  # noqa: E402
+    CustomFeedsSource,
+    DiscoverySource,
+    HypeMachineSource,
+    LastFMTagSource,
+    RSSFeedConfig,
+    RSSSource,
+    Track,
 )
+from settings import get_settings, validate_environment  # noqa: E402
+
+try:
+    from config import (  # noqa: E402
+        DISCOVER_MAX_TRACKS,
+        LASTFM_TAGS,
+        LASTFM_TAG_LIMIT,
+        RSS_FEEDS,
+    )
+except ImportError as e:
+    print(f"Error: config.py missing discovery fields: {e}")
+    sys.exit(1)
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-# Constants
-API_URL = "https://api.hypem.com/v2/popular"
-MAX_TRACKS = 30
-REQUEST_TIMEOUT = 30
+PIPELINE_DIR = Path(__file__).parent.parent
+OUTPUT_FILE = PIPELINE_DIR / "tracks-to-download.json"
+CUSTOM_FEEDS_FILE = PIPELINE_DIR / "data" / "custom_feeds.json"
+
+# A bigger HypeMachine batch keeps the legacy source competitive among many.
+HYPEM_COUNT = 50
 
 
-class Track(TypedDict):
-    """Track data structure."""
-    id: str
-    artist: str
-    title: str
-    cover: str | None
-    search: str
+def _normalize_key(artist: str, title: str) -> str:
+    return f"{artist.strip().lower()}|{title.strip().lower()}"
 
 
-def fetch_tracks() -> list[dict[str, Any]]:
-    """
-    Fetch tracks from HypeMachine API.
+def _build_sources() -> list[DiscoverySource]:
+    settings = get_settings()
+    sources: list[DiscoverySource] = [HypeMachineSource(count=HYPEM_COUNT)]
 
-    Returns:
-        List of track dictionaries from API response.
-    """
-    url = f"{API_URL}?mode=now&count={MAX_TRACKS}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # RSS sources from config — translated to discovery_sources.RSSFeedConfig
+    rss_cfgs = [
+        RSSFeedConfig(
+            url=spec.url,
+            parser=spec.parser,
+            link_must_contain=spec.link_must_contain,
+            label=spec.label,
+            enabled=spec.enabled,
+            limit=spec.limit,
+        )
+        for spec in RSS_FEEDS
+    ]
+    if rss_cfgs:
+        sources.append(RSSSource(feeds=rss_cfgs))
 
-    req = urllib.request.Request(url, headers=headers)
+    # Last.fm tag charts — only if API key is configured
+    if settings.lastfm_api_key and LASTFM_TAGS:
+        sources.append(
+            LastFMTagSource(
+                api_key=settings.lastfm_api_key,
+                tags=list(LASTFM_TAGS),
+                per_tag_limit=LASTFM_TAG_LIMIT,
+            )
+        )
+    elif LASTFM_TAGS and not settings.lastfm_api_key:
+        logger.warning("LASTFM_API_KEY not set — skipping Last.fm tag sources")
 
-    try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            return data if isinstance(data, list) else []
-    except urllib.error.URLError as e:
-        logger.error(f"Network error: {e.reason}")
-        return []
-    except urllib.error.HTTPError as e:
-        logger.error(f"HTTP error {e.code}: {e.reason}")
-        return []
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON response: {e}")
-        return []
-    except TimeoutError:
-        logger.error("Request timed out")
-        return []
+    # User-added custom feeds (rss.app etc.)
+    sources.append(CustomFeedsSource(path=CUSTOM_FEEDS_FILE))
+
+    return sources
 
 
-def format_tracks(raw_tracks: list[dict[str, Any]]) -> list[Track]:
-    """
-    Format raw API response into Track objects.
-
-    Args:
-        raw_tracks: Raw track data from API.
-
-    Returns:
-        List of formatted Track objects.
-    """
-    result: list[Track] = []
-
-    for track in raw_tracks:
-        artist = track.get("artist", "").strip()
-        title = track.get("title", "").strip()
-
-        if not artist or not title:
+def _dedupe_and_cap(tracks: list[Track], cap: int) -> list[Track]:
+    seen: set[str] = set()
+    out: list[Track] = []
+    for t in tracks:
+        key = _normalize_key(t["artist"], t["title"])
+        if key in seen:
             continue
-
-        result.append({
-            "id": str(track.get("itemid", "")),
-            "artist": artist,
-            "title": title,
-            "cover": track.get("thumb_url_large"),
-            "search": f"{artist} - {title}"
-        })
-
-    return result
+        seen.add(key)
+        out.append(t)
+        if len(out) >= cap:
+            break
+    return out
 
 
-def save_tracks(tracks: list[Track], output_file: Path) -> bool:
-    """
-    Save tracks to JSON file.
-
-    Args:
-        tracks: List of tracks to save.
-        output_file: Path to output JSON file.
-
-    Returns:
-        True if successful, False otherwise.
-    """
+def _save(tracks: list[Track]) -> bool:
     try:
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(tracks, f, indent=2, ensure_ascii=False)
+        # Strip our internal `source` field to keep the file shape stable for
+        # downstream consumers (download.py only reads canonical fields).
+        slim: list[dict[str, Any]] = []
+        for t in tracks:
+            slim.append({
+                "id": t["id"],
+                "artist": t["artist"],
+                "title": t["title"],
+                "cover": t["cover"],
+                "search": t["search"],
+                "source": t.get("source", ""),
+            })
+        OUTPUT_FILE.write_text(
+            json.dumps(slim, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
         return True
     except OSError as e:
-        logger.error(f"Failed to write file: {e}")
+        logger.error("Failed to write %s: %s", OUTPUT_FILE, e)
         return False
 
 
 def main() -> int:
-    """
-    Main entry point.
+    logger.info("=== Discovery (multi-source) ===")
 
-    Returns:
-        Exit code (0 for success, 1 for failure).
-    """
-    script_dir = Path(__file__).parent
-    pipeline_dir = script_dir.parent
-    output_file = pipeline_dir / "tracks-to-download.json"
-
-    logger.info("=== HypeMachine Discovery ===")
-    logger.info(f"Fetching {MAX_TRACKS} tracks...")
-
-    raw_tracks = fetch_tracks()
-
-    if not raw_tracks:
-        logger.warning("No tracks found from API")
+    is_valid, errors = validate_environment()
+    if not is_valid:
+        for err in errors:
+            logger.error("Config: %s", err)
         return 1
 
-    tracks = format_tracks(raw_tracks)
+    sources = _build_sources()
 
-    if not tracks:
-        logger.warning("No valid tracks after formatting")
+    all_tracks: list[Track] = []
+    per_source_counts: dict[str, int] = {}
+    for src in sources:
+        before = len(all_tracks)
+        try:
+            fetched = src.fetch()
+        except Exception as e:  # never let one bad source kill discovery
+            logger.warning("Source %s crashed: %s", src.__class__.__name__, e)
+            fetched = []
+        all_tracks.extend(fetched)
+        per_source_counts[src.__class__.__name__] = len(all_tracks) - before
+
+    if not all_tracks:
+        logger.warning("No tracks discovered from any source")
+        # Don't error out: rotation still needs to run. Write empty list so
+        # downstream consumers see an explicit "nothing new".
+        _save([])
+        return 0
+
+    deduped = _dedupe_and_cap(all_tracks, DISCOVER_MAX_TRACKS)
+
+    logger.info("")
+    logger.info("Per-source contribution:")
+    for name, count in per_source_counts.items():
+        logger.info("  %-24s %3d", name, count)
+    logger.info("")
+    logger.info("Total after dedup: %d (cap %d)", len(deduped), DISCOVER_MAX_TRACKS)
+
+    if not _save(deduped):
         return 1
 
-    if not save_tracks(tracks, output_file):
-        return 1
+    # Persist per-source contribution + dedup ratio for run.sh aggregation.
+    stats_path = PIPELINE_DIR / "data" / "last_discover_stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        stats_path.write_text(
+            json.dumps({
+                "raw_total": len(all_tracks),
+                "deduped_total": len(deduped),
+                "cap": DISCOVER_MAX_TRACKS,
+                "per_source": per_source_counts,
+            }, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        logger.warning("Could not write last_discover_stats.json")
 
-    logger.info(f"Found {len(tracks)} tracks")
-
-    # Display first 5 tracks
-    for track in tracks[:5]:
-        logger.info(f"  - {track['artist']} - {track['title']}")
-
-    if len(tracks) > 5:
-        logger.info(f"  ... and {len(tracks) - 5} more")
-
-    logger.info(f"\nSaved to: {output_file}")
+    logger.info("Saved to %s", OUTPUT_FILE.name)
     return 0
 
 

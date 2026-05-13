@@ -5,8 +5,6 @@ Uses Pydantic for type-safe configuration with automatic validation.
 Loads from environment variables and .env file.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 import sys
@@ -56,6 +54,16 @@ class Settings(BaseSettings):
         description="AzuraCast station ID",
     )
 
+    # Spotify API configuration (for reliable audio features)
+    spotify_client_id: str | None = Field(
+        default=None,
+        description="Spotify API Client ID",
+    )
+    spotify_client_secret: str | None = Field(
+        default=None,
+        description="Spotify API Client Secret",
+    )
+
     # Optional API keys for metadata enrichment
     acoustid_api_key: str | None = Field(
         default=None,
@@ -64,6 +72,10 @@ class Settings(BaseSettings):
     lastfm_api_key: str | None = Field(
         default=None,
         description="Last.fm API key for genre lookup",
+    )
+    discogs_token: str | None = Field(
+        default=None,
+        description="Discogs Personal Access Token (raises rate limit to 60 req/min)",
     )
 
     # Pipeline settings
@@ -181,8 +193,8 @@ def get_settings() -> Settings:
     """
     try:
         return Settings()  # type: ignore
-    except Exception as e:
-        logger.error(f"Configuration error: {e}")
+    except Exception:
+        logger.error("Configuration error", exc_info=True)
         raise
 
 
@@ -221,9 +233,13 @@ def print_config_status() -> None:
         print("Configuration Status:")
         print(f"  AzuraCast URL: {settings.azuracast_url}")
         print(f"  Station ID: {settings.azuracast_station_id}")
-        print(f"  API Key: {'*' * 8}...{settings.azuracast_api_key[-4:]}")
+        key = settings.azuracast_api_key
+        masked = f"{'*' * 8}...{key[-4:]}" if len(key) >= 4 else "***"
+        print(f"  API Key: {masked}")
+        print(f"  Spotify: {'configured' if settings.spotify_client_id and settings.spotify_client_secret else 'not set'}")
         print(f"  AcoustID: {'configured' if settings.acoustid_api_key else 'not set'}")
         print(f"  Last.fm: {'configured' if settings.lastfm_api_key else 'not set'}")
+        print(f"  Discogs: {'configured' if settings.discogs_token else 'not set (using anonymous rate limit)'}")
         print(f"  SSL Verify: {settings.ssl_verify}")
         print(f"  Debug: {settings.debug}")
 
@@ -235,8 +251,8 @@ def print_config_status() -> None:
             for error in errors:
                 print(f"    - {error}")
 
-    except Exception as e:
-        print(f"Configuration Error: {e}")
+    except Exception:
+        logger.error("Configuration error", exc_info=True)
         sys.exit(1)
 
 

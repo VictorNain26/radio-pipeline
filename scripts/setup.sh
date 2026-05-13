@@ -24,7 +24,7 @@ pip3 install --user --break-system-packages yt-dlp
 
 echo ""
 echo "[3/5] Installing Python packages..."
-pip3 install --user --break-system-packages essentia-tensorflow mutagen numpy requests
+pip3 install --user --break-system-packages essentia-tensorflow mutagen numpy requests feedparser
 
 echo ""
 echo "[4/5] Downloading Essentia mood models..."

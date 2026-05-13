@@ -13,8 +13,17 @@ numpy>=1.24.0,<2.0.0
 # Audio metadata
 mutagen>=1.47.0,<2.0.0
 
+# Fuzzy string matching for YouTube track matching
+rapidfuzz>=3.0.0,<4.0.0
+
 # Configuration
 python-dotenv>=1.0.0,<2.0.0
+
+# RSS / Atom parsing (multi-source discovery)
+feedparser>=6.0.0,<7.0.0
+
+# Development / test (optional, not needed for production runs)
+# pytest>=8.0.0
 
 # Validation
 pydantic>=2.5.0,<3.0.0

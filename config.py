@@ -1,242 +1,1141 @@
 """
-AubeSonore Radio Configuration
-Single source of truth for moods, dayparts and filtering rules.
+AubeSonore Radio Configuration v2.0
+===================================
 
-Dayparting approach: tracks are routed to playlists based on time of day
-and their detected mood/energy level.
+Architecture basée sur les meilleures pratiques 2026 :
+- Modèle Russell Circumplex (8 moods en 2D valence-arousal)
+- Dayparting granulaire (8 segments)
+- Règles de séparation professionnelles
+- Filtres audio configurables
+- Structure flexible et extensible
+
+Références:
+- Russell, J.A. (1980). A circumplex model of affect.
+- Soundcharts AI Music Analysis 2026
+- Music 1 / MusicMaster scheduling best practices
 """
 
-from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
 
-from typing import Any, Literal, TypedDict
-
-# Type definitions
-MoodType = Literal["Energetic", "Intense", "Chill", "Melancholic"]
-DaypartType = Literal["Morning_Energy", "Afternoon_Mix", "Evening_Relax", "Night_Discovery"]
-ArousalLevel = Literal["high", "low"]
-ValenceType = Literal["positive", "negative"]
-
-
-class MoodConfig(TypedDict):
-    """Configuration for a mood category."""
-    enabled: bool
-    description: str
-    arousal: ArousalLevel
-    valence: ValenceType
-
-
-class DaypartConfig(TypedDict):
-    """Configuration for a daypart playlist."""
-    enabled: bool
-    schedule: str  # Human-readable schedule
-    start_hour: int  # 24h format
-    end_hour: int  # 24h format
-    description: str
-
-
-class AudioFilters(TypedDict):
-    """Audio filtering rules."""
-    bpm_min: int | None
-    bpm_max: int | None
-    energy_max: float | None
-    duration_max: int | None  # Maximum duration in seconds
-
-
-class RotationConfig(TypedDict):
-    """Rotation/library management settings."""
-    max_tracks: int  # Maximum tracks in library
-    min_age_days: int  # Don't delete tracks younger than this
+# Constants
+AVERAGE_TRACK_DURATION_MINUTES = 3.5
 
 
 # =============================================================================
-# MOOD CONFIGURATION (for analysis)
+# ENUMS - Types de base
 # =============================================================================
-# Each mood is defined by its quadrant in the Valence-Arousal model:
-#   - Arousal: energy level (high=energetic, low=calm)
-#   - Valence: positivity (positive=happy, negative=dark)
+
+class MoodCategory(str, Enum):
+    """
+    8 catégories de mood basées sur le modèle circumplex de Russell.
+    Positionnées à 45° d'intervalle sur le plan valence-arousal.
+
+    Arousal (vertical) : niveau d'énergie/activation
+    Valence (horizontal) : positif/négatif
+    """
+    ENERGETIC = "Energetic"      # 0° - High valence, medium-high arousal
+    EXCITED = "Excited"          # 45° - High valence, high arousal
+    INTENSE = "Intense"          # 90° - Medium valence, very high arousal (peak energy)
+    ANGRY = "Angry"              # 135° - Low valence, high arousal
+    MELANCHOLIC = "Melancholic"  # 180° - Low valence, medium arousal
+    SAD = "Sad"                  # 225° - Low valence, low arousal
+    CALM = "Calm"                # 270° - Medium valence, very low arousal
+    RELAXED = "Relaxed"          # 315° - High valence, low arousal
+
+
+class DaypartSegment(str, Enum):
+    """
+    8 segments de journée pour une programmation granulaire.
+    Basé sur les habitudes d'écoute et les contextes d'usage.
+    """
+    EARLY_MORNING = "Early_Morning"      # 05:00-07:00 - Réveil doux
+    MORNING_COMMUTE = "Morning_Commute"  # 07:00-09:00 - Trajet, énergie
+    MORNING_WORK = "Morning_Work"        # 09:00-12:00 - Concentration
+    LUNCH = "Lunch"                      # 12:00-14:00 - Pause, détente
+    AFTERNOON = "Afternoon"              # 14:00-17:00 - Productivité
+    EVENING_COMMUTE = "Evening_Commute"  # 17:00-19:00 - Retour, transition
+    EVENING = "Evening"                  # 19:00-22:00 - Détente
+    NIGHT = "Night"                      # 22:00-05:00 - Calme, introspection
+
+
+class EnergyLevel(str, Enum):
+    """Niveaux d'énergie pour les transitions."""
+    VERY_LOW = "very_low"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
+
+
+class DayType(str, Enum):
+    """
+    Types de jours pour la programmation différenciée.
+
+    Basé sur les études de comportement d'écoute:
+    - Semaine: routine, trajets, productivité
+    - Vendredi: anticipation weekend, montée d'énergie
+    - Samedi: pic de fête, brunch, activités
+    - Dimanche: détente, introspection, "sunday blues"
+    """
+    WEEKDAY = "weekday"      # Lundi-Jeudi
+    FRIDAY = "friday"        # Vendredi (transition vers weekend)
+    SATURDAY = "saturday"    # Samedi (pic d'énergie/fête)
+    SUNDAY = "sunday"        # Dimanche (calme, récupération)
+
+
+# =============================================================================
+# DATACLASSES - Configurations structurées
+# =============================================================================
+
+@dataclass
+class MoodProfile:
+    """
+    Profil complet d'un mood avec ses caractéristiques.
+
+    Attributes:
+        enabled: Si le mood est actif (sinon tracks rejetées)
+        description: Description humaine
+        valence: Score valence typique (-1 à 1)
+        arousal: Score arousal typique (-1 à 1)
+        energy_level: Niveau d'énergie catégorique
+        bpm_range: Plage de BPM typique (min, max)
+        color: Couleur hex pour visualisation
+    """
+    enabled: bool = True
+    description: str = ""
+    valence: float = 0.0  # -1 (négatif) à 1 (positif)
+    arousal: float = 0.0  # -1 (calme) à 1 (énergique)
+    energy_level: EnergyLevel = EnergyLevel.MEDIUM
+    bpm_range: tuple[int, int] = (80, 140)
+    color: str = "#808080"
+
+
+@dataclass
+class DaypartProfile:
+    """
+    Configuration d'un segment de journée.
+
+    Attributes:
+        enabled: Si le daypart est actif
+        start_hour: Heure de début (0-23)
+        end_hour: Heure de fin (0-23)
+        description: Description du contexte d'écoute
+        target_moods: Moods appropriés pour ce segment
+        energy_curve: Niveau d'énergie cible
+        transition_flex: Flexibilité pour transitions (0-1)
+    """
+    enabled: bool = True
+    start_hour: int = 0
+    end_hour: int = 24
+    description: str = ""
+    target_moods: list[MoodCategory] = field(default_factory=list)
+    energy_curve: EnergyLevel = EnergyLevel.MEDIUM
+    transition_flex: float = 0.3  # 0 = strict, 1 = très flexible
+
+
+
+@dataclass
+class SeparationRules:
+    """
+    Règles de séparation pour éviter la répétition et le clustering.
+
+    Basé sur les best practices de Music 1 et MusicMaster.
+
+    Attributes:
+        artist_min_minutes: Minutes minimum entre même artiste
+        title_min_minutes: Minutes minimum entre même titre
+        tempo_max_variance: Variance BPM max entre tracks consécutives
+        energy_smooth_transition: Forcer transitions douces d'énergie
+        mood_min_separation: Tracks minimum avant répétition du même mood
+        genre_min_separation: Tracks minimum avant répétition du même genre
+    """
+    artist_min_minutes: int = 60
+    title_min_minutes: int = 180
+    tempo_max_variance: int = 25
+    energy_smooth_transition: bool = True
+    mood_min_separation: int = 3
+    genre_min_separation: int = 2
+
+
+@dataclass
+class AudioFilters:
+    """
+    Filtres audio pour la sélection des tracks.
+
+    Attributes:
+        duration_min: Durée minimum en secondes (None = désactivé)
+        duration_max: Durée maximum en secondes
+        bpm_min: BPM minimum
+        bpm_max: BPM maximum
+        min_confidence: Score de confiance minimum pour classification (0-1)
+        reject_low_quality: Rejeter les tracks avec analyse de faible qualité
+    """
+    duration_min: int | None = 60       # 1 minute minimum
+    duration_max: int | None = 420      # 7 minutes maximum
+    bpm_min: int | None = None
+    bpm_max: int | None = None
+    min_confidence: float = 0.3
+    reject_low_quality: bool = True
+
+
+@dataclass
+class RotationConfig:
+    """
+    Rotation 3-tiers pour webradio de découverte.
+
+    Tiers basés sur l'âge (uploaded_at en SQLite):
+      FRESH (0-fresh_days)         : protection totale
+      CURRENT (fresh-current_days) : supprimé si library pleine + plays >= seuil
+      FADING (current-max_age_days): proactivement réduit à max fading_max_pct%
+      EXPIRED (>max_age_days)      : force delete
+
+    Attributes:
+        max_tracks: Nombre maximum de tracks en bibliothèque
+        fresh_days: Jours de protection totale (FRESH)
+        current_days: Fin du tier CURRENT (début FADING)
+        max_age_days: Fin du tier FADING (début EXPIRED)
+        cooldown_days: Jours de cooldown avant re-download après suppression
+        fading_max_pct: Pourcentage max de la library pour les tracks FADING
+        min_plays_before_delete: Plays minimum avant suppression d'un CURRENT
+    """
+    max_tracks: int = 500
+    fresh_days: int = 14
+    current_days: int = 30
+    max_age_days: int = 50
+    cooldown_days: int = 60
+    fading_max_pct: float = 20.0
+    min_plays_before_delete: int = 3
+
+
+@dataclass
+class GenreFilterConfig:
+    """
+    Configuration du filtrage par genre via Last.fm.
+
+    Best practices 2026:
+    - Filtrage pré-téléchargement pour économiser bande passante
+    - Tags Last.fm crowd-sourcés = plus fiables que métadonnées HypeMachine
+    - Liste bloquée configurable selon la couleur sonore de la radio
+
+    Attributes:
+        enabled: Activer le filtrage par genre
+        blocked_genres: Genres à bloquer (lowercase)
+        require_tags: Rejeter les tracks sans tags Last.fm
+    """
+    enabled: bool = True
+    blocked_genres: tuple[str, ...] = (
+        # Hard/Extreme electronic (trop brutal)
+        "hardcore", "hardstyle", "hard techno", "gabber", "schranz",
+        "acid", "acid techno", "industrial techno",
+        # Industrial agressif
+        "aggrotech", "industrial metal", "industrial rock",
+        # Metal (tous)
+        "metal", "death metal", "black metal", "heavy metal",
+        "thrash metal", "doom metal", "nu metal", "groove metal",
+        "grindcore", "metalcore", "deathcore",
+        "hard rock",
+        # Noise/Experimental extreme
+        "noise", "harsh noise", "power electronics",
+        # Punk extreme
+        "hardcore punk", "crust punk",
+    )
+    require_tags: bool = False  # Si True, rejette les tracks sans tags
+
+
+@dataclass
+class AggressiveAudioFilter:
+    """
+    Filtre audio intelligent pour bloquer les tracks agressives (metal, hardcore, etc.)
+    quand Last.fm n'a pas de tags.
+
+    Best practices 2026:
+    - Utilise arousal + valence de l'analyse Essentia comme fallback
+    - Arousal élevé + valence négative = son agressif/metal
+    - S'applique uniquement si Last.fm n'a pas de tags (artistes obscurs)
+
+    Attributes:
+        enabled: Activer le filtre audio intelligent
+        arousal_threshold: Seuil arousal au-dessus duquel vérifier (0-1)
+        valence_threshold: Seuil valence en-dessous duquel bloquer (-1 à 1)
+        block_intense_mood: Bloquer aussi les tracks classées "Intense" ou "Angry"
+    """
+    enabled: bool = True
+    arousal_threshold: float = 0.65  # Arousal > 0.65 = énergique
+    valence_threshold: float = -0.2  # Valence < -0.2 = négatif/agressif
+    block_intense_mood: bool = True  # Bloquer mood "Intense" et "Angry" sans tags
+
+
+@dataclass(frozen=True)
+class MultiSignalFilterConfig:
+    """
+    Configuration du filtre multi-signal pour rejeter les morceaux agressifs.
+
+    Utilise 4 signaux indépendants :
+    1. mood_aggressive (discogs-effnet, 98% accuracy)
+    2. Arousal-Valence (MusiCNN ensemble, ~88%)
+    3. Genre ML (genre_discogs400, AUC 0.954)
+    4. Last.fm tags (crowd-sourced)
+
+    Règle de rejet : 2+ signaux concordants, OU mood_aggressive > solo_threshold.
+    S'applique uniquement aux nouveaux morceaux (ceux avec les tags multi-signal).
+    """
+    enabled: bool = True
+    min_signals_to_reject: int = 2
+    aggressive_threshold: float = 0.65
+    aggressive_solo_threshold: float = 0.85
+    av_arousal_threshold: float = 0.65
+    av_valence_threshold: float = -0.2
+    genre_blocked: frozenset[str] = frozenset({
+        "metal", "punk", "hardcore", "grindcore", "death metal",
+        "black metal", "thrash metal", "heavy metal", "industrial",
+        "noise", "power metal", "speed metal", "nu metal",
+    })
+    lastfm_blocked_tags: frozenset[str] = frozenset({
+        "aggressive", "metal", "hardcore", "screamo", "brutal",
+        "heavy metal", "death metal", "black metal", "grindcore",
+        "noise", "industrial", "thrash",
+    })
+
+
+@dataclass
+class ClassificationThresholds:
+    """
+    Seuils pour la classification des moods (legacy - kept for backward compat).
+    """
+    aggressive_threshold: float = 0.40
+    happy_threshold: float = 0.45
+    relaxed_threshold: float = 0.45
+    sad_threshold: float = 0.45
+
+    # Seuils BPM pour déterminer l'énergie
+    bpm_very_slow: int = 80
+    bpm_slow: int = 100
+    bpm_moderate: int = 115
+    bpm_fast: int = 128
+    bpm_very_fast: int = 145
+
+
+# =============================================================================
+# CONFIGURATION DES MOODS
+# =============================================================================
+
+MOODS: dict[MoodCategory, MoodProfile] = {
+    MoodCategory.ENERGETIC: MoodProfile(
+        enabled=True,
+        description="Joyeux, optimiste, dynamique - parfait pour booster l'énergie",
+        valence=0.8,
+        arousal=0.5,
+        energy_level=EnergyLevel.HIGH,
+        bpm_range=(110, 135),
+        color="#FFD700",  # Gold
+    ),
+    MoodCategory.EXCITED: MoodProfile(
+        enabled=True,
+        description="Exubérant, euphorique, festif - pics d'énergie positive",
+        valence=0.9,
+        arousal=0.9,
+        energy_level=EnergyLevel.VERY_HIGH,
+        bpm_range=(125, 150),
+        color="#FF6B35",  # Orange vif
+    ),
+    MoodCategory.INTENSE: MoodProfile(
+        enabled=True,
+        description="Puissant, driving, épique - énergie maximale",
+        valence=0.0,
+        arousal=1.0,
+        energy_level=EnergyLevel.VERY_HIGH,
+        bpm_range=(120, 160),
+        color="#DC143C",  # Crimson
+    ),
+    MoodCategory.ANGRY: MoodProfile(
+        enabled=True,
+        description="Agressif, rebelle, punk/rock - tension et puissance",
+        valence=-0.7,
+        arousal=0.8,
+        energy_level=EnergyLevel.HIGH,
+        bpm_range=(100, 180),
+        color="#8B0000",  # Dark red
+    ),
+    MoodCategory.MELANCHOLIC: MoodProfile(
+        enabled=True,
+        description="Nostalgique, introspectif, poétique - émotion profonde",
+        valence=-0.5,
+        arousal=0.0,
+        energy_level=EnergyLevel.MEDIUM,
+        bpm_range=(70, 110),
+        color="#4A0E4E",  # Purple foncé
+    ),
+    MoodCategory.SAD: MoodProfile(
+        enabled=True,
+        description="Triste, sombre, émotionnel - ballades et slow",
+        valence=-0.8,
+        arousal=-0.6,
+        energy_level=EnergyLevel.LOW,
+        bpm_range=(50, 90),
+        color="#2F4F4F",  # Dark slate
+    ),
+    MoodCategory.CALM: MoodProfile(
+        enabled=True,
+        description="Paisible, serein, ambient - repos et méditation",
+        valence=0.0,
+        arousal=-1.0,
+        energy_level=EnergyLevel.VERY_LOW,
+        bpm_range=(50, 85),
+        color="#87CEEB",  # Sky blue
+    ),
+    MoodCategory.RELAXED: MoodProfile(
+        enabled=True,
+        description="Détendu, chill, lounge - bien-être positif",
+        valence=0.6,
+        arousal=-0.5,
+        energy_level=EnergyLevel.LOW,
+        bpm_range=(70, 105),
+        color="#98FB98",  # Pale green
+    ),
+}
+
+
+# =============================================================================
+# CONFIGURATION DES DAYPARTS
+# =============================================================================
+
+DAYPARTS: dict[DaypartSegment, DaypartProfile] = {
+    DaypartSegment.EARLY_MORNING: DaypartProfile(
+        enabled=True,
+        start_hour=5,
+        end_hour=7,
+        description="Réveil en douceur - transition nuit vers jour",
+        target_moods=[MoodCategory.CALM, MoodCategory.RELAXED],
+        energy_curve=EnergyLevel.VERY_LOW,
+        transition_flex=0.2,
+    ),
+    DaypartSegment.MORNING_COMMUTE: DaypartProfile(
+        enabled=True,
+        start_hour=7,
+        end_hour=9,
+        description="Trajet du matin - boost d'énergie progressif",
+        target_moods=[MoodCategory.ENERGETIC, MoodCategory.EXCITED],
+        energy_curve=EnergyLevel.HIGH,
+        transition_flex=0.4,
+    ),
+    DaypartSegment.MORNING_WORK: DaypartProfile(
+        enabled=True,
+        start_hour=9,
+        end_hour=12,
+        description="Matinée de travail - concentration avec énergie modérée",
+        target_moods=[MoodCategory.ENERGETIC, MoodCategory.RELAXED],
+        energy_curve=EnergyLevel.MEDIUM,
+        transition_flex=0.3,
+    ),
+    DaypartSegment.LUNCH: DaypartProfile(
+        enabled=True,
+        start_hour=12,
+        end_hour=14,
+        description="Pause déjeuner - ambiance détendue et positive",
+        target_moods=[MoodCategory.RELAXED, MoodCategory.ENERGETIC, MoodCategory.EXCITED],
+        energy_curve=EnergyLevel.MEDIUM,
+        transition_flex=0.5,
+    ),
+    DaypartSegment.AFTERNOON: DaypartProfile(
+        enabled=True,
+        start_hour=14,
+        end_hour=17,
+        description="Après-midi - maintien productivité, mix varié",
+        target_moods=[MoodCategory.ENERGETIC, MoodCategory.RELAXED, MoodCategory.MELANCHOLIC],
+        energy_curve=EnergyLevel.MEDIUM,
+        transition_flex=0.4,
+    ),
+    DaypartSegment.EVENING_COMMUTE: DaypartProfile(
+        enabled=True,
+        start_hour=17,
+        end_hour=19,
+        description="Retour maison - transition travail vers détente",
+        target_moods=[MoodCategory.ENERGETIC, MoodCategory.RELAXED],
+        energy_curve=EnergyLevel.MEDIUM,
+        transition_flex=0.4,
+    ),
+    DaypartSegment.EVENING: DaypartProfile(
+        enabled=True,
+        start_hour=19,
+        end_hour=22,
+        description="Soirée - détente, émotions, découverte",
+        target_moods=[MoodCategory.RELAXED, MoodCategory.MELANCHOLIC, MoodCategory.SAD, MoodCategory.CALM, MoodCategory.ANGRY],
+        energy_curve=EnergyLevel.LOW,
+        transition_flex=0.5,
+    ),
+    DaypartSegment.NIGHT: DaypartProfile(
+        enabled=True,
+        start_hour=22,
+        end_hour=5,
+        description="Nuit - ambiance intime, introspection, découverte",
+        target_moods=[MoodCategory.CALM, MoodCategory.SAD, MoodCategory.MELANCHOLIC, MoodCategory.INTENSE, MoodCategory.ANGRY],
+        energy_curve=EnergyLevel.LOW,
+        transition_flex=0.6,
+    ),
+}
+
+
+# =============================================================================
+# CONFIGURATION PAR JOUR DE LA SEMAINE
+# =============================================================================
 #
-# Set enabled=False to reject tracks of that mood (won't be uploaded)
-
-MOODS: dict[MoodType, MoodConfig] = {
-    "Energetic": {
-        "enabled": True,
-        "description": "Upbeat, happy, dynamic (high energy + positive)",
-        "arousal": "high",
-        "valence": "positive",
-    },
-    "Intense": {
-        "enabled": True,
-        "description": "Punk, rock, aggressive (high energy + negative)",
-        "arousal": "high",
-        "valence": "negative",
-    },
-    "Chill": {
-        "enabled": True,
-        "description": "Relaxed, lounge, ambient (low energy + positive)",
-        "arousal": "low",
-        "valence": "positive",
-    },
-    "Melancholic": {
-        "enabled": True,
-        "description": "Emotional, introspective, sad (low energy + negative)",
-        "arousal": "low",
-        "valence": "negative",
-    },
-}
-
-# =============================================================================
-# DAYPART CONFIGURATION (for playlists)
-# =============================================================================
-# Professional radio approach: playlists scheduled by time of day
-# Each track is assigned to dayparts based on its mood
-
-DAYPARTS: dict[DaypartType, DaypartConfig] = {
-    "Morning_Energy": {
-        "enabled": True,
-        "schedule": "06:00 - 12:00",
-        "start_hour": 6,
-        "end_hour": 12,
-        "description": "Energetic start to the day - upbeat and dynamic tracks",
-    },
-    "Afternoon_Mix": {
-        "enabled": True,
-        "schedule": "12:00 - 18:00",
-        "start_hour": 12,
-        "end_hour": 18,
-        "description": "Varied mix for work hours - all moods in rotation",
-    },
-    "Evening_Relax": {
-        "enabled": True,
-        "schedule": "18:00 - 00:00",
-        "start_hour": 18,
-        "end_hour": 0,
-        "description": "Wind down - chill and emotional tracks",
-    },
-    "Night_Discovery": {
-        "enabled": True,
-        "schedule": "00:00 - 06:00",
-        "start_hour": 0,
-        "end_hour": 6,
-        "description": "Late night vibes - energetic and intense for night owls",
-    },
-}
-
-# =============================================================================
-# MOOD TO DAYPART MAPPING
-# =============================================================================
-# Which daypart playlists should receive tracks of each mood
-# A track can be assigned to multiple dayparts
-
-MOOD_TO_DAYPARTS: dict[MoodType, list[DaypartType]] = {
-    "Energetic": ["Morning_Energy", "Afternoon_Mix", "Night_Discovery"],
-    "Intense": ["Morning_Energy", "Afternoon_Mix", "Night_Discovery"],
-    "Chill": ["Afternoon_Mix", "Evening_Relax"],
-    "Melancholic": ["Afternoon_Mix", "Evening_Relax"],
-}
-
-# =============================================================================
-# AUDIO FILTERS (additional rejection rules)
-# =============================================================================
-# Tracks outside these ranges will be rejected
-# Set to None to disable a filter
-
-AUDIO_FILTERS: AudioFilters = {
-    "bpm_min": None,      # Disabled for now
-    "bpm_max": None,      # Disabled for now
-    "energy_max": None,   # Disabled for now
-    "duration_max": 360,  # 6 minutes max
-}
-
-# =============================================================================
-# ROTATION CONFIGURATION (library management)
-# =============================================================================
-# Controls how tracks are rotated to maintain freshness while ensuring
-# each track has time to be played before removal.
-
-ROTATION: RotationConfig = {
-    "max_tracks": 450,    # Maximum tracks in AzuraCast library
-    "min_age_days": 7,    # Never delete tracks younger than 7 days
-}
+# Overrides par type de jour. Seuls les dayparts avec des différences sont listés.
+# Les dayparts non mentionnés utilisent la config de base (DAYPARTS).
+#
+# Architecture basée sur:
+# - Nielsen Audio weekday vs weekend listening patterns
+# - Spotify diurnal cycle research
+# - Radio programming best practices (MusicMaster, Music 1)
 
 
 # =============================================================================
-# HELPERS
+# INSTANCES DE CONFIGURATION
 # =============================================================================
 
-def get_enabled_moods() -> list[MoodType]:
-    """Return list of enabled mood names."""
-    return [name for name, config in MOODS.items() if config["enabled"]]
+# Règles de séparation — valeurs de RÉFÉRENCE pour la config AzuraCast AutoDJ.
+# Ces règles ne sont PAS appliquées par le pipeline Python (classify.py).
+# Elles documentent les paramètres à configurer dans AzuraCast > AutoDJ > Scheduling.
+# La fonction check_separation_rules() peut être appelée pour du monitoring/debug.
+SEPARATION = SeparationRules(
+    artist_min_minutes=60,        # 1 heure entre même artiste
+    title_min_minutes=180,        # 3 heures entre même titre
+    tempo_max_variance=25,        # ±25 BPM entre tracks consécutives
+    energy_smooth_transition=True,
+    mood_min_separation=3,        # 3 tracks avant de répéter un mood
+    genre_min_separation=2,
+)
+
+# Filtres audio
+AUDIO_FILTERS = AudioFilters(
+    duration_min=60,    # 1 minute minimum
+    duration_max=420,   # 7 minutes maximum
+    bpm_min=None,
+    bpm_max=None,
+    min_confidence=0.3,
+    reject_low_quality=True,
+)
+
+# Rotation de la bibliothèque (3-tiers)
+ROTATION = RotationConfig(
+    max_tracks=600,
+    fresh_days=10,
+    current_days=30,
+    max_age_days=50,
+    cooldown_days=60,
+    fading_max_pct=20.0,
+    min_plays_before_delete=3,
+)
+
+# =============================================================================
+# DISCOVERY — Sources de découverte multi-RSS + Last.fm
+# =============================================================================
+#
+# Architecture (mai 2026) :
+# - HypeMachine reste actif comme une source parmi d'autres
+# - Sources RSS curated alignées sur l'esthétique AubeSonore
+#   (indie / electronic / ambient / hip-hop)
+# - Last.fm tag.gettoptracks comble les angles morts (notamment hip-hop)
+# - data/manual_picks.json : injection manuelle (existant)
+# - data/custom_feeds.json : URLs RSS arbitraires (ex. rss.app) — modifiable
+#   sans toucher au code
+# =============================================================================
 
 
-def get_enabled_dayparts() -> list[DaypartType]:
-    """Return list of enabled daypart names."""
-    return [name for name, config in DAYPARTS.items() if config["enabled"]]
+@dataclass
+class RSSFeedSpec:
+    """Specification d'un feed RSS pour la découverte."""
+    url: str
+    parser: str = "dash"                  # "dash", "tilde", "dash_quoted"
+    link_must_contain: str | None = None  # filtre sur le path du <link>
+    label: str = ""
+    enabled: bool = True
+    limit: int = 30
 
 
-def get_dayparts_for_mood(mood_name: str) -> list[DaypartType]:
+# Sources RSS curated.
+# Chaque source enrichit tracks-to-download.json. Le pipeline déduplique sur
+# (artist, title) après normalisation, donc des sources qui se recoupent
+# (ex. Pitchfork × Stereogum × Gorilla vs Bear) ne posent pas de problème.
+RSS_FEEDS: tuple[RSSFeedSpec, ...] = (
+    RSSFeedSpec(
+        url="https://www.gorillavsbear.net/feed/",
+        parser="dash",
+        label="gorillavsbear",
+        limit=25,
+    ),
+    RSSFeedSpec(
+        url="https://acloserlisten.com/feed/",
+        parser="tilde",
+        label="acloserlisten",
+        limit=15,
+    ),
+    RSSFeedSpec(
+        url="https://www.stereogum.com/feed/",
+        parser="dash_quoted",
+        link_must_contain="/music/",
+        label="stereogum",
+        limit=30,
+    ),
+    RSSFeedSpec(
+        # Pitchfork "Track Reviews" feed. Le <title> contient seulement le
+        # morceau ; l'artiste est dans le slug du <link>. Parser dédié.
+        # Voir https://pitchfork.com/info/rss/ pour la liste à jour.
+        url="https://pitchfork.com/feed/feed-track-reviews/rss",
+        parser="pitchfork",
+        label="pitchfork-tracks",
+        limit=20,
+    ),
+)
+
+
+# Tags Last.fm dont on tire les top tracks (gettoptracks).
+# Mix indie / electro / ambient + hip-hop demandé.
+# Chaque tag retourne jusqu'à LASTFM_TAG_LIMIT tracks par run.
+LASTFM_TAGS: tuple[str, ...] = (
+    "indie",
+    "electronic",
+    "ambient",
+    "hip-hop",
+    "downtempo",
+    "dream pop",
+    "trip hop",
+    "indietronica",
+    "shoegaze",
+)
+LASTFM_TAG_LIMIT: int = 15
+
+# Plafond global de tracks remontées par l'étape discover (toutes sources
+# confondues, après dédup). Évite que le pipeline soit submergé un jour de
+# RSS bavards.
+DISCOVER_MAX_TRACKS: int = 120
+
+
+# =============================================================================
+# GENRE — Allowlist (multi-source : MusicBrainz + Discogs + Last.fm)
+# =============================================================================
+#
+# Politique du genre_client (best practices 2026) :
+#   1. blocklist hit (UNION des 3 sources) → rejet immédiat
+#   2. allowlist hit (UNION des 3 sources) → accept (passe le filtre)
+#   3. aucun tag retourné → accept (downstream Essentia AGGRESSIVE_FILTER prend
+#      le relais sur l'audio)
+#
+# MusicBrainz fournit la taxonomie canonique (genre + tag).
+# Discogs domine sur électronique/hip-hop/jazz (genre + style).
+# Last.fm couvre l'obscur (crowd-sourced).
+# =============================================================================
+
+ALLOWED_GENRES: tuple[str, ...] = (
+    # Indie / alternative
+    "indie", "indie rock", "indie pop", "indie folk", "alternative", "alternative rock",
+    "art pop", "bedroom pop", "dream pop", "shoegaze", "slowcore",
+    "post-rock", "math rock", "chamber pop",
+    # Electronic
+    "electronic", "electronica", "indietronica", "synthpop", "synth-pop",
+    "synthwave", "chillwave", "vaporwave", "future bass", "idm",
+    "downtempo", "trip hop", "trip-hop", "deep house", "house", "techno",
+    "minimal techno", "ambient techno", "uk garage", "garage", "footwork",
+    "drum and bass", "dnb", "broken beat",
+    # Ambient / cinematic
+    "ambient", "drone", "modern classical", "neoclassical", "post-classical",
+    "soundscape", "field recordings", "minimalism", "ambient pop",
+    # Hip-hop / R&B / Soul
+    "hip hop", "hip-hop", "rap", "alternative hip hop", "experimental hip hop",
+    "neo soul", "soul", "r&b", "rnb", "contemporary r&b", "afrobeat", "afro soul",
+    # Jazz-adjacent
+    "jazz", "nu jazz", "jazz fusion",
+    # Folk / acoustic
+    "folk", "freak folk", "psych folk", "americana",
+    # Pop-ish that fits the radio
+    "pop", "electro pop", "electropop",
+    # Lo-fi
+    "lo-fi", "lofi", "lo-fi hip hop", "bedroom",
+)
+
+
+# Filtre de genre (Last.fm) - pré-téléchargement
+GENRE_FILTER = GenreFilterConfig(
+    enabled=True,
+    blocked_genres=(
+        # Hard/Extreme electronic (trop brutal)
+        "hardcore", "hardstyle", "hard techno", "gabber", "schranz",
+        "acid", "acid techno", "industrial techno",
+        # Industrial agressif
+        "aggrotech", "industrial metal", "industrial rock",
+        # Metal (tous)
+        "metal", "death metal", "black metal", "heavy metal",
+        "thrash metal", "doom metal", "nu metal", "groove metal",
+        "grindcore", "metalcore", "deathcore",
+        "hard rock",
+        # Noise/Experimental extreme
+        "noise", "harsh noise", "power electronics",
+        # Punk extreme
+        "hardcore punk", "crust punk",
+    ),
+    require_tags=False,
+)
+
+# Filtre audio intelligent (fallback quand Last.fm n'a pas de tags)
+# Bloque les tracks agressives détectées par Essentia (arousal élevé + valence négative)
+AGGRESSIVE_FILTER = AggressiveAudioFilter(
+    enabled=True,
+    arousal_threshold=0.65,   # Arousal > 0.65 = très énergique
+    valence_threshold=-0.2,   # Valence < -0.2 = négatif/agressif
+    block_intense_mood=False,  # Désactivé : le filtre multi-signal gère les tracks agressives
+)
+
+# Filtre multi-signal (nouveaux morceaux uniquement)
+# Combine 4 signaux indépendants pour rejeter les tracks agressives
+MULTI_SIGNAL_FILTER = MultiSignalFilterConfig()
+
+# Seuils de classification
+THRESHOLDS = ClassificationThresholds(
+    aggressive_threshold=0.40,
+    happy_threshold=0.45,
+    relaxed_threshold=0.45,
+    sad_threshold=0.45,
+    bpm_very_slow=80,
+    bpm_slow=100,
+    bpm_moderate=115,
+    bpm_fast=128,
+    bpm_very_fast=145,
+)
+
+
+# =============================================================================
+# FONCTIONS UTILITAIRES
+# =============================================================================
+
+def get_enabled_moods() -> list[MoodCategory]:
+    """Retourne la liste des moods activés."""
+    return [mood for mood, profile in MOODS.items() if profile.enabled]
+
+
+def get_enabled_dayparts() -> list[DaypartSegment]:
+    """Retourne la liste des dayparts activés."""
+    return [dp for dp, profile in DAYPARTS.items() if profile.enabled]
+
+
+def get_mood_profile(mood: MoodCategory | str) -> MoodProfile | None:
     """
-    Get daypart playlists for a mood.
+    Récupère le profil d'un mood.
 
     Args:
-        mood_name: Name of the mood.
+        mood: MoodCategory ou nom du mood
 
     Returns:
-        List of daypart names to assign the track to.
+        MoodProfile ou None si non trouvé
     """
-    if mood_name not in MOOD_TO_DAYPARTS:
-        return []
-    # Filter to only enabled dayparts
-    return [dp for dp in MOOD_TO_DAYPARTS[mood_name] if DAYPARTS[dp]["enabled"]]  # type: ignore[literal-required]
+    if isinstance(mood, str):
+        try:
+            mood = MoodCategory(mood)
+        except ValueError:
+            return None
+    return MOODS.get(mood)
 
 
-def is_mood_enabled(mood_name: str) -> bool:
+def get_day_type(weekday: int) -> DayType:
     """
-    Check if a mood is enabled.
+    Convertit un numéro de jour en DayType.
 
     Args:
-        mood_name: Name of the mood.
+        weekday: 0=Lundi, 1=Mardi, ..., 6=Dimanche (format datetime.weekday())
 
     Returns:
-        True if mood exists and is enabled.
+        DayType correspondant
     """
-    return mood_name in MOODS and MOODS[mood_name]["enabled"]  # type: ignore[literal-required]
+    match weekday:
+        case 4:
+            return DayType.FRIDAY
+        case 5:
+            return DayType.SATURDAY
+        case 6:
+            return DayType.SUNDAY
+        case _:
+            return DayType.WEEKDAY
+
+
+def get_current_day_type() -> DayType:
+    """Retourne le DayType pour aujourd'hui."""
+    return get_day_type(datetime.now().weekday())
+
+
+def get_daypart_for_hour(hour: int) -> DaypartSegment | None:
+    """
+    Trouve le daypart correspondant à une heure donnée.
+
+    Args:
+        hour: Heure (0-23)
+
+    Returns:
+        DaypartSegment ou None
+    """
+    for segment, profile in DAYPARTS.items():
+        if not profile.enabled:
+            continue
+
+        start = profile.start_hour
+        end = profile.end_hour
+
+        # Gestion du passage minuit (ex: 22:00 - 05:00)
+        if start > end:
+            if hour >= start or hour < end:
+                return segment
+        else:
+            if start <= hour < end:
+                return segment
+
+    return None
+
+
+def get_effective_daypart_profile(
+    daypart: DaypartSegment,
+    day_type: DayType | None = None
+) -> DaypartProfile:
+    """
+    Récupère le profil d'un daypart.
+
+    Args:
+        daypart: Le segment de journée
+        day_type: Ignoré (gardé pour compatibilité)
+
+    Returns:
+        DaypartProfile
+    """
+    return DAYPARTS[daypart]
+
+
+def get_dayparts_for_mood(
+    mood: MoodCategory | str,
+    day_type: DayType | None = None
+) -> list[DaypartSegment]:
+    """
+    Trouve tous les dayparts qui acceptent un mood donné.
+
+    Args:
+        mood: MoodCategory ou nom du mood
+        day_type: Ignoré (gardé pour compatibilité)
+
+    Returns:
+        Liste des DaypartSegment compatibles
+    """
+    if isinstance(mood, str):
+        try:
+            mood = MoodCategory(mood)
+        except ValueError:
+            return []
+
+    return [
+        segment for segment, profile in DAYPARTS.items()
+        if profile.enabled and mood in profile.target_moods
+    ]
+
+
+def is_mood_enabled(mood: MoodCategory | str) -> bool:
+    """Vérifie si un mood est activé."""
+    profile = get_mood_profile(mood)
+    return profile is not None and profile.enabled
+
+
+def get_energy_order() -> list[EnergyLevel]:
+    """Retourne les niveaux d'énergie dans l'ordre croissant."""
+    return [
+        EnergyLevel.VERY_LOW,
+        EnergyLevel.LOW,
+        EnergyLevel.MEDIUM,
+        EnergyLevel.HIGH,
+        EnergyLevel.VERY_HIGH,
+    ]
+
+
+def is_smooth_energy_transition(from_energy: EnergyLevel, to_energy: EnergyLevel) -> bool:
+    """
+    Vérifie si la transition d'énergie est douce (max 1 niveau de différence).
+
+    Args:
+        from_energy: Niveau d'énergie de départ
+        to_energy: Niveau d'énergie d'arrivée
+
+    Returns:
+        True si la transition est acceptable
+    """
+    order = get_energy_order()
+    from_idx = order.index(from_energy)
+    to_idx = order.index(to_energy)
+    return abs(from_idx - to_idx) <= 1
 
 
 def should_reject_track(features: dict[str, Any]) -> tuple[bool, str | None]:
     """
-    Check if a track should be rejected based on filters.
+    Vérifie si une track doit être rejetée selon les filtres configurés.
 
     Args:
-        features: Track features dictionary with keys:
+        features: Dictionnaire contenant:
             - mood: str | None
             - bpm: int
-            - energy: float
+            - duration: int (secondes)
+            - confidence: float (0-1)
 
     Returns:
-        Tuple of (reject: bool, reason: str or None)
+        Tuple (reject: bool, reason: str | None)
     """
-    # Check mood enabled
+    # 1. Vérifier si le mood est activé
     mood = features.get("mood")
     if mood and not is_mood_enabled(mood):
-        return True, f"mood '{mood}' is disabled"
+        return True, f"mood '{mood}' désactivé"
 
-    # Check BPM range (if filters are set)
-    bpm = features.get("bpm", 0)
-    if AUDIO_FILTERS["bpm_min"] is not None and bpm < AUDIO_FILTERS["bpm_min"]:
-        return True, f"BPM too low ({bpm})"
-    if AUDIO_FILTERS["bpm_max"] is not None and bpm > AUDIO_FILTERS["bpm_max"]:
-        return True, f"BPM too high ({bpm})"
-
-    # Check energy (if filter is set)
-    energy = features.get("energy", 0.0)
-    if AUDIO_FILTERS["energy_max"] is not None and energy > AUDIO_FILTERS["energy_max"]:
-        return True, f"too aggressive (energy={energy:.2f})"
-
-    # Check duration (if filter is set)
+    # 2. Vérifier la durée
     duration = features.get("duration", 0)
-    if AUDIO_FILTERS["duration_max"] is not None and duration > AUDIO_FILTERS["duration_max"]:
-        minutes = duration // 60
-        seconds = duration % 60
-        return True, f"too long ({minutes}:{seconds:02d})"
+    if AUDIO_FILTERS.duration_min and duration < AUDIO_FILTERS.duration_min:
+        mins, secs = divmod(int(duration), 60)
+        return True, f"trop court ({mins}:{secs:02d})"
+
+    if AUDIO_FILTERS.duration_max and duration > AUDIO_FILTERS.duration_max:
+        mins, secs = divmod(int(duration), 60)
+        return True, f"trop long ({mins}:{secs:02d})"
+
+    # 3. Vérifier le BPM
+    bpm = features.get("bpm", 0)
+    if AUDIO_FILTERS.bpm_min and bpm < AUDIO_FILTERS.bpm_min:
+        return True, f"BPM trop bas ({bpm})"
+
+    if AUDIO_FILTERS.bpm_max and bpm > AUDIO_FILTERS.bpm_max:
+        return True, f"BPM trop haut ({bpm})"
+
+    # 4. Vérifier la confiance de classification
+    confidence = features.get("confidence", 1.0)
+    if AUDIO_FILTERS.min_confidence and confidence < AUDIO_FILTERS.min_confidence:
+        return True, f"confiance trop basse ({confidence:.2f})"
+
+    # 5. Vérifier si le mood a des dayparts assignés
+    if mood:
+        if not get_dayparts_for_mood(mood):
+            return True, f"aucun créneau pour mood '{mood}'"
 
     return False, None
+
+
+def check_separation_rules(
+    new_track: dict[str, Any],
+    recent_tracks: list[dict[str, Any]],
+    minutes_since_last: float = 0
+) -> tuple[bool, str | None]:
+    """
+    Vérifie les règles de séparation pour une nouvelle track.
+
+    NOTE: Cette fonction n'est PAS appelée par le pipeline de classification.
+    Les règles de séparation sont appliquées par AzuraCast AutoDJ au moment
+    du scheduling. Cette fonction est disponible pour du monitoring ou debug.
+
+    Args:
+        new_track: Track à vérifier (artist, title, bpm, mood, energy_level)
+        recent_tracks: Liste des tracks récentes (plus récente en premier)
+        minutes_since_last: Minutes depuis la dernière track
+
+    Returns:
+        Tuple (can_play: bool, violation: str | None)
+    """
+    if not recent_tracks:
+        return True, None
+
+    new_artist = new_track.get("artist", "").lower()
+    new_title = new_track.get("title", "").lower()
+    new_bpm = new_track.get("bpm", 0)
+    new_mood = new_track.get("mood", "")
+    new_energy = new_track.get("energy_level", EnergyLevel.MEDIUM)
+
+    # 1. Vérifier séparation artiste
+    for i, track in enumerate(recent_tracks):
+        track_artist = track.get("artist", "").lower()
+        if track_artist and track_artist == new_artist:
+            # Estimer le temps écoulé (approximation: 3.5 min par track)
+            estimated_minutes = i * AVERAGE_TRACK_DURATION_MINUTES + minutes_since_last
+            if estimated_minutes < SEPARATION.artist_min_minutes:
+                return False, f"artiste trop récent ({new_artist})"
+
+    # 2. Vérifier séparation titre
+    for i, track in enumerate(recent_tracks):
+        track_title = track.get("title", "").lower()
+        if track_title and track_title == new_title:
+            estimated_minutes = i * AVERAGE_TRACK_DURATION_MINUTES + minutes_since_last
+            if estimated_minutes < SEPARATION.title_min_minutes:
+                return False, f"titre trop récent"
+
+    # 3. Vérifier variance de tempo (seulement vs la track précédente)
+    if SEPARATION.tempo_max_variance and new_bpm > 0:
+        last_bpm = recent_tracks[0].get("bpm", 0)
+        if last_bpm > 0:
+            variance = abs(new_bpm - last_bpm)
+            if variance > SEPARATION.tempo_max_variance:
+                return False, f"saut de tempo trop grand ({last_bpm} → {new_bpm})"
+
+    # 4. Vérifier transition d'énergie douce
+    if SEPARATION.energy_smooth_transition:
+        last_energy = recent_tracks[0].get("energy_level", EnergyLevel.MEDIUM)
+        if isinstance(last_energy, str):
+            try:
+                last_energy = EnergyLevel(last_energy)
+            except ValueError:
+                last_energy = EnergyLevel.MEDIUM
+        if isinstance(new_energy, str):
+            try:
+                new_energy = EnergyLevel(new_energy)
+            except ValueError:
+                new_energy = EnergyLevel.MEDIUM
+
+        if not is_smooth_energy_transition(last_energy, new_energy):
+            return False, f"transition d'énergie trop brutale ({last_energy.value} → {new_energy.value})"
+
+    # 5. Vérifier séparation de mood
+    if SEPARATION.mood_min_separation and new_mood:
+        same_mood_count = 0
+        for i, track in enumerate(recent_tracks[:SEPARATION.mood_min_separation]):
+            if track.get("mood") == new_mood:
+                same_mood_count += 1
+        if same_mood_count >= SEPARATION.mood_min_separation:
+            return False, f"mood '{new_mood}' trop fréquent"
+
+    return True, None
+
+
+def get_playlist_name(daypart: DaypartSegment, day_type: DayType | None = None) -> str:
+    """
+    Génère le nom de playlist pour un daypart.
+
+    Args:
+        daypart: Le segment de journée
+        day_type: Ignoré (gardé pour compatibilité)
+
+    Returns:
+        Nom de la playlist (ex: "Evening")
+    """
+    return daypart.value
+
+
+def get_all_playlist_names() -> list[str]:
+    """
+    Génère les noms des 8 playlists daypart (sans variantes jour).
+
+    Returns:
+        Liste des 8 noms de playlists
+    """
+    return [daypart.value for daypart in get_enabled_dayparts()]
+
+
+def print_day_schedule(day_type: DayType) -> None:
+    """
+    Affiche le planning pour un type de jour.
+
+    Args:
+        day_type: Type de jour à afficher
+    """
+    day_names = {
+        DayType.WEEKDAY: "LUNDI-JEUDI",
+        DayType.FRIDAY: "VENDREDI",
+        DayType.SATURDAY: "SAMEDI",
+        DayType.SUNDAY: "DIMANCHE",
+    }
+
+    print(f"\n{'='*60}")
+    print(f"  {day_names[day_type]}")
+    print(f"{'='*60}")
+
+    for segment in DaypartSegment:
+        profile = get_effective_daypart_profile(segment, day_type)
+        if not profile.enabled:
+            continue
+
+        # Format horaire
+        start = f"{profile.start_hour:02d}:00"
+        end = f"{profile.end_hour:02d}:00"
+        time_str = f"{start}-{end}"
+
+        # Moods
+        moods = ", ".join(m.value for m in profile.target_moods[:3])
+        if len(profile.target_moods) > 3:
+            moods += "..."
+
+        # Énergie
+        energy = profile.energy_curve.value.upper()
+
+        print(f"  {time_str:12} │ {segment.value:17} │ {energy:10} │ {moods}")
+
+    print(f"{'='*60}")
+
+
+def format_duration(seconds: int) -> str:
+    """Formate une durée en MM:SS."""
+    mins, secs = divmod(seconds, 60)
+    return f"{mins}:{secs:02d}"
+
+
+def format_bpm_range(bpm_range: tuple[int, int]) -> str:
+    """Formate une plage de BPM."""
+    return f"{bpm_range[0]}-{bpm_range[1]}"
+
+
+# =============================================================================
+# VALIDATION DE CONFIGURATION
+# =============================================================================
+
+def validate_config() -> tuple[bool, list[str]]:
+    """
+    Valide la cohérence de la configuration.
+
+    Returns:
+        Tuple (is_valid: bool, errors: list[str])
+    """
+    errors = []
+
+    # 1. Au moins un mood activé
+    enabled_moods = get_enabled_moods()
+    if not enabled_moods:
+        errors.append("Aucun mood activé")
+
+    # 2. Au moins un daypart activé
+    enabled_dayparts = get_enabled_dayparts()
+    if not enabled_dayparts:
+        errors.append("Aucun daypart activé")
+
+    # 3. Chaque mood activé doit avoir au moins un daypart
+    for mood in enabled_moods:
+        dayparts = get_dayparts_for_mood(mood)
+        if not dayparts:
+            errors.append(f"Mood '{mood.value}' n'a aucun daypart assigné")
+
+    # 4. Chaque daypart doit avoir au moins un mood
+    for segment, profile in DAYPARTS.items():
+        if profile.enabled and not profile.target_moods:
+            errors.append(f"Daypart '{segment.value}' n'a aucun mood cible")
+
+    # 5. Vérifier cohérence des horaires (couverture 24h)
+    covered_hours = set()
+    for segment, profile in DAYPARTS.items():
+        if not profile.enabled:
+            continue
+        start, end = profile.start_hour, profile.end_hour
+        if start > end:  # Passage minuit
+            covered_hours.update(range(start, 24))
+            covered_hours.update(range(0, end))
+        else:
+            covered_hours.update(range(start, end))
+
+    missing_hours = set(range(24)) - covered_hours
+    if missing_hours:
+        errors.append(f"Heures non couvertes: {sorted(missing_hours)}")
+
+    # 6. Vérifier filtres audio cohérents
+    if AUDIO_FILTERS.duration_min and AUDIO_FILTERS.duration_max:
+        if AUDIO_FILTERS.duration_min >= AUDIO_FILTERS.duration_max:
+            errors.append("duration_min doit être < duration_max")
+
+    if AUDIO_FILTERS.bpm_min and AUDIO_FILTERS.bpm_max:
+        if AUDIO_FILTERS.bpm_min >= AUDIO_FILTERS.bpm_max:
+            errors.append("bpm_min doit être < bpm_max")
+
+    return len(errors) == 0, errors
+
+
