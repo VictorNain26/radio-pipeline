@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AubeSonore Radio Pipeline
-# HypeMachine → yt-dlp → Librosa → AzuraCast
+# HypeMachine → yt-dlp → Essentia/MTG → AzuraCast
 #
 # Features:
 # - Lock file to prevent concurrent execution
@@ -12,13 +12,22 @@
 
 set -euo pipefail
 
+# Restrict file permissions: owner rw, group/other none
+umask 077
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Configuration
 LOCK_FILE="/tmp/radio-pipeline.lock"
 LOG_FILE="$SCRIPT_DIR/pipeline.log"
+STATS_FILE="$SCRIPT_DIR/data/pipeline_stats.json"
 MAX_LOCK_AGE=7200  # 2 hours in seconds
+
+# ntfy.sh configuration (free push notifications)
+# Set NTFY_TOPIC in .env to enable (e.g. NTFY_TOPIC=aubesonore-pipeline)
+# Notifications sent to https://ntfy.sh/$NTFY_TOPIC
+NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -36,24 +45,93 @@ log_warn() { log "WARN" "$@"; }
 log_error() { log "ERROR" "$@"; }
 
 # -----------------------------------------------------------------------------
+# Notifications (ntfy.sh - free push notifications)
+# -----------------------------------------------------------------------------
+notify() {
+    local title="$1"
+    local message="$2"
+    local priority="${3:-default}"
+    local tags="${4:-}"
+
+    # Only send if NTFY_TOPIC is configured
+    if [ -z "${NTFY_TOPIC:-}" ]; then
+        return 0
+    fi
+
+    curl -s \
+        -H "Title: $title" \
+        -H "Priority: $priority" \
+        -H "Tags: $tags" \
+        -d "$message" \
+        "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1 || true
+}
+
+write_stats() {
+    local status="$1"
+    local downloads="${2:-0}"
+    local uploads="${3:-0}"
+    local errors="${4:-}"
+
+    mkdir -p "$(dirname "$STATS_FILE")"
+    python3 - "$status" "$downloads" "$uploads" "$errors" "$STATS_FILE" "$SCRIPT_DIR/data" <<'PYEOF'
+import json, sys, time
+from datetime import datetime
+from pathlib import Path
+
+status, downloads, uploads, errors, stats_file, data_dir = sys.argv[1:7]
+data_path = Path(data_dir)
+
+def _read(name):
+    try:
+        return json.loads((data_path / name).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+discover = _read("last_discover_stats.json")
+dl_breakdown = _read("last_download_stats.json")
+
+stats = {
+    "timestamp": datetime.now().isoformat(),
+    "epoch": time.time(),
+    "status": status,
+    "downloads": int(downloads),
+    "uploads": int(uploads),
+    "errors": errors or None,
+    "discover": discover,           # raw_total, deduped_total, per_source
+    "download_breakdown": dl_breakdown,  # downloaded/skipped/filtered/blocked/failed
+}
+try:
+    with open(stats_file) as f:
+        history = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    history = []
+history.append(stats)
+history = history[-30:]
+with open(stats_file, "w") as f:
+    json.dump(history, f, indent=2)
+PYEOF
+}
+
+# -----------------------------------------------------------------------------
 # Cleanup function
 # -----------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
 
-    # Remove lock file
-    if [ -f "$LOCK_FILE" ]; then
-        rm -f "$LOCK_FILE"
-        log_info "Lock file removed"
-    fi
+    # Release lock (fd 200 is closed automatically)
+    rm -f "$LOCK_FILE"
 
-    # Clean temp files
-    if [ -d "$SCRIPT_DIR/temp" ]; then
-        rm -rf "$SCRIPT_DIR/temp"
-    fi
+    # Clean all temp directories
+    for d in "$SCRIPT_DIR/temp" "$SCRIPT_DIR/temp_reanalyze" "$SCRIPT_DIR/temp_reanalyze_server" "$SCRIPT_DIR/temp_playlist_setup"; do
+        if [ -d "$d" ]; then
+            rm -rf "$d"
+        fi
+    done
 
     if [ $exit_code -ne 0 ]; then
         log_error "Pipeline failed with exit code $exit_code"
+        write_stats "failed" 0 0 "Exit code $exit_code"
+        notify "AubeSonore Pipeline FAILED" "Pipeline crashed with exit code $exit_code. Check logs." "urgent" "rotating_light"
     fi
 
     exit $exit_code
@@ -62,27 +140,17 @@ cleanup() {
 trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
-# Lock file management
+# Lock file management (atomic via flock)
 # -----------------------------------------------------------------------------
 acquire_lock() {
-    # Check for stale lock
-    if [ -f "$LOCK_FILE" ]; then
-        local lock_age
-        lock_age=$(( $(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0) ))
-
-        if [ "$lock_age" -gt "$MAX_LOCK_AGE" ]; then
-            log_warn "Removing stale lock file (age: ${lock_age}s)"
-            rm -f "$LOCK_FILE"
-        else
-            local lock_pid
-            lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
-            log_error "Pipeline already running (PID: $lock_pid, age: ${lock_age}s)"
-            exit 1
-        fi
+    # Use flock for atomic locking (avoids TOCTOU race condition)
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+        log_error "Pipeline already running (lock held by another process)"
+        exit 1
     fi
-
-    # Create lock file with PID
-    echo $$ > "$LOCK_FILE"
+    # Write PID for info (lock is held via fd 200)
+    echo $$ >&200
     log_info "Lock acquired (PID: $$)"
 }
 
@@ -92,7 +160,7 @@ acquire_lock() {
 check_dependencies() {
     local missing=()
 
-    for cmd in python3 curl; do
+    for cmd in python3 curl ffprobe ffmpeg yt-dlp; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -148,7 +216,7 @@ main() {
     echo ""
     echo "╔═══════════════════════════════════════════════════════════════╗"
     echo "║           AUBESONORE RADIO PIPELINE                           ║"
-    echo "║       HypeMachine → yt-dlp → Librosa → AzuraCast              ║"
+    echo "║       HypeMachine → yt-dlp → Essentia/MTG → AzuraCast           ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
     echo ""
 
@@ -192,43 +260,51 @@ main() {
         exit 1
     fi
 
-    # Check if we have tracks
-    if [ ! -f "tracks-to-download.json" ]; then
-        log_info "No tracks found. Pipeline complete."
-        exit 0
+    # Step 1b: Merge manual picks (secondary source)
+    if [ -f "data/manual_picks.json" ]; then
+        log_info "Checking manual picks..."
+        python3 scripts/discover_manual.py || log_warn "Manual picks step failed, continuing..."
     fi
 
-    # Step 2: Download from YouTube
-    echo ""
-    echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│ STEP 2/4: DOWNLOAD (yt-dlp)                                    │"
-    echo "└─────────────────────────────────────────────────────────────────┘"
+    DOWNLOAD_COUNT=0
 
-    if ! python3 scripts/download.py; then
-        log_error "Download step failed"
-        exit 1
+    # Check if we have tracks to download
+    HAS_TRACKS=false
+    if [ -f "tracks-to-download.json" ]; then
+        HAS_TRACKS=true
+    else
+        log_info "No tracks to download (HypeMachine returned nothing)"
     fi
 
-    # Check if downloads succeeded
-    DOWNLOAD_COUNT=$(find downloads -name "*.mp3" 2>/dev/null | wc -l)
-    if [ "$DOWNLOAD_COUNT" -eq 0 ]; then
-        log_info "No new files downloaded. Pipeline complete."
-        exit 0
+    # Step 2: Download from YouTube (only if tracks discovered)
+    if [ "$HAS_TRACKS" = true ]; then
+        echo ""
+        echo "┌─────────────────────────────────────────────────────────────────┐"
+        echo "│ STEP 2/4: DOWNLOAD (yt-dlp)                                    │"
+        echo "└─────────────────────────────────────────────────────────────────┘"
+
+        if ! python3 scripts/download.py; then
+            log_warn "Download step failed, continuing for rotation..."
+        fi
+
+        # Check if downloads succeeded
+        DOWNLOAD_COUNT=$(find downloads -name "*.mp3" 2>/dev/null | wc -l)
+        log_info "Downloaded $DOWNLOAD_COUNT files"
+
+        # Step 3: Analyze audio (only if new downloads)
+        if [ "$DOWNLOAD_COUNT" -gt 0 ]; then
+            echo ""
+            echo "┌─────────────────────────────────────────────────────────────────┐"
+            echo "│ STEP 3/4: ANALYZE (Essentia/MTG)                               │"
+            echo "└─────────────────────────────────────────────────────────────────┘"
+
+            if ! ./scripts/analyze.sh; then
+                log_warn "Analyze step had issues, continuing..."
+            fi
+        fi
     fi
 
-    log_info "Downloaded $DOWNLOAD_COUNT files"
-
-    # Step 3: Analyze audio (Librosa)
-    echo ""
-    echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│ STEP 3/4: ANALYZE (Librosa)                                    │"
-    echo "└─────────────────────────────────────────────────────────────────┘"
-
-    if ! ./scripts/analyze.sh; then
-        log_warn "Analyze step had issues, continuing..."
-    fi
-
-    # Step 4: Classify and Upload to AzuraCast
+    # Step 4: Classify and Upload to AzuraCast (ALWAYS runs for rotation)
     echo ""
     echo "┌─────────────────────────────────────────────────────────────────┐"
     echo "│ STEP 4/4: UPLOAD (AzuraCast)                                   │"
@@ -243,6 +319,16 @@ main() {
     echo "╔═══════════════════════════════════════════════════════════════╗"
     echo "║                    PIPELINE COMPLETE                          ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
+
+    # Read actual upload count from classify.py output
+    UPLOAD_COUNT=0
+    if [ -f "data/last_upload_count.txt" ]; then
+        UPLOAD_COUNT=$(cat data/last_upload_count.txt 2>/dev/null || echo 0)
+    fi
+
+    # Write stats with distinct download/upload counts
+    write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
+    notify "AubeSonore Pipeline OK" "Pipeline OK. DL:${DOWNLOAD_COUNT:-0} UL:${UPLOAD_COUNT:-0}" "low" "white_check_mark"
 
     log_info "Pipeline completed successfully"
 }

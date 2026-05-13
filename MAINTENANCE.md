@@ -1,0 +1,175 @@
+# Maintenance — AubeSonore Radio Pipeline
+
+Procédures d'entretien et scripts d'audit. Le pipeline tourne sans
+intervention sur cycle journalier (cron 03:00), mais certains audits
+hebdo/mensuels gardent la bibliothèque saine.
+
+> **AzuraCast server** — `116.203.46.203` (utilisé par `audit_server.py`
+> et `reanalyze_server.py` qui requièrent un accès SSH direct ou
+> `docker exec`).
+
+---
+
+## Inventaire des scripts maintenance
+
+| Script | But | Fréquence | Côté |
+|--------|-----|-----------|------|
+| `scripts/audit_separation.py` | Compare `config.SEPARATION` à la config AzuraCast live | Mensuel ou après modif `config.py` | Pipeline (read-only API) |
+| `scripts/audit_integrity.py` | Télécharge depuis AzuraCast et vérifie chaque fichier audio (ffprobe + tailles) | Hebdo si suspicion, sinon mensuel | Pipeline (lent : download) |
+| `scripts/audit_server.py` | Idem mais directement sur les fichiers du serveur AzuraCast | Mensuel | Serveur AzuraCast (SSH) |
+| `scripts/redownload_corrupted.py` | Re-télécharge la liste produite par `audit_server.py --fix` | Après audit_server | Pipeline |
+| `scripts/reanalyze_server.py` | Ré-analyse les tracks où `mood IS NULL` dans `tracks.db` | Au besoin | Pipeline |
+| `scripts/reanalyze.py` | **Ré-analyse globale** (lourd, ~600 tracks × ~30s) | One-shot historique | Pipeline |
+| `scripts/redownload_corrupted.py` | Re-DL des fichiers corrompus identifiés | Après audit | Pipeline |
+| `scripts/update-ytdlp.sh` | Met à jour `yt-dlp` (release ~toutes les 2 semaines) | Hebdo (cron séparé) | Pipeline |
+
+`reanalyze.py` (ré-analyse globale) est essentiellement un outil
+**one-shot historique** issu de la migration vers les modèles MTG
+Arousal-Valence. Il peut être archivé sauf si tu changes encore une fois
+de modèle. À mettre dans `scripts/legacy/` si tu veux faire du ménage,
+ou laisser tel quel — il n'est plus appelé par `run.sh`.
+
+Les autres scripts sont **toujours utiles** :
+- `audit_integrity` / `audit_server` détectent les fichiers corrompus
+- `reanalyze_server` répare les tracks classify échouées
+- `redownload_corrupted` répare les fichiers cassés
+
+---
+
+## Audits réguliers
+
+### 1. Séparation AzuraCast (mensuel ou après modification de `config.SEPARATION`)
+
+```bash
+cd /home/victormoi/radio-pipeline
+set -a && source .env && set +a
+python3 scripts/audit_separation.py
+```
+
+Sortie attendue (exemple `2026-05-13`) :
+```
+duplicate_prevention_time_range : 180 min
+✓ [OK] backend_config.duplicate_prevention_time_range
+       AzuraCast = 180min covers SEPARATION (artist=60, title=180).
+· [INFO] config.SEPARATION (advanced rules)
+       mood_min_separation=3, genre_min_separation=2, ... NOT enforceable
+       by AzuraCast natively.
+```
+
+AzuraCast (Liquidsoap backend) **n'expose qu'un seul champ** pour la
+prévention de doublons : `backend_config.duplicate_prevention_time_range`
+en minutes. Il s'applique à artiste + titre en bloc. Les règles
+plus fines (`mood_min_separation`, `genre_min_separation`,
+`tempo_max_variance`) **ne sont pas applicables nativement** — leur
+implémentation demanderait un script Liquidsoap custom, ce qui sort du
+scope actuel. Les valeurs dans `config.SEPARATION` sont donc
+**documentaires** sauf pour `title_min_minutes`.
+
+### 2. Intégrité des fichiers serveur (mensuel)
+
+À exécuter **sur le serveur AzuraCast** (plus rapide, pas de download) :
+
+```bash
+# Depuis la machine pipeline, déployer puis exécuter
+scp scripts/audit_server.py victormoi@116.203.46.203:/tmp/
+ssh victormoi@116.203.46.203 \
+    "python3 /tmp/audit_server.py /var/azuracast/stations/radio/media --fix --output /tmp/audit_report.json"
+scp victormoi@116.203.46.203:/tmp/audit_report.json data/
+```
+
+Si `--fix` est passé, les fichiers corrompus sont supprimés et la liste
+écrite dans un JSON. Récupérer ce JSON, puis sur la machine pipeline :
+
+```bash
+python3 scripts/redownload_corrupted.py data/audit_report.json
+./run.sh   # le pipeline re-DL via le flux normal
+```
+
+### 3. Réanalyse des tracks sans mood (au besoin)
+
+Si `data/tracks.db` contient des tracks où `mood IS NULL` (échec de
+`analyze.py` à un run antérieur) :
+
+```bash
+python3 scripts/reanalyze_server.py --dry-run    # voir ce qui serait fait
+python3 scripts/reanalyze_server.py              # appliquer
+```
+
+Aucune ré-upload, juste re-classification + réassignation playlist.
+
+### 4. Mise à jour `yt-dlp` (hebdo, automatisable)
+
+```bash
+./scripts/update-ytdlp.sh
+```
+
+À mettre en cron séparé du pipeline principal :
+```
+0 2 * * 0 cd /home/victormoi/radio-pipeline && ./scripts/update-ytdlp.sh >> ytdlp-update.log 2>&1
+```
+
+(Dimanche 02:00, une heure avant le run du pipeline.)
+
+---
+
+## Tests
+
+Suite pytest dans `tests/`. ~50 tests couvrent les fonctions pures
+critiques : parsers RSS, filtre genre (avec mocks des 3 backends),
+sectoring Russell circumplex, validation de la config.
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+À lancer après toute modification de :
+- `scripts/discovery_sources.py` (parsers)
+- `scripts/genre_client.py` (logique blocklist/allowlist)
+- `scripts/analyze.py::classify_mood` (sectoring atan2)
+- `config.py` (validation cohérence)
+
+Pas de tests d'intégration (qui demanderaient un AzuraCast / YouTube
+de test) — ceux-là sont couverts par le run cron quotidien réel.
+
+---
+
+## Logs et rotation
+
+Logrotate configuré via `scripts/logrotate.conf` (rotation hebdo,
+8 semaines de rétention compressées). Installation :
+
+```bash
+sudo ./scripts/install_logrotate.sh
+```
+
+Important : `copytruncate` est obligatoire car `run.sh` utilise
+`tee -a` qui garde le file descriptor ouvert.
+
+---
+
+## Cron quotidien (référence)
+
+```
+0 3 * * * cd /home/victormoi/radio-pipeline && ./run.sh >> cron.log 2>&1
+```
+
+Cron yt-dlp séparé (dimanche 02:00) :
+```
+0 2 * * 0 cd /home/victormoi/radio-pipeline && ./scripts/update-ytdlp.sh >> ytdlp-update.log 2>&1
+```
+
+---
+
+## Cache `genre_cache.json`
+
+`data/genre_cache.json` stocke les tags genre (MusicBrainz + Discogs +
+Last.fm) avec TTL 30 j. Il grossit progressivement (~1 ko / track).
+Pas de purge nécessaire — au-delà de 30 j les entrées sont ignorées,
+et la rotation `max_tracks=600` borne la taille du cache utile.
+
+Pour forcer un refresh complet (ex. après modification des règles) :
+```bash
+rm data/genre_cache.json
+```
+
+Sera reconstruit au prochain run.

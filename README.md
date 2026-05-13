@@ -1,62 +1,143 @@
-# Radio Pipeline
+# AubeSonore Radio Pipeline
 
-Pipeline de découverte musicale automatique pour AubeSonore Radio.
-
-## Workflow
-
-```
-HypeMachine (API) → yt-dlp (YouTube) → Essentia-TensorFlow (analyse) → AzuraCast (diffusion)
-```
-
-## Fonctionnalités
-
-- **Découverte** : Récupération automatique des tracks populaires via HypeMachine
-- **Détection doublons** : Vérification contre la bibliothèque AzuraCast (artist + title)
-- **Téléchargement** : Download via yt-dlp avec métadonnées et cover art
-- **Analyse audio** : Classification par mood avec modèles MTG pré-entraînés (~97% accuracy)
-- **Dayparting** : Assignation aux playlists par créneau horaire (approche radio professionnelle)
-- **Rotation** : Gestion automatique de la taille de bibliothèque (FIFO avec protection)
-
-## Classification des Moods
-
-Utilise les modèles pré-entraînés MTG (Music Technology Group) via Essentia-TensorFlow:
-- `mood_aggressive` - Détection de l'agressivité (~97% accuracy)
-- `mood_happy` - Détection de la joie
-- `mood_relaxed` - Détection de la relaxation
-- `mood_sad` - Détection de la tristesse
-
-### Classification intelligente (Mood + BPM)
-
-| Mood | Critères | Exemples |
-|------|----------|----------|
-| Intense | Aggressive élevé (>0.45) | Punk, rock, metal |
-| Melancholic | Sad élevé + BPM lent (<125) | Ballades, folk triste |
-| Energetic | Happy élevé + BPM rapide (≥125) ou BPM très rapide (≥130) | Dance, pop, electro |
-| Chill | Relaxed élevé ou BPM lent (<100) | Lounge, ambient, downtempo |
-
-## Dayparting (Programmation Radio)
-
-Approche professionnelle : les tracks sont assignées à des playlists par créneau horaire selon leur mood.
-
-### Playlists par Daypart
-
-| Playlist | Horaire | Moods | Description |
-|----------|---------|-------|-------------|
-| Morning_Energy | 06:00 - 12:00 | Energetic, Intense | Démarrage dynamique |
-| Afternoon_Mix | 12:00 - 18:00 | Tous les moods | Mix varié pour le travail |
-| Evening_Relax | 18:00 - 00:00 | Chill, Melancholic | Détente du soir |
-| Night_Discovery | 00:00 - 06:00 | Energetic, Intense | Vibes nocturnes |
-
-### Routage Mood → Daypart
+Pipeline de découverte musicale automatique pour la webradio
+[AubeSonore](https://radio.aubesonore.fr).
 
 ```
-Energetic    → Morning_Energy, Afternoon_Mix, Night_Discovery
-Intense      → Morning_Energy, Afternoon_Mix, Night_Discovery
-Chill        → Afternoon_Mix, Evening_Relax
-Melancholic  → Afternoon_Mix, Evening_Relax
+Discovery (multi-source) ──► yt-dlp (YouTube) ──► Essentia-TensorFlow ──► AzuraCast
+       │                                            │
+       │                                            │
+       └─ MusicBrainz + Discogs + Last.fm (genre filter, multi-source)
 ```
 
-Chaque track peut être assignée à plusieurs playlists selon son mood.
+## Architecture (mai 2026)
+
+### 1. Discovery — multi-source
+
+Le pipeline agrège plusieurs sources de découverte, déduplique sur
+`(artist, title)` normalisé, et plafonne à `DISCOVER_MAX_TRACKS`
+(120 par défaut). Chaque source est best-effort : si l'une tombe, les
+autres continuent.
+
+| Source                | Type     | Notes                                                              |
+|-----------------------|----------|--------------------------------------------------------------------|
+| HypeMachine `/popular`| JSON API | Source historique, gardée parmi d'autres                           |
+| Gorilla vs. Bear      | RSS      | Indie / électro / ambient, parser em-dash                          |
+| A Closer Listen       | RSS      | Ambient / experimental / modern classical, parser tilde            |
+| Stereogum             | RSS      | Filtré sur `/music/`, parser dash + smart quotes                   |
+| Pitchfork Track Reviews| RSS     | Artiste extrait de l'URL slug (parser dédié)                       |
+| Last.fm `tag.gettoptracks` | API | 9 tags : indie, electronic, ambient, hip-hop, dream pop, downtempo, trip hop, indietronica, shoegaze |
+| `data/manual_picks.json`| JSON   | Injection manuelle (existant)                                      |
+| `data/custom_feeds.json`| JSON   | URLs RSS arbitraires (ex. flux générés par [rss.app](https://rss.app/)) |
+
+Sources et seuils sont configurés dans `config.py` (`RSS_FEEDS`,
+`LASTFM_TAGS`, `DISCOVER_MAX_TRACKS`).
+
+### 2. Filtre genre — multi-source (MusicBrainz + Discogs + Last.fm)
+
+Avant le téléchargement, chaque track passe par `genre_client.py` qui
+interroge 3 sources et applique une politique hybride :
+
+1. **blocklist hard** sur l'union des tags (rejet immédiat)
+2. **allowlist soft** sur l'union des tags (accept, passe le filtre)
+3. **aucun tag** → accept, le filtre audio Essentia (`AGGRESSIVE_FILTER`)
+   reprend la main en aval
+
+Les 3 sources sont complémentaires :
+
+- **MusicBrainz** — taxonomie canonique genre/style, source primaire
+- **Discogs** — couverture supérieure pour électronique + hip-hop (avec
+  Personal Access Token : 60 req/min, sinon 25)
+- **Last.fm** — crowd-sourced, sauve les artistes obscurs
+
+Un cache disque (`data/genre_cache.json`, TTL 30 j) persiste les lookups
+entre runs. Blocklist et allowlist sont configurées dans `config.py`
+(`GENRE_FILTER.blocked_genres` et `ALLOWED_GENRES`).
+
+### 3. Téléchargement — yt-dlp robuste
+
+`scripts/download.py` :
+
+- Probe via `ytsearch5` + scoring rapidfuzz pour choisir le bon candidat
+- Téléchargement MP3 qualité maximale (`--audio-quality 0`)
+- Sleep intervals (3–8 s) + 5 retries pour éviter le throttling YouTube
+  (3 workers parallèles depuis une IP unique)
+- `--extractor-args youtube:player_client=web_safari,web` : escape-hatch
+  recommandée par yt-dlp en 2026 quand YouTube ship un player change
+- Validation post-download via `ffprobe` + retry automatique si fichier
+  corrompu
+- Cover art HypeMachine embed + ID3 tags
+
+### 4. Analyse audio — Essentia-TensorFlow + MTG (v3)
+
+`scripts/analyze.py` utilise un ensemble de modèles MTG :
+
+- **Arousal-Valence ensemble** : DEAM + emoMusic + MuSe (MusiCNN,
+  ~88 % accuracy)
+- **mood_aggressive** : `mood_aggressive-discogs-effnet-1.pb` (~98 %)
+- **Genre Discogs400** : `genre_discogs400-discogs-effnet-1.pb`
+  (AUC 0.954)
+
+Le mood final est dérivé de la position 2D (valence, arousal) via
+`atan2`, projeté sur le cercle de Russell (8 catégories à 45°
+d'intervalle).
+
+### 5. Classification finale — filtre multi-signal
+
+`scripts/classify.py` applique un filtre à 4 signaux indépendants pour
+rejeter les tracks agressives qui auraient passé le filtre genre :
+
+1. `mood_aggressive` (discogs-effnet)
+2. Arousal-Valence (MusiCNN ensemble)
+3. Genre ML (genre_discogs400)
+4. Tags genre (multi-source : MusicBrainz + Discogs + Last.fm)
+
+Rejet si **2 signaux ou plus concordants** OU `mood_aggressive > 0.85`.
+
+### 6. 8 moods × 8 dayparts (modèle de Russell)
+
+Les tracks sont routées vers des playlists AzuraCast selon le mood et le
+créneau horaire :
+
+| Mood        | Valence | Arousal | BPM       | Couleur |
+|-------------|---------|---------|-----------|---------|
+| Energetic   | +0.8    | +0.5    | 110–135   | #FFD700 |
+| Excited     | +0.9    | +0.9    | 125–150   | #FF6B35 |
+| Intense     |  0.0    | +1.0    | 120–160   | #DC143C |
+| Angry       | −0.7    | +0.8    | 100–180   | #8B0000 |
+| Melancholic | −0.5    |  0.0    |  70–110   | #4A0E4E |
+| Sad         | −0.8    | −0.6    |  50–90    | #2F4F4F |
+| Calm        |  0.0    | −1.0    |  50–85    | #87CEEB |
+| Relaxed     | +0.6    | −0.5    |  70–105   | #98FB98 |
+
+Dayparts (configurables dans `config.py`) :
+
+| Daypart          | Horaire     | Moods cibles                                  |
+|------------------|-------------|-----------------------------------------------|
+| Early_Morning    | 05:00–07:00 | Calm, Relaxed                                 |
+| Morning_Commute  | 07:00–09:00 | Energetic, Excited                            |
+| Morning_Work     | 09:00–12:00 | Energetic, Relaxed                            |
+| Lunch            | 12:00–14:00 | Relaxed, Energetic, Excited                   |
+| Afternoon        | 14:00–17:00 | Energetic, Relaxed, Melancholic               |
+| Evening_Commute  | 17:00–19:00 | Energetic, Relaxed                            |
+| Evening          | 19:00–22:00 | Relaxed, Melancholic, Sad, Calm, Angry        |
+| Night            | 22:00–05:00 | Calm, Sad, Melancholic, Intense, Angry        |
+
+### 7. Rotation 3-tiers + cooldown
+
+`classify.enforce_tiered_rotation` sépare les tracks en 4 tiers basés
+sur l'âge :
+
+- **FRESH** (`<= fresh_days`, 10 j) — protection totale
+- **CURRENT** (`<= current_days`, 30 j) — supprimable si library pleine
+  ET `play_count >= min_plays_before_delete`
+- **FADING** (`<= max_age_days`, 50 j) — plafonné à 20 % de la library,
+  least-played évacuées en premier
+- **EXPIRED** (`> max_age_days`) — force delete
+
+Le `play_count` vient de l'historique AzuraCast (sync à chaque run).
+Cooldown de 60 j après suppression : un track supprimé ne sera pas
+re-téléchargé pendant cette fenêtre (`data/tracks.db`).
 
 ## Installation
 
@@ -64,125 +145,124 @@ Chaque track peut être assignée à plusieurs playlists selon son mood.
 git clone git@github.com:VictorNain26/radio-pipeline.git
 cd radio-pipeline
 ./scripts/setup.sh
+cp .env.example .env && nano .env       # remplir AzuraCast / Last.fm / Discogs
+./scripts/download_models.sh            # ~600 Mo de modèles Essentia
+./scripts/setup_playlists.sh            # crée les 8 playlists dans AzuraCast
+sudo ./scripts/install_logrotate.sh     # rotation des logs (recommandé)
+./scripts/setup_cron.sh                 # cron quotidien 03:00
 ```
 
-## Configuration
+## Variables d'environnement
 
-```bash
-cp .env.example .env
-nano .env
+Voir `.env.example` pour la liste complète. Clés notables :
+
+- `AZURACAST_URL`, `AZURACAST_API_KEY`, `AZURACAST_STATION_ID` — requis
+- `LASTFM_API_KEY` — fortement recommandé (alimente discovery + filtre genre)
+- `DISCOGS_TOKEN` — optionnel, augmente le rate limit Discogs à 60 req/min
+- `NTFY_TOPIC` — notifications push sur succès/échec
+- `DEBUG`, `SSL_VERIFY` — flags de debug/sécurité
+
+## Ajouter une source RSS sans toucher au code
+
+Coller un objet dans `data/custom_feeds.json` (voir
+`data/custom_feeds.json.example`) :
+
+```json
+[
+  {
+    "url": "https://rss.app/feeds/XXXXXXXX.xml",
+    "parser": "dash",
+    "label": "mon-flux",
+    "limit": 25,
+    "enabled": true
+  }
+]
 ```
 
-Variables requises:
-- `AZURACAST_URL` - URL du serveur AzuraCast
-- `AZURACAST_API_KEY` - Clé API AzuraCast
-- `AZURACAST_STATION_ID` - ID de la station (défaut: 1)
-
-## Utilisation
-
-### Pipeline complet
-```bash
-./run.sh
-```
-
-### Créer les playlists AzuraCast (avec scheduling)
-```bash
-./scripts/setup_playlists.sh
-```
+Parsers disponibles : `dash`, `tilde`, `dash_quoted`, `pitchfork`.
 
 ## Structure
 
 ```
 radio-pipeline/
-├── run.sh                  # Pipeline principal
-├── config.py               # Configuration moods, dayparts et filtres
+├── run.sh                   # Orchestration (flock + trap + ntfy + stats)
+├── config.py                # Moods, dayparts, sources, filtres
+├── .env.example             # Documentation des variables
+├── requirements.txt         # Dépendances Python
+├── data/
+│   ├── tracks.db            # SQLite (cooldown + play_count)
+│   ├── manual_picks.json    # Injection manuelle
+│   ├── custom_feeds.json    # RSS arbitraires (rss.app etc.)
+│   ├── genre_cache.json     # Cache 30 j multi-source genre
+│   ├── pipeline_stats.json  # 30 derniers runs + breakdown
+│   ├── last_discover_stats.json
+│   └── last_download_stats.json
 ├── scripts/
-│   ├── setup.sh            # Installation dépendances
-│   ├── setup_playlists.sh  # Création playlists AzuraCast (scheduled)
-│   ├── setup_cron.sh       # Installation cron job (3h quotidien)
-│   ├── download_models.sh  # Téléchargement modèles Essentia
-│   ├── discover.py         # HypeMachine API
-│   ├── download.py         # yt-dlp + métadonnées
-│   ├── download.sh         # Wrapper download
-│   ├── analyze.py          # Analyse Essentia-TensorFlow (BPM, mood)
-│   ├── analyze.sh          # Wrapper analyse
-│   ├── classify.py         # Upload AzuraCast + rotation + routage daypart
-│   └── upload.sh           # Wrapper upload
-├── models/                 # Modèles Essentia pré-entraînés
-├── downloads/              # Fichiers téléchargés
-├── music/                  # Fichiers analysés (prêts pour upload)
-├── archive/                # Historique des tracks
-├── .env.example
-└── README.md
+│   ├── discover.py          # Orchestrateur multi-source
+│   ├── discovery_sources.py # HypeMachine + RSS + Last.fm tags
+│   ├── discover_manual.py   # Manual picks (legacy, branché par run.sh)
+│   ├── download.py          # yt-dlp + ffprobe + ID3 + checksum
+│   ├── analyze.py           # Essentia-TF (arousal-valence + genre)
+│   ├── classify.py          # Filtre multi-signal + rotation 3-tiers
+│   ├── lastfm_client.py     # Backend Last.fm
+│   ├── genre_client.py      # Agrégateur 3 sources + cache disque
+│   ├── http_client.py       # Retry + circuit breaker + SHA-256
+│   ├── settings.py          # Pydantic v2 settings
+│   ├── track_db.py          # SQLite TrackDB
+│   ├── audit_integrity.py   # Vérif local files (SHA + ffprobe)
+│   ├── audit_server.py      # Vérif library AzuraCast
+│   ├── reanalyze*.py        # Réanalyse forcée (maintenance)
+│   ├── redownload_corrupted.py
+│   ├── setup_playlists.py   # Crée les 8 playlists AzuraCast
+│   ├── logrotate.conf       # Config logrotate
+│   └── install_logrotate.sh # Installeur (sudo)
+└── models/                  # Modèles Essentia pré-entraînés
 ```
 
-## Détection des doublons
+## Maintenance et tests
 
-La détection des doublons utilise **AzuraCast comme source de vérité**:
+Voir [`MAINTENANCE.md`](MAINTENANCE.md) — couvre :
+- Audits réguliers (`audit_separation.py`, `audit_integrity.py`,
+  `audit_server.py`)
+- Procédure de redownload des fichiers corrompus
+- Cron yt-dlp séparé
+- Cache `genre_cache.json`
+- Inventaire et fréquence recommandée de chaque script
 
-1. Au démarrage du téléchargement, la bibliothèque AzuraCast est récupérée
-2. Chaque track est comparée par `artist + title` (normalisé)
-3. Les tracks déjà présents sont ignorés
+Tests pytest dans `tests/` (~50 tests, ~1.5 s) :
 
-**Avantage:** Un track supprimé par rotation peut revenir s'il redevient populaire sur HypeMachine.
-
-## Rotation de la bibliothèque
-
-Le pipeline gère automatiquement la taille de la bibliothèque AzuraCast:
-
-- **Maximum 450 tracks** - Les plus anciennes sont supprimées pour faire place aux nouvelles
-- **Protection 7 jours** - Un track ne peut pas être supprimé avant 7 jours (temps de passer à l'antenne)
-- **FIFO** - First In, First Out (les plus anciens partent en premier)
-
-Configuration dans `config.py`:
-
-```python
-ROTATION = {
-    "max_tracks": 450,    # Maximum tracks in AzuraCast library
-    "min_age_days": 7,    # Never delete tracks younger than 7 days
-}
+```bash
+python3 -m pytest tests/ -q
 ```
 
-## Automatisation (Cron)
+Cibles : parsers RSS, filtre genre multi-source, classification Russell
+circumplex, cohérence de la configuration.
 
-### Installation automatique
+## Logs et observabilité
+
+- `pipeline.log` : pipeline events (1 ligne par étape)
+- `cron.log` : sortie complète stdout/stderr du cron
+- `data/pipeline_stats.json` : 30 derniers runs avec breakdown discover
+  + download (par source, par status)
+- ntfy push (si `NTFY_TOPIC` configuré) sur succès/échec
+
+Rotation hebdo via logrotate (8 semaines de rétention compressées).
+
+## Cron
 
 ```bash
 ./scripts/setup_cron.sh
 ```
 
-### Installation manuelle
+Installe :
+```
+0 3 * * * /home/victormoi/radio-pipeline/run.sh >> /home/victormoi/radio-pipeline/cron.log 2>&1
+```
+
+## Mises à jour yt-dlp
 
 ```bash
-# Exécuter le pipeline tous les jours à 3h
-0 3 * * * cd /path/to/radio-pipeline && ./run.sh >> /var/log/radio-pipeline.log 2>&1
+./scripts/update-ytdlp.sh
 ```
 
-## Configuration avancée
-
-Éditer `config.py` pour:
-- Activer/désactiver des moods ou dayparts
-- Modifier les horaires des dayparts
-- Configurer le routage mood → daypart
-- Configurer des filtres audio (BPM min/max, durée max, etc.)
-
-### Exemple: Désactiver un daypart
-
-```python
-DAYPARTS = {
-    "Morning_Energy": {"enabled": True, ...},
-    "Afternoon_Mix": {"enabled": True, ...},
-    "Evening_Relax": {"enabled": False, ...},  # Désactivé
-    "Night_Discovery": {"enabled": True, ...},
-}
-```
-
-### Exemple: Modifier le routage
-
-```python
-MOOD_TO_DAYPARTS = {
-    "Energetic": ["Morning_Energy", "Afternoon_Mix"],  # Retiré Night_Discovery
-    "Chill": ["Evening_Relax"],  # Uniquement le soir
-    ...
-}
-```
+À installer en cron séparé (yt-dlp release toutes les ~2 semaines).
