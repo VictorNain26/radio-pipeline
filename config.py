@@ -213,34 +213,47 @@ class RotationConfig:
 @dataclass
 class GenreFilterConfig:
     """
-    Configuration du filtrage par genre via Last.fm.
+    Configuration du filtrage par genre multi-source.
 
     Best practices 2026:
     - Filtrage pré-téléchargement pour économiser bande passante
-    - Tags Last.fm crowd-sourcés = plus fiables que métadonnées HypeMachine
-    - Liste bloquée configurable selon la couleur sonore de la radio
+    - Tags agrégés depuis MusicBrainz + Discogs + Last.fm
+    - Liste bloquée curated pour l'esthétique AubeSonore
+      (indie / electronic / ambient / hip-hop)
+
+    NOTE: "noise" tout court n'est PAS bloqué car Last.fm l'utilise
+    largement comme descripteur de texture (shoegaze, dream pop). On
+    bloque uniquement les variantes canoniques extrêmes (harsh noise,
+    power electronics, japanoise).
 
     Attributes:
         enabled: Activer le filtrage par genre
-        blocked_genres: Genres à bloquer (lowercase)
-        require_tags: Rejeter les tracks sans tags Last.fm
+        blocked_genres: Genres à bloquer (lowercase, match exact sur tag)
+        require_tags: Rejeter les tracks sans tags
     """
     enabled: bool = True
     blocked_genres: tuple[str, ...] = (
-        # Hard/Extreme electronic (trop brutal)
-        "hardcore", "hardstyle", "hard techno", "gabber", "schranz",
-        "acid", "acid techno", "industrial techno",
-        # Industrial agressif
-        "aggrotech", "industrial metal", "industrial rock",
-        # Metal (tous)
+        # Metal — toutes variantes (incompatible avec dawn-sound)
         "metal", "death metal", "black metal", "heavy metal",
         "thrash metal", "doom metal", "nu metal", "groove metal",
-        "grindcore", "metalcore", "deathcore",
-        "hard rock",
-        # Noise/Experimental extreme
-        "noise", "harsh noise", "power electronics",
-        # Punk extreme
-        "hardcore punk", "crust punk",
+        "power metal", "speed metal", "progressive metal",
+        "sludge metal", "stoner metal", "post-metal",
+        "folk metal", "symphonic metal", "viking metal", "djent",
+        # Metalcore / hardcore famille
+        "grindcore", "metalcore", "deathcore", "mathcore",
+        "melodic metalcore", "post-hardcore",
+        # Hard rock + glam (guitares saturées, vibe pas dawn-sound)
+        "hard rock", "glam metal", "hair metal",
+        # Punk extrême (post-punk reste autorisé)
+        "hardcore punk", "crust punk", "thrash punk", "d-beat",
+        # Industrial agressif (Throbbing Gristle, Skinny Puppy...)
+        "industrial", "industrial metal", "industrial rock",
+        "aggrotech", "ebm", "death industrial",
+        # Hard electronic (BPM > 160, kicks distordus)
+        "hardcore", "hardstyle", "hard techno", "industrial techno",
+        "gabber", "schranz", "speedcore", "happy hardcore",
+        # Noise extrême (PAS "noise" seul — trop large)
+        "harsh noise", "power electronics", "japanoise", "noise music",
     )
     require_tags: bool = False  # Si True, rejette les tracks sans tags
 
@@ -629,51 +642,90 @@ DISCOVER_MAX_TRACKS: int = 120
 # =============================================================================
 
 ALLOWED_GENRES: tuple[str, ...] = (
-    # Indie / alternative
-    "indie", "indie rock", "indie pop", "indie folk", "alternative", "alternative rock",
-    "art pop", "bedroom pop", "dream pop", "shoegaze", "slowcore",
-    "post-rock", "math rock", "chamber pop",
-    # Electronic
-    "electronic", "electronica", "indietronica", "synthpop", "synth-pop",
-    "synthwave", "chillwave", "vaporwave", "future bass", "idm",
-    "downtempo", "trip hop", "trip-hop", "deep house", "house", "techno",
-    "minimal techno", "ambient techno", "uk garage", "garage", "footwork",
-    "drum and bass", "dnb", "broken beat",
-    # Ambient / cinematic
-    "ambient", "drone", "modern classical", "neoclassical", "post-classical",
-    "soundscape", "field recordings", "minimalism", "ambient pop",
-    # Hip-hop / R&B / Soul
-    "hip hop", "hip-hop", "rap", "alternative hip hop", "experimental hip hop",
-    "neo soul", "soul", "r&b", "rnb", "contemporary r&b", "afrobeat", "afro soul",
-    # Jazz-adjacent
+    # ─── INDIE / ALTERNATIVE ──────────────────────────────────────
+    "indie", "indie rock", "indie pop", "indie folk", "indietronica",
+    "alternative", "alternative rock", "alt-rock",
+    "dream pop", "shoegaze", "slowcore", "sadcore",
+    "bedroom pop", "jangle pop", "twee pop",
+    "art pop", "art rock", "chamber pop", "baroque pop",
+    "post-rock", "math rock", "post-punk", "new wave", "no wave",
+    "experimental rock",
+    # ─── FOLK ─────────────────────────────────────────────────────
+    "folk", "freak folk", "psych folk", "indie folk",
+    "americana", "alt-country", "alternative country",
+    "contemporary folk", "neo-folk",
+    # ─── ELECTRONIC ───────────────────────────────────────────────
+    "electronic", "electronica", "idm", "intelligent dance music",
+    "downtempo", "chillout", "chill-out", "lounge",
+    "trip hop", "trip-hop",
+    "ambient pop", "ambient electronic", "ambient techno",
+    "synthpop", "synth-pop", "electropop", "electro pop",
+    "synthwave", "chillwave", "vaporwave", "glitch",
+    "future bass",
+    # House / techno (variantes mid-tempo, pas le hard)
+    "house", "deep house", "minimal house", "lo-fi house", "tech house",
+    "techno", "minimal techno", "dub techno", "ambient techno",
+    "uk garage", "garage", "future garage", "2-step",
+    "footwork", "juke",
+    "drum and bass", "dnb", "drum & bass", "liquid dnb", "liquid funk",
+    "broken beat", "breakbeat", "jungle",
+    "bass music",
+    # ─── AMBIENT / CINEMATIC ──────────────────────────────────────
+    "ambient", "dark ambient", "drone", "drone music",
+    "modern classical", "neoclassical", "post-classical",
+    "minimalism", "minimal music", "post-minimalism",
+    "soundscape", "field recordings", "field recording",
+    "new age",
+    # ─── HIP-HOP / RAP ────────────────────────────────────────────
+    "hip hop", "hip-hop", "rap",
+    "alternative hip hop", "alt hip hop", "alt-hip-hop",
+    "experimental hip hop", "conscious hip hop",
+    "jazz rap", "jazz hip hop", "abstract hip hop",
+    "lo-fi hip hop", "boom bap", "golden age hip hop",
+    "trap", "cloud rap",
+    # ─── SOUL / R&B / NEO SOUL ────────────────────────────────────
+    "neo soul", "neo-soul", "soul",
+    "r&b", "rnb", "rhythm and blues",
+    "contemporary r&b", "alternative r&b", "alt-r&b", "alt r&b",
+    "afrobeat", "afro soul", "afrobeats",
+    # ─── JAZZ-ADJACENT ────────────────────────────────────────────
     "jazz", "nu jazz", "jazz fusion",
-    # Folk / acoustic
-    "folk", "freak folk", "psych folk", "americana",
-    # Pop-ish that fits the radio
-    "pop", "electro pop", "electropop",
-    # Lo-fi
-    "lo-fi", "lofi", "lo-fi hip hop", "bedroom",
+    "smooth jazz", "spiritual jazz", "contemporary jazz",
+    "ethio-jazz",
+    # ─── POP / LO-FI / BEDROOM ────────────────────────────────────
+    "pop", "indie pop",
+    "lo-fi", "lofi", "bedroom",
 )
 
 
-# Filtre de genre (Last.fm) - pré-téléchargement
+# Filtre de genre (multi-source : MusicBrainz + Discogs + Last.fm)
+# Voir GenreFilterConfig pour la docstring détaillée. Cette instance
+# garde sa propre liste (peut être tunée sans toucher la classe).
 GENRE_FILTER = GenreFilterConfig(
     enabled=True,
     blocked_genres=(
-        # Hard/Extreme electronic (trop brutal)
-        "hardcore", "hardstyle", "hard techno", "gabber", "schranz",
-        "acid", "acid techno", "industrial techno",
-        # Industrial agressif
-        "aggrotech", "industrial metal", "industrial rock",
-        # Metal (tous)
+        # Metal — toutes variantes
         "metal", "death metal", "black metal", "heavy metal",
         "thrash metal", "doom metal", "nu metal", "groove metal",
-        "grindcore", "metalcore", "deathcore",
-        "hard rock",
-        # Noise/Experimental extreme
-        "noise", "harsh noise", "power electronics",
-        # Punk extreme
-        "hardcore punk", "crust punk",
+        "power metal", "speed metal", "progressive metal",
+        "sludge metal", "stoner metal", "post-metal",
+        "folk metal", "symphonic metal", "viking metal", "djent",
+        # Metalcore / hardcore famille
+        "grindcore", "metalcore", "deathcore", "mathcore",
+        "melodic metalcore", "post-hardcore",
+        # Hard rock + glam
+        "hard rock", "glam metal", "hair metal",
+        # Punk extrême (post-punk reste autorisé)
+        "hardcore punk", "crust punk", "thrash punk", "d-beat",
+        # Industrial agressif
+        "industrial", "industrial metal", "industrial rock",
+        "aggrotech", "ebm", "death industrial",
+        # Hard electronic
+        "hardcore", "hardstyle", "hard techno", "industrial techno",
+        "gabber", "schranz", "speedcore", "happy hardcore",
+        # Noise extrême uniquement (laisser passer "noise" qui est
+        # surtout utilisé comme texture en shoegaze/dream pop)
+        "harsh noise", "power electronics", "japanoise", "noise music",
     ),
     require_tags=False,
 )

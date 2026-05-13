@@ -149,7 +149,7 @@ cp .env.example .env && nano .env       # remplir AzuraCast / Last.fm / Discogs
 ./scripts/download_models.sh            # ~600 Mo de modèles Essentia
 ./scripts/setup_playlists.sh            # crée les 8 playlists dans AzuraCast
 sudo ./scripts/install_logrotate.sh     # rotation des logs (recommandé)
-./scripts/setup_cron.sh                 # cron quotidien 03:00
+./scripts/setup_systemd.sh              # timers user-scoped : pipeline 03:00 + yt-dlp dimanche 02:00
 ```
 
 ## Variables d'environnement
@@ -248,21 +248,36 @@ circumplex, cohérence de la configuration.
 
 Rotation hebdo via logrotate (8 semaines de rétention compressées).
 
-## Cron
+## Scheduler (systemd user-scoped)
+
+Le pipeline est piloté par 2 timers systemd dans `~/.config/systemd/user/` :
+
+| Unit | Quand | Quoi |
+|------|-------|------|
+| `radio-pipeline.timer` | quotidien 03:00 | exécute `run.sh` (full pipeline) |
+| `radio-pipeline-ytdlp.timer` | dimanche 02:00 | exécute `scripts/update-ytdlp.sh` (refresh yt-dlp avant le run hebdo) |
+
+Les deux units sont versionnés sous `scripts/systemd/` avec des placeholders
+`@HOME@` / `@PIPELINE_DIR@`, et installés via :
 
 ```bash
-./scripts/setup_cron.sh
+./scripts/setup_systemd.sh
 ```
 
-Installe :
-```
-0 3 * * * /home/victormoi/radio-pipeline/run.sh >> /home/victormoi/radio-pipeline/cron.log 2>&1
-```
+`Persistent=true` garantit le catch-up après un reboot. `loginctl
+enable-linger` est activé automatiquement par le script (1 prompt sudo)
+pour que les timers tournent sans session shell ouverte.
 
-## Mises à jour yt-dlp
+Inspection :
 
 ```bash
-./scripts/update-ytdlp.sh
+systemctl --user list-timers 'radio-pipeline*'
+journalctl --user -u radio-pipeline.service --since "1 day ago"
 ```
 
-À installer en cron séparé (yt-dlp release toutes les ~2 semaines).
+### Lancer un run à la main
+
+```bash
+systemctl --user start radio-pipeline.service    # full pipeline
+systemctl --user start radio-pipeline-ytdlp.service   # juste yt-dlp update
+```

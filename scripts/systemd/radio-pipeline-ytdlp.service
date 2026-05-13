@@ -1,0 +1,12 @@
+[Unit]
+Description=Update yt-dlp for AubeSonore Radio Pipeline
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@PIPELINE_DIR@
+Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@PIPELINE_DIR@/scripts/update-ytdlp.sh
+
+[Install]
+WantedBy=default.target

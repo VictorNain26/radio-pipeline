@@ -97,18 +97,23 @@ python3 scripts/reanalyze_server.py              # appliquer
 
 Aucune ré-upload, juste re-classification + réassignation playlist.
 
-### 4. Mise à jour `yt-dlp` (hebdo, automatisable)
+### 4. Mise à jour `yt-dlp` (automatisée via systemd)
 
+Géré par `radio-pipeline-ytdlp.timer` (dimanche 02:00, une heure avant
+le run quotidien). Le script vérifie la dernière release GitHub et
+ne télécharge que si la version a changé.
+
+Manuel :
 ```bash
 ./scripts/update-ytdlp.sh
+systemctl --user start radio-pipeline-ytdlp.service   # idem, via systemd
 ```
 
-À mettre en cron séparé du pipeline principal :
+Inspection :
+```bash
+systemctl --user list-timers radio-pipeline-ytdlp.timer
+tail -20 ytdlp-update.log
 ```
-0 2 * * 0 cd /home/victormoi/radio-pipeline && ./scripts/update-ytdlp.sh >> ytdlp-update.log 2>&1
-```
-
-(Dimanche 02:00, une heure avant le run du pipeline.)
 
 ---
 
@@ -147,15 +152,22 @@ Important : `copytruncate` est obligatoire car `run.sh` utilise
 
 ---
 
-## Cron quotidien (référence)
+## Scheduler (référence)
+
+2 timers systemd user-scoped (pas de cron) installés par `setup_systemd.sh` :
 
 ```
-0 3 * * * cd /home/victormoi/radio-pipeline && ./run.sh >> cron.log 2>&1
+radio-pipeline.timer        OnCalendar=*-*-* 03:00:00       Persistent=true
+radio-pipeline-ytdlp.timer  OnCalendar=Sun *-*-* 02:00:00   Persistent=true
 ```
 
-Cron yt-dlp séparé (dimanche 02:00) :
-```
-0 2 * * 0 cd /home/victormoi/radio-pipeline && ./scripts/update-ytdlp.sh >> ytdlp-update.log 2>&1
+Lingering activé via `loginctl enable-linger $USER` pour que les
+timers tournent sans session shell ouverte.
+
+Templates dans `scripts/systemd/`, installation idempotente :
+
+```bash
+./scripts/setup_systemd.sh
 ```
 
 ---
