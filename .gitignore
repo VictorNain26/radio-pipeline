@@ -8,21 +8,41 @@
 downloads/
 music/
 archive/
+temp/
+temp_*/
 
-# Beets database
+# Data directory: ignore all state/cache, but keep templates
+data/*
+!data/*.example
+
+# Beets / SQLite databases
 *.db
 import.log
 
-# Track lists
+# Logs (rotated by logrotate, not for git)
+*.log
+
+# Heavy ML models (downloaded by scripts/download_models.sh)
+models/
+
+# Transient discovery queue (regenerated each run)
+tracks-to-download.json
 tracks-to-download.txt
 
 # Environment
 .env
 
+# Tests
+.pytest_cache/
+
 # Python
 __pycache__/
 *.pyc
 .venv/
+
+# Cache Spotify
+scripts/.cache
+.cache
 
 # System
 .DS_Store

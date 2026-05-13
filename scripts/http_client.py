@@ -5,19 +5,18 @@ Best practices 2026:
 - Exponential backoff with jitter
 - Circuit breaker pattern
 - Structured logging
-- Type safety with Pydantic
+- Type safety with dataclasses and type annotations
+- File integrity verification (SHA-256/MD5)
 """
 
-from __future__ import annotations
-
+import hashlib
 import logging
 import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
-
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -44,7 +43,7 @@ class ServerError(HTTPError):
     pass
 
 
-class ConnectionError(HTTPError):
+class HTTPConnectionError(HTTPError):
     """Network/connection errors."""
     pass
 
@@ -93,12 +92,7 @@ class CircuitBreaker:
             logger.warning(f"Circuit breaker: OPEN (after {self._failure_count} failures)")
 
     def can_execute(self) -> bool:
-        state = self.state
-        if state == CircuitState.CLOSED:
-            return True
-        if state == CircuitState.HALF_OPEN:
-            return True
-        return False
+        return self.state != CircuitState.OPEN
 
 
 @dataclass
@@ -143,7 +137,7 @@ class RobustHTTPClient:
         retry_config: RetryConfig | None = None,
         circuit_breaker: CircuitBreaker | None = None,
     ):
-        self.base_url = self._validate_url(base_url)
+        self.base_url = self._normalize_url(base_url)
         self.api_key = api_key
         self.timeout = timeout
         self.retry_config = retry_config or RetryConfig()
@@ -152,25 +146,9 @@ class RobustHTTPClient:
         self._session = self._create_session()
 
     @staticmethod
-    def _validate_url(url: str) -> str:
-        """Validate and normalize URL."""
-        url = url.rstrip("/")
-        parsed = urlparse(url)
-
-        if not parsed.scheme:
-            raise ValueError(f"URL must include scheme (http/https): {url}")
-
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"Invalid URL scheme: {parsed.scheme}")
-
-        if not parsed.netloc:
-            raise ValueError(f"URL must include host: {url}")
-
-        # Warn if using HTTP
-        if parsed.scheme == "http":
-            logger.warning(f"Using insecure HTTP connection to {parsed.netloc}")
-
-        return url
+    def _normalize_url(url: str) -> str:
+        """Normalize URL (remove trailing slash). Validation done by settings.py."""
+        return url.rstrip("/")
 
     def _create_session(self) -> requests.Session:
         """Create session with connection pooling."""
@@ -213,7 +191,7 @@ class RobustHTTPClient:
     ) -> requests.Response:
         """Execute HTTP request with circuit breaker and retry logic."""
         if not self.circuit_breaker.can_execute():
-            raise ConnectionError(
+            raise HTTPConnectionError(
                 f"Circuit breaker is OPEN - service unavailable",
                 status_code=None,
             )
@@ -243,7 +221,7 @@ class RobustHTTPClient:
 
             except requests.exceptions.SSLError as e:
                 logger.error(f"SSL/TLS error: {e}")
-                raise ConnectionError(f"SSL verification failed: {e}") from e
+                raise HTTPConnectionError(f"SSL verification failed: {e}") from e
 
             except requests.exceptions.ConnectionError as e:
                 last_exception = e
@@ -254,7 +232,7 @@ class RobustHTTPClient:
                     logger.warning(f"Connection error, retrying in {delay:.1f}s: {e}")
                     time.sleep(delay)
                 else:
-                    raise ConnectionError(f"Connection failed after {attempt + 1} attempts: {e}") from e
+                    raise HTTPConnectionError(f"Connection failed after {attempt + 1} attempts: {e}") from e
 
             except requests.exceptions.Timeout as e:
                 last_exception = e
@@ -265,9 +243,9 @@ class RobustHTTPClient:
                     logger.warning(f"Timeout, retrying in {delay:.1f}s")
                     time.sleep(delay)
                 else:
-                    raise ConnectionError(f"Request timed out after {attempt + 1} attempts") from e
+                    raise HTTPConnectionError(f"Request timed out after {attempt + 1} attempts") from e
 
-        raise ConnectionError(f"Request failed: {last_exception}")
+        raise HTTPConnectionError(f"Request failed: {last_exception}")
 
     def _handle_error_response(self, response: requests.Response, attempt: int) -> None:
         """Handle HTTP error responses."""
@@ -286,7 +264,7 @@ class RobustHTTPClient:
             if status == 429:
                 # Rate limited - do retry with backoff
                 retry_after = response.headers.get("Retry-After", "60")
-                delay = float(retry_after) if retry_after.isdigit() else 60.0
+                delay = min(float(retry_after), 300.0) if retry_after.isdigit() else 60.0
                 logger.warning(f"Rate limited, waiting {delay}s")
                 time.sleep(delay)
                 raise ServerError("Rate limited", status, response)
@@ -330,7 +308,7 @@ class RobustHTTPClient:
         try:
             response = self.get(endpoint)
             return 200 <= response.status_code < 300
-        except (HTTPError, ConnectionError):
+        except (HTTPError, HTTPConnectionError):
             return False
 
     def close(self) -> None:
@@ -342,6 +320,27 @@ class RobustHTTPClient:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+
+def compute_file_hashes(filepath: Path) -> tuple[str, str]:
+    """
+    Compute MD5 and SHA-256 hashes of a file.
+
+    Args:
+        filepath: Path to the file.
+
+    Returns:
+        Tuple of (md5_hex, sha256_hex).
+    """
+    md5_hash = hashlib.md5(usedforsecurity=False)
+    sha256_hash = hashlib.sha256()
+
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            md5_hash.update(chunk)
+            sha256_hash.update(chunk)
+
+    return md5_hash.hexdigest(), sha256_hash.hexdigest()
 
 
 class AzuraCastClient(RobustHTTPClient):
@@ -356,10 +355,12 @@ class AzuraCastClient(RobustHTTPClient):
         base_url: str,
         api_key: str,
         station_id: int = 1,
+        verify_upload_integrity: bool = True,
         **kwargs: Any,
     ):
         super().__init__(base_url, api_key, **kwargs)
         self.station_id = station_id
+        self.verify_upload_integrity = verify_upload_integrity
 
     def get_station_files(self) -> list[dict[str, Any]]:
         """Get all files in station library."""
@@ -377,15 +378,23 @@ class AzuraCastClient(RobustHTTPClient):
         playlist_id: int | None = None,
     ) -> dict[str, Any] | None:
         """
-        Upload a file to station.
+        Upload a file to station with integrity verification.
+
+        Best practices 2026:
+        - Computes MD5/SHA-256 before upload
+        - Verifies server-side hash matches (if available)
+        - Logs integrity status for audit trail
 
         Returns file metadata on success, None on failure.
         """
-        from pathlib import Path
-
         path = Path(filepath)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {filepath}")
+
+        # Compute hashes before upload for integrity verification
+        local_md5, local_sha256 = compute_file_hashes(path)
+        local_size = path.stat().st_size
+        logger.debug(f"Local file: size={local_size}, MD5={local_md5}, SHA256={local_sha256[:16]}...")
 
         try:
             with open(filepath, "rb") as f:
@@ -398,6 +407,18 @@ class AzuraCastClient(RobustHTTPClient):
             if response.status_code in (200, 201):
                 file_data = response.json()
 
+                # Verify upload integrity (best practice 2026)
+                if self.verify_upload_integrity:
+                    integrity_ok = self._verify_upload_integrity(
+                        file_data, local_md5, local_sha256, local_size
+                    )
+                    if not integrity_ok:
+                        logger.error("Upload integrity verification FAILED - file may be corrupted")
+                        # Optionally delete the corrupted upload
+                        if file_id := file_data.get("id"):
+                            self.delete_file(file_id)
+                        return None
+
                 # Add to playlist if specified
                 if playlist_id and "id" in file_data:
                     self._add_to_playlist(file_data["id"], playlist_id)
@@ -407,9 +428,60 @@ class AzuraCastClient(RobustHTTPClient):
             logger.error(f"Upload failed: HTTP {response.status_code}")
             return None
 
-        except (ClientError, ServerError, ConnectionError) as e:
+        except (ClientError, ServerError, HTTPConnectionError) as e:
             logger.error(f"Upload failed: {e}")
             return None
+
+    def _verify_upload_integrity(
+        self,
+        file_data: dict[str, Any],
+        local_md5: str,
+        local_sha256: str,
+        local_size: int,
+    ) -> bool:
+        """
+        Verify uploaded file integrity by comparing hashes.
+
+        AzuraCast returns 'unique_id' which is often the MD5 hash.
+
+        Args:
+            file_data: Response from upload API.
+            local_md5: Pre-computed local MD5.
+            local_sha256: Pre-computed local SHA-256.
+            local_size: Local file size in bytes.
+
+        Returns:
+            True if integrity verified, False otherwise.
+        """
+        # Check size if available
+        remote_size = file_data.get("size")
+        if remote_size and int(remote_size) != local_size:
+            logger.error(f"Size mismatch: local={local_size}, remote={remote_size}")
+            return False
+
+        # AzuraCast uses unique_id which may be MD5-based
+        unique_id = file_data.get("unique_id", "")
+
+        # Check if unique_id matches MD5 (AzuraCast behavior)
+        if unique_id and len(unique_id) == 32:
+            if unique_id.lower() != local_md5.lower():
+                logger.error(f"MD5 mismatch: local={local_md5}, remote={unique_id}")
+                return False
+            logger.debug(f"Integrity verified: MD5={local_md5}")
+
+        # Check explicit hash fields if present
+        remote_md5 = file_data.get("md5") or file_data.get("hash_md5")
+        if remote_md5 and remote_md5.lower() != local_md5.lower():
+            logger.error(f"MD5 hash mismatch: local={local_md5}, remote={remote_md5}")
+            return False
+
+        remote_sha256 = file_data.get("sha256") or file_data.get("hash_sha256")
+        if remote_sha256 and remote_sha256.lower() != local_sha256.lower():
+            logger.error(f"SHA-256 hash mismatch")
+            return False
+
+        logger.info(f"Upload integrity OK (size={local_size})")
+        return True
 
     def _add_to_playlist(self, file_id: int, playlist_id: int) -> bool:
         """Add file to playlist."""
@@ -420,6 +492,122 @@ class AzuraCastClient(RobustHTTPClient):
             )
             return response.status_code in (200, 201)
         except HTTPError:
+            return False
+
+    def get_station_history(self, limit: int = 500) -> list[dict[str, Any]]:
+        """
+        Get station play history.
+
+        Returns list of recently played tracks with timestamps.
+        Used to calculate play counts for rotation decisions.
+
+        Args:
+            limit: Maximum entries to retrieve (AzuraCast max ~500).
+
+        Returns:
+            List of history entries with song_id, played_at, etc.
+        """
+        response = self.get(
+            f"/api/station/{self.station_id}/history",
+            params={"limit": limit},
+        )
+        return response.json()
+
+    def get_play_counts(self) -> dict[str, int]:
+        """
+        Calculate play counts for all tracks from history.
+
+        Returns:
+            Dict mapping unique_id -> play_count.
+        """
+        history = self.get_station_history()
+        play_counts: dict[str, int] = {}
+
+        for entry in history:
+            # AzuraCast history uses song.unique_id
+            song = entry.get("song", {})
+            unique_id = song.get("unique_id") or song.get("id")
+            if unique_id:
+                play_counts[str(unique_id)] = play_counts.get(str(unique_id), 0) + 1
+
+        return play_counts
+
+    @staticmethod
+    def _parse_played_at(value: Any) -> float:
+        """Parse AzuraCast played_at which may be int (unix) or ISO-8601 string."""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            # Try ISO-8601 parsing
+            from datetime import datetime, timezone
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    dt = datetime.strptime(value, fmt)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt.timestamp()
+                except ValueError:
+                    continue
+            # Last resort: try float conversion
+            try:
+                return float(value)
+            except ValueError:
+                pass
+        return 0.0
+
+    def get_history_since(self, since_timestamp: float) -> list[dict[str, Any]]:
+        """
+        Get station history entries since a given timestamp.
+
+        Args:
+            since_timestamp: Unix timestamp. Pass 0 for all available history.
+
+        Returns:
+            List of history entries with played_at > since_timestamp.
+        """
+        params: dict[str, Any] = {"limit": 500}
+
+        if since_timestamp > 0:
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(since_timestamp, tz=timezone.utc)
+            params["start"] = dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+        try:
+            response = self.get(
+                f"/api/station/{self.station_id}/history",
+                params=params,
+            )
+            entries = response.json()
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning(f"Failed to fetch history: {e}")
+            return []
+
+        if since_timestamp <= 0:
+            return entries
+
+        # Client-side filter in case API doesn't support 'start' param
+        filtered = []
+        for entry in entries:
+            played_at = self._parse_played_at(entry.get("played_at", 0))
+            if played_at > since_timestamp:
+                filtered.append(entry)
+        return filtered
+
+    def delete_file(self, file_id: int | str) -> bool:
+        """
+        Delete a file from station library.
+
+        Args:
+            file_id: File ID to delete.
+
+        Returns:
+            True if successful.
+        """
+        try:
+            response = self.delete(f"/api/station/{self.station_id}/file/{file_id}")
+            return response.status_code in (200, 204)
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.error(f"Delete failed for file {file_id}: {e}")
             return False
 
     def health_check(self, endpoint: str = "/api/status") -> bool:

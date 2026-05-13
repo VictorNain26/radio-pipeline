@@ -25,9 +25,9 @@ echo ""
 
 # Get dayparts from config.py
 # Format: name:start_hour:end_hour:description
-DAYPARTS=$(python3 -c "
-import sys
-sys.path.insert(0, '$PIPELINE_DIR')
+DAYPARTS=$(PIPELINE_DIR="$PIPELINE_DIR" python3 -c "
+import sys, os
+sys.path.insert(0, os.environ['PIPELINE_DIR'])
 from config import DAYPARTS
 
 for name, cfg in DAYPARTS.items():

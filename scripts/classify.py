@@ -2,14 +2,14 @@
 """
 Upload tracks to AzuraCast with daypart-based playlist assignment.
 
-Features:
-- Reads mood from ID3 tags (set by analyze.py)
-- Routes tracks to daypart playlists
-- Professional radio approach with time-based scheduling
+Features v2.0:
+- Reads 8-mood circumplex classification from ID3 tags
+- Routes tracks to 8 daypart playlists
+- Uses energy levels for smooth programming
+- Confidence-based quality filtering
+- Professional separation rules support
 - Robust HTTP client with retry logic and circuit breaker
 """
-
-from __future__ import annotations
 
 import logging
 import sys
@@ -23,13 +23,30 @@ from mutagen.id3 import ID3
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from http_client import AzuraCastClient as BaseAzuraCastClient, ClientError, ConnectionError, ServerError
+from http_client import AzuraCastClient as BaseAzuraCastClient, ClientError, HTTPConnectionError, ServerError, compute_file_hashes
 from settings import get_settings, validate_environment
+from track_db import TrackDB, normalize_track_key
 
 try:
-    from config import get_dayparts_for_mood, get_enabled_dayparts, should_reject_track, ROTATION
-except ImportError:
-    print("Error: config.py not found in pipeline root")
+    from config import (
+        MoodCategory,
+        DaypartSegment,
+        DayType,
+        EnergyLevel,
+        ROTATION,
+        AUDIO_FILTERS,
+        AGGRESSIVE_FILTER,
+        MULTI_SIGNAL_FILTER,
+        get_dayparts_for_mood,
+        get_enabled_dayparts,
+        get_current_day_type,
+        get_all_playlist_names,
+        should_reject_track,
+        is_mood_enabled,
+        format_duration,
+    )
+except ImportError as e:
+    print(f"Error: config.py not found or invalid in pipeline root: {e}")
     sys.exit(1)
 
 # Configure logging
@@ -45,16 +62,23 @@ UPLOAD_TIMEOUT = 180
 
 
 class TrackFeatures(TypedDict):
-    """Track features extracted from ID3 tags."""
+    """Track features extracted from ID3 tags (v2.0 with circumplex model)."""
     artist: str
     title: str
     bpm: int
     mood: str | None
+    mood_confidence: float
+    energy_level: str | None
     duration: int
+    valence: float
+    arousal: float
+    # Flag pour filtrage audio intelligent (True si Last.fm avait des tags)
+    has_lastfm_tags: bool
+    # Multi-signal filtering fields
     mood_aggressive: float
-    mood_happy: float
-    mood_relaxed: float
-    mood_sad: float
+    genre_top: str
+    genre_top_prob: float
+    lastfm_tags: str
 
 
 class ClassifyClient(BaseAzuraCastClient):
@@ -72,13 +96,13 @@ class ClassifyClient(BaseAzuraCastClient):
             Dictionary of playlist names to IDs.
 
         Raises:
-            ConnectionError: If AzuraCast is unreachable.
+            HTTPConnectionError: If AzuraCast is unreachable.
         """
         try:
             data = self.get_playlists()
             return {p["name"]: p["id"] for p in data}
-        except (ClientError, ServerError, ConnectionError) as e:
-            logger.error(f"Failed to fetch playlists: {e}")
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.error("Failed to fetch playlists: %s", e)
             raise
 
     def get_existing_paths(self) -> set[str]:
@@ -89,13 +113,13 @@ class ClassifyClient(BaseAzuraCastClient):
             Set of lowercase file paths.
 
         Raises:
-            ConnectionError: If AzuraCast is unreachable.
+            HTTPConnectionError: If AzuraCast is unreachable.
         """
         try:
             data = self.get_station_files()
             return {f["path"].lower() for f in data}
-        except (ClientError, ServerError, ConnectionError) as e:
-            logger.error(f"Failed to fetch existing files: {e}")
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.error("Failed to fetch existing files: %s", e)
             raise
 
     def get_all_files(self) -> list[dict[str, Any]]:
@@ -106,12 +130,12 @@ class ClassifyClient(BaseAzuraCastClient):
             List of file dictionaries with id, path, mtime.
 
         Raises:
-            ConnectionError: If AzuraCast is unreachable.
+            HTTPConnectionError: If AzuraCast is unreachable.
         """
         try:
             return self.get_station_files()
-        except (ClientError, ServerError, ConnectionError) as e:
-            logger.error(f"Failed to fetch files: {e}")
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.error("Failed to fetch files: %s", e)
             raise
 
     def delete_file(self, file_id: int) -> bool:
@@ -127,13 +151,18 @@ class ClassifyClient(BaseAzuraCastClient):
         try:
             response = self.delete(f"/api/station/{self.station_id}/file/{file_id}")
             return response.status_code in [200, 204]
-        except (ClientError, ServerError, ConnectionError) as e:
-            logger.warning(f"Failed to delete file {file_id}: {e}")
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning("Failed to delete file %s: %s", file_id, e)
             return False
 
     def upload_file(self, filepath: Path) -> int | None:
         """
-        Upload file to AzuraCast with retry logic.
+        Upload file to AzuraCast with retry logic and integrity verification.
+
+        Best practices 2026:
+        - Computes hash before upload
+        - Verifies upload integrity via size/hash comparison
+        - Logs audit trail
 
         Args:
             filepath: Path to file.
@@ -142,6 +171,11 @@ class ClassifyClient(BaseAzuraCastClient):
             File ID or None on failure.
         """
         filename = filepath.name
+
+        # Compute hashes before upload for integrity verification
+        local_md5, local_sha256 = compute_file_hashes(filepath)
+        local_size = filepath.stat().st_size
+        logger.debug("  Pre-upload: size=%s, MD5=%s...", local_size, local_md5[:8])
 
         try:
             with open(filepath, "rb") as f:
@@ -152,7 +186,7 @@ class ClassifyClient(BaseAzuraCastClient):
                 )
 
             if response.status_code not in [200, 201]:
-                logger.warning(f"  Upload failed: HTTP {response.status_code}")
+                logger.warning("  Upload failed: HTTP %s", response.status_code)
                 return None
 
             logger.info("  Uploaded")
@@ -163,7 +197,7 @@ class ClassifyClient(BaseAzuraCastClient):
             # Find the uploaded file
             try:
                 data = self.get_station_files()
-            except (ClientError, ServerError, ConnectionError):
+            except (ClientError, ServerError, HTTPConnectionError):
                 return None
 
             if not data:
@@ -174,19 +208,43 @@ class ClassifyClient(BaseAzuraCastClient):
 
             # Match by filename
             fname_lower = filename.lower().replace(" ", "_").replace("-", "_")
+            uploaded_file = None
             for f in data[:5]:
                 path_lower = f["path"].lower()
                 if fname_lower[:10] in path_lower or path_lower[:10] in fname_lower:
-                    return f["id"]
+                    uploaded_file = f
+                    break
 
-            # Fallback: most recent
-            return data[0]["id"] if data else None
+            if not uploaded_file:
+                uploaded_file = data[0] if data else None
 
-        except (ClientError, ServerError, ConnectionError) as e:
-            logger.warning(f"  Upload error: {e}")
+            if not uploaded_file:
+                return None
+
+            # Verify upload integrity (best practice 2026)
+            remote_size = uploaded_file.get("size")
+            if remote_size and int(remote_size) != local_size:
+                logger.error("  INTEGRITY FAILED: size mismatch (local=%s, remote=%s)", local_size, remote_size)
+                # Delete corrupted upload
+                self.delete_file(uploaded_file["id"])
+                return None
+
+            # Check unique_id (often MD5 in AzuraCast)
+            unique_id = uploaded_file.get("unique_id", "")
+            if unique_id and len(unique_id) == 32:
+                if unique_id.lower() != local_md5.lower():
+                    logger.error("  INTEGRITY FAILED: MD5 mismatch")
+                    self.delete_file(uploaded_file["id"])
+                    return None
+
+            logger.info("  Integrity OK (size=%s)", local_size)
+            return uploaded_file["id"]
+
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning("  Upload error: %s", e)
             return None
         except OSError as e:
-            logger.warning(f"  File read error: {e}")
+            logger.warning("  File read error: %s", e)
             return None
 
     def assign_playlists(self, file_id: int, playlist_ids: list[int]) -> bool:
@@ -206,14 +264,14 @@ class ClassifyClient(BaseAzuraCastClient):
                 json={"playlists": playlist_ids},
             )
             return response.status_code == 200
-        except (ClientError, ServerError, ConnectionError) as e:
-            logger.warning(f"Failed to assign playlists: {e}")
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning("Failed to assign playlists: %s", e)
             return False
 
 
 def get_features_from_tags(filepath: str) -> TrackFeatures | None:
     """
-    Extract mood and features from ID3 tags.
+    Extract mood and features from ID3 tags (v2.0 circumplex model).
 
     Args:
         filepath: Path to MP3 file.
@@ -222,6 +280,8 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
         Track features or None on error.
     """
     try:
+        from mutagen import MutagenError
+
         tags = ID3(filepath)
 
         # Get artist/title
@@ -236,28 +296,51 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
             except (ValueError, TypeError):
                 pass
 
-        # Get custom tags
+        # Initialize default values
         mood: str | None = None
+        mood_confidence: float = 0.0
+        energy_level: str | None = None
         duration = 0
+        valence = 0.0
+        arousal = 0.0
+        has_lastfm_tags = False
         mood_aggressive = 0.0
-        mood_happy = 0.0
-        mood_relaxed = 0.0
-        mood_sad = 0.0
+        genre_top = ""
+        genre_top_prob = 0.0
+        lastfm_tags = ""
 
+        # Read TXXX frames (custom tags)
         for frame in tags.getall("TXXX"):
             try:
-                if frame.desc == "MOOD":
-                    mood = frame.text[0]
-                elif frame.desc == "DURATION":
-                    duration = int(frame.text[0])
-                elif frame.desc == "MOOD_AGGRESSIVE":
-                    mood_aggressive = float(frame.text[0])
-                elif frame.desc == "MOOD_HAPPY":
-                    mood_happy = float(frame.text[0])
-                elif frame.desc == "MOOD_RELAXED":
-                    mood_relaxed = float(frame.text[0])
-                elif frame.desc == "MOOD_SAD":
-                    mood_sad = float(frame.text[0])
+                desc = frame.desc.upper()
+                value = frame.text[0]
+
+                if desc == "MOOD":
+                    mood = value
+                elif desc == "MOOD_CONFIDENCE":
+                    mood_confidence = float(value)
+                elif desc == "ENERGY_LEVEL":
+                    energy_level = value
+                elif desc == "DURATION":
+                    duration = int(value)
+                elif desc == "VALENCE":
+                    valence = float(value)
+                elif desc == "AROUSAL":
+                    arousal = float(value)
+                elif desc == "HAS_LASTFM_TAGS":
+                    has_lastfm_tags = value.lower() == "true"
+                elif desc == "MOOD_AGGRESSIVE":
+                    mood_aggressive = float(value)
+                elif desc == "GENRE_TOP":
+                    genre_top = value
+                elif desc == "GENRE_TOP_PROB":
+                    genre_top_prob = float(value)
+                elif desc == "LASTFM_TAGS":
+                    lastfm_tags = value
+                    # If we have actual lastfm tags string, set the boolean too
+                    if value.strip():
+                        has_lastfm_tags = True
+
             except (ValueError, IndexError):
                 continue
 
@@ -266,38 +349,106 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
             "title": title,
             "bpm": bpm,
             "mood": mood,
+            "mood_confidence": mood_confidence,
+            "energy_level": energy_level,
             "duration": duration,
+            "valence": valence,
+            "arousal": arousal,
+            "has_lastfm_tags": has_lastfm_tags,
             "mood_aggressive": mood_aggressive,
-            "mood_happy": mood_happy,
-            "mood_relaxed": mood_relaxed,
-            "mood_sad": mood_sad,
+            "genre_top": genre_top,
+            "genre_top_prob": genre_top_prob,
+            "lastfm_tags": lastfm_tags,
         }
-    except Exception as e:
-        logger.debug(f"Failed to read tags: {e}")
+    except (MutagenError, OSError) as e:
+        logger.debug("Failed to read tags: %s", e)
         return None
+
+
+def should_reject_multisignal(features: TrackFeatures) -> tuple[bool, str]:
+    """
+    Multi-signal rejection for new tracks with discogs-effnet analysis.
+
+    Uses 4 independent signals:
+    1. mood_aggressive > threshold (discogs-effnet, 98% accuracy)
+    2. High arousal + negative valence (MusiCNN AV ensemble)
+    3. Genre in blocked list (genre_discogs400)
+    4. Last.fm tags matching blocked tags
+
+    Rules:
+    - mood_aggressive > solo_threshold → reject alone
+    - 2+ signals concordant → reject
+
+    Args:
+        features: Track features from ID3 tags.
+
+    Returns:
+        Tuple of (should_reject, reason).
+    """
+    config = MULTI_SIGNAL_FILTER
+    if not config.enabled:
+        return False, ""
+
+    signals = []
+
+    # Signal 1: mood_aggressive > threshold
+    if features.get("mood_aggressive", 0) > config.aggressive_threshold:
+        signals.append("aggressive_ml")
+
+    # Signal 2: AV high-arousal negative-valence
+    if (features.get("arousal", 0) > config.av_arousal_threshold
+            and features.get("valence", 0) < config.av_valence_threshold):
+        signals.append("arousal_valence")
+
+    # Signal 3: genre blocked
+    # Genre labels from discogs400 use "Parent---Subgenre" format
+    raw_genre = features.get("genre_top", "").lower()
+    genre = raw_genre.split("---")[-1] if "---" in raw_genre else raw_genre
+    if genre in config.genre_blocked:
+        signals.append("genre_blocked")
+
+    # Signal 4: lastfm tags
+    tags = {t.strip().lower() for t in features.get("lastfm_tags", "").split(",") if t.strip()}
+    if tags & config.lastfm_blocked_tags:
+        signals.append("lastfm_tags")
+
+    # Solo override: very high aggressive confidence
+    if features.get("mood_aggressive", 0) > config.aggressive_solo_threshold:
+        return True, "aggressive_solo (%.2f)" % features["mood_aggressive"]
+
+    # Consensus: 2+ signals
+    if len(signals) >= config.min_signals_to_reject:
+        return True, "%d signals: %s" % (len(signals), ", ".join(signals))
+
+    return False, ""
 
 
 def process_track(
     filepath: Path,
     client: ClassifyClient,
     playlists: dict[str, int],
-    existing: set[str]
+    existing: set[str],
+    track_db: TrackDB | None = None,
 ) -> tuple[str, list[str]]:
     """
     Process and upload a single track.
+
+    Assigns tracks to playlists based on mood and day-of-week compatibility.
+    A track may be assigned to multiple daypart×day combinations.
 
     Args:
         filepath: Path to track.
         client: AzuraCast client.
         playlists: Available playlists (daypart name -> ID).
         existing: Set of existing file paths.
+        track_db: Optional persistent track database.
 
     Returns:
-        Tuple of (status, dayparts_assigned).
+        Tuple of (status, playlists_assigned).
         Status: "uploaded", "rejected", "skipped", or "failed".
     """
     filename = filepath.name
-    logger.info(f"\n{filename}")
+    logger.info("\n%s", filename)
 
     # Check duplicate
     normalized = filename.lower().replace(" ", "_")
@@ -310,115 +461,262 @@ def process_track(
     features = get_features_from_tags(str(filepath))
     if not features or not features["mood"]:
         logger.warning("  Failed: no mood tag")
+        filepath.unlink()  # Clean up
         return "failed", []
 
     mood = features["mood"]
-    duration_min = features["duration"] // 60
-    duration_sec = features["duration"] % 60
-    logger.info(f"  {features['artist']} - {features['title']}")
-    logger.info(f"  BPM: {features['bpm']} | Mood: {mood} | Duration: {duration_min}:{duration_sec:02d}")
+    artist = features["artist"]
+    title = features["title"]
+    bpm = features["bpm"]
+    duration = features["duration"]
+    confidence = features["mood_confidence"]
+    energy_level = features["energy_level"]
+    valence = features["valence"]
+    arousal = features["arousal"]
+
+    # Display track info
+    duration_str = format_duration(duration) if duration > 0 else "?"
+    confidence_str = f"{confidence:.0%}" if confidence > 0 else "?"
+    logger.info("  %s - %s", artist, title)
+    logger.info("  BPM: %s | Mood: %s (%s) | Duration: %s", bpm, mood, confidence_str, duration_str)
+    if energy_level:
+        logger.info("  Energy: %s | V/A: %+.2f/%+.2f", energy_level, valence, arousal)
+
+    # Build features dict for rejection check
+    reject_features = {
+        "mood": mood,
+        "bpm": bpm,
+        "duration": duration,
+        "confidence": confidence,
+    }
 
     # Check if track should be rejected (using config rules)
-    reject, reason = should_reject_track(features)
+    reject, reason = should_reject_track(reject_features)
     if reject:
-        logger.info(f"  Rejected: {reason}")
+        logger.info("  Rejected: %s", reason)
         filepath.unlink()
         return "rejected", []
 
-    # Get dayparts for this mood
-    dayparts = get_dayparts_for_mood(mood)
-    if not dayparts:
-        logger.warning(f"  Failed: no dayparts configured for mood '{mood}'")
-        return "failed", []
+    # Multi-signal filter (new tracks with discogs-effnet analysis)
+    # For tracks with mood_aggressive tag (new pipeline), use multi-signal consensus.
+    # For legacy tracks without it, fallback to the old AV-based aggressive filter.
+    has_multisignal = features.get("mood_aggressive", 0) > 0 or features.get("genre_top", "")
+    has_lastfm_tags = features.get("has_lastfm_tags", False)
 
-    # Check all daypart playlists exist
-    missing_playlists = [dp for dp in dayparts if dp not in playlists]
-    if missing_playlists:
-        logger.warning(f"  Failed: missing playlists: {', '.join(missing_playlists)}")
+    if has_multisignal:
+        reject_ms, reason_ms = should_reject_multisignal(features)
+        if reject_ms:
+            logger.info("  Rejected (multi-signal): %s", reason_ms)
+            filepath.unlink()
+            return "rejected", []
+    elif AGGRESSIVE_FILTER.enabled and not has_lastfm_tags:
+        # Legacy fallback for tracks without discogs-effnet tags
+        is_aggressive = (
+            arousal > AGGRESSIVE_FILTER.arousal_threshold and
+            valence < AGGRESSIVE_FILTER.valence_threshold
+        )
+        is_blocked_mood = (
+            AGGRESSIVE_FILTER.block_intense_mood and
+            mood in ("Intense", "Angry")
+        )
+        if is_aggressive or is_blocked_mood:
+            reason = "Audio agressif détecté (V:%+.2f/A:%+.2f, mood:%s)" % (valence, arousal, mood)
+            logger.info("  Rejected: %s", reason)
+            filepath.unlink()
+            return "rejected", []
+
+    # Assign to daypart playlists based on mood compatibility
+    assigned_playlists: list[str] = []
+
+    for segment in get_dayparts_for_mood(mood):
+        playlist_name = segment.value
+        if playlist_name in playlists and playlist_name not in assigned_playlists:
+            assigned_playlists.append(playlist_name)
+
+    if not assigned_playlists:
+        logger.warning("  Failed: no playlists found for mood '%s'", mood)
+        filepath.unlink()  # Clean up
         return "failed", []
 
     # Upload
     file_id = client.upload_file(filepath)
     if not file_id:
+        filepath.unlink()  # Clean up failed upload
         return "failed", []
 
-    # Assign to all daypart playlists
-    playlist_ids = [playlists[dp] for dp in dayparts]
+    # Assign to all applicable playlists
+    playlist_ids = [playlists[name] for name in assigned_playlists]
     if client.assign_playlists(file_id, playlist_ids):
-        logger.info(f"  → Assigned to: {', '.join(dayparts)}")
+        # Show summary of assignments
+        if len(assigned_playlists) <= 5:
+            logger.info("  → Assigned to: %s", ", ".join(assigned_playlists))
+        else:
+            logger.info("  → Assigned to %s playlists", len(assigned_playlists))
+
+        # Record in persistent TrackDB
+        if track_db and file_id:
+            track_key = normalize_track_key(artist, title)
+            track_db.record_upload(track_key, artist, title, file_id, mood)
+
         filepath.unlink()
-        return "uploaded", dayparts
+        return "uploaded", assigned_playlists
     else:
         logger.warning("  Warning: playlist assignment failed")
         return "failed", []
 
 
-def enforce_rotation(client: ClassifyClient, new_tracks_count: int) -> int:
+def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_tracks_count: int) -> int:
     """
-    Enforce track rotation by removing oldest tracks if needed.
+    Enforce 3-tier track rotation for discovery webradio.
+
+    Tiers:
+      FRESH (0-fresh_days)         : protection totale
+      CURRENT (fresh-current_days) : supprimé si library pleine + plays >= seuil
+      FADING (current-max_age_days): plafonné à fading_max_pct% de la library
+      EXPIRED (>max_age_days)      : force delete
 
     Args:
         client: AzuraCast client.
+        track_db: Persistent track database.
         new_tracks_count: Number of new tracks to be added.
 
     Returns:
         Number of tracks deleted.
     """
-    max_tracks = ROTATION["max_tracks"]
-    min_age_days = ROTATION["min_age_days"]
+    max_tracks = ROTATION.max_tracks
+    fresh_days = ROTATION.fresh_days
+    current_days = ROTATION.current_days
+    max_age_days = ROTATION.max_age_days
+    fading_max_pct = ROTATION.fading_max_pct
+    min_plays = ROTATION.min_plays_before_delete
 
-    # Get all files
+    # --- Phase 1: Sync play counts ---
+    last_sync = track_db.get_last_sync_timestamp()
+    history = client.get_history_since(last_sync)  # returns [] on API error
+    if history:
+        track_db.sync_play_counts(history)
+
+    # --- Phase 2: Classify tracks into tiers ---
     files = client.get_all_files()
     current_count = len(files)
+    now = time.time()
 
-    logger.info(f"\n=== Rotation Check ===")
-    logger.info(f"Current tracks: {current_count}")
-    logger.info(f"New tracks to add: {new_tracks_count}")
-    logger.info(f"Max allowed: {max_tracks}")
+    logger.info("\n=== Tiered Rotation Check ===")
+    logger.info("Library: %s tracks | New to add: %s | Max: %s", current_count, new_tracks_count, max_tracks)
+    logger.info("Tiers: FRESH<%sd | CURRENT<%sd | FADING<%sd | EXPIRED", fresh_days, current_days, max_age_days)
 
-    # Calculate how many we need to delete
-    total_after_upload = current_count + new_tracks_count
-    to_delete_count = max(0, total_after_upload - max_tracks)
+    tiers: dict[str, list[dict[str, Any]]] = {
+        "FRESH": [], "CURRENT": [], "FADING": [], "EXPIRED": [],
+    }
 
-    if to_delete_count == 0:
-        logger.info("No rotation needed")
-        return 0
+    for f in files:
+        file_id = f.get("id")
+        artist = f.get("artist", "") or ""
+        title = f.get("title", "") or ""
 
-    logger.info(f"Need to delete: {to_delete_count} tracks")
+        # Look up in TrackDB by file_id for accurate uploaded_at and play_count
+        db_track = track_db.get_track_by_file_id(file_id) if file_id else None
 
-    # Sort files by mtime (oldest first)
-    # mtime is Unix timestamp in AzuraCast API
-    files_with_mtime = [f for f in files if f.get("mtime")]
-    files_with_mtime.sort(key=lambda x: x.get("mtime", 0))
+        if db_track:
+            uploaded_at = db_track["uploaded_at"]
+            play_count = db_track["play_count"]
+            track_key = db_track["track_key"]
+        else:
+            # Auto-register untracked files using AzuraCast's uploaded_at
+            uploaded_at = f.get("uploaded_at") or f.get("mtime") or now
+            play_count = 0
+            track_key = normalize_track_key(artist, title) if artist and title else ""
+            # Persist into TrackDB so future runs have accurate data
+            if track_key and file_id:
+                track_db.register_untracked_file(track_key, artist, title, uploaded_at, file_id)
 
-    # Calculate cutoff timestamp (min_age_days ago)
-    cutoff_timestamp = time.time() - (min_age_days * 24 * 60 * 60)
+        age_days = (now - uploaded_at) / 86400
+
+        entry = {
+            "file_id": file_id,
+            "artist": artist,
+            "title": title,
+            "track_key": track_key,
+            "age_days": age_days,
+            "play_count": play_count,
+            "uploaded_at": uploaded_at,
+        }
+
+        if age_days <= fresh_days:
+            tiers["FRESH"].append(entry)
+        elif age_days <= current_days:
+            tiers["CURRENT"].append(entry)
+        elif age_days <= max_age_days:
+            tiers["FADING"].append(entry)
+        else:
+            tiers["EXPIRED"].append(entry)
+
+    for tier_name, tracks in tiers.items():
+        logger.info("  %s: %s tracks", tier_name, len(tracks))
+
+    # --- Monitor: warn about active tracks with 0 plays after 7+ days ---
+    zero_play_old = [
+        e for e in (tiers["CURRENT"] + tiers["FADING"])
+        if e["play_count"] == 0 and e["age_days"] > 7
+    ]
+    if zero_play_old:
+        logger.warning("  ⚠ %s tracks actives > 7j avec 0 plays (possible problème AzuraCast scheduling):", len(zero_play_old))
+        for e in zero_play_old[:10]:
+            logger.warning("    - %s - %s (%.0fj)", e["artist"], e["title"], e["age_days"])
+        if len(zero_play_old) > 10:
+            logger.warning("    ... et %s autres", len(zero_play_old) - 10)
 
     deleted_count = 0
-    for file_info in files_with_mtime:
-        if deleted_count >= to_delete_count:
-            break
 
-        file_mtime = file_info.get("mtime", 0)
-        file_id = file_info.get("id")
-        file_path = file_info.get("path", "unknown")
-
-        # Skip if file is younger than min_age_days
-        if file_mtime > cutoff_timestamp:
-            logger.info(f"  Skipping {file_path} (< {min_age_days} days old)")
-            continue
-
-        # Delete the file
-        if client.delete_file(file_id):
-            logger.info(f"  Deleted: {file_path}")
+    # --- Phase 3: Force delete EXPIRED (>max_age_days) ---
+    for entry in tiers["EXPIRED"]:
+        if client.delete_file(entry["file_id"]):
+            logger.info("  EXPIRED: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
+            if entry["track_key"]:
+                track_db.record_deletion(entry["track_key"])
             deleted_count += 1
-        else:
-            logger.warning(f"  Failed to delete: {file_path}")
 
-    logger.info(f"Rotation complete: {deleted_count}/{to_delete_count} deleted")
+    # --- Phase 4: Cap FADING to fading_max_pct% of library ---
+    fading_max_count = int(max_tracks * fading_max_pct / 100)
+    fading_excess = len(tiers["FADING"]) - fading_max_count
 
-    if deleted_count < to_delete_count:
-        logger.warning(f"Could not delete enough tracks (protected by {min_age_days}-day rule)")
+    if fading_excess > 0:
+        # Sort by play_count ascending: least-played leave first (failed to get traction)
+        fading_sorted = sorted(tiers["FADING"], key=lambda x: x["play_count"], reverse=False)
+        for entry in fading_sorted[:fading_excess]:
+            if client.delete_file(entry["file_id"]):
+                logger.info("  FADING cap: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
+                if entry["track_key"]:
+                    track_db.record_deletion(entry["track_key"])
+                deleted_count += 1
+
+    # --- Phase 5: Cap total if library + new > max_tracks ---
+    remaining = current_count - deleted_count + new_tracks_count
+    overflow = max(0, remaining - max_tracks)
+
+    if overflow > 0:
+        # Candidates: CURRENT with plays >= min_plays, oldest first
+        candidates = sorted(
+            [t for t in tiers["CURRENT"] if t["play_count"] >= min_plays],
+            key=lambda x: x["uploaded_at"],
+        )
+        for entry in candidates:
+            if overflow <= 0:
+                break
+            if client.delete_file(entry["file_id"]):
+                logger.info("  CURRENT overflow: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
+                if entry["track_key"]:
+                    track_db.record_deletion(entry["track_key"])
+                deleted_count += 1
+                overflow -= 1
+
+    # --- Phase 6: Summary ---
+    logger.info("\n=== Rotation Summary ===")
+    logger.info("Deleted: %s", deleted_count)
+    logger.info("Library after rotation: %s (+ %s new)", current_count - deleted_count, new_tracks_count)
+
+    stats = track_db.get_stats()
+    logger.info("TrackDB stats: %s", stats)
 
     return deleted_count
 
@@ -427,33 +725,71 @@ def main() -> int:
     """
     Main entry point.
 
+    Rotation always runs (even with 0 new files) to enforce age-based tiers.
+
     Returns:
         Exit code (0 for success, 1 for failure).
     """
-    logger.info("=== Upload to AzuraCast ===")
+    logger.info("=== Upload to AzuraCast (v2.2 - Tiered Rotation) ===")
 
     # Validate configuration
     is_valid, errors = validate_environment()
     if not is_valid:
         for error in errors:
-            logger.error(f"Config error: {error}")
+            logger.error("Config error: %s", error)
         return 1
 
     settings = get_settings()
 
-    # Get music files
-    music_dir = Path(__file__).parent.parent / "music"
+    # Get music files (from downloads/ where analyze.py processes them)
+    music_dir = Path(__file__).parent.parent / "downloads"
     files = list(music_dir.glob("*.mp3")) if music_dir.exists() else []
 
-    if not files:
-        logger.info("No MP3 files to process")
-        return 0
+    # Initialize persistent TrackDB (closed in finally block)
+    db_path = Path(__file__).parent.parent / "data" / "tracks.db"
+    track_db = TrackDB(db_path)
 
-    # Show enabled dayparts
-    enabled_dayparts = get_enabled_dayparts()
-    logger.info(f"Files: {len(files)}")
-    logger.info(f"Server: {settings.azuracast_url}")
-    logger.info(f"Daypart playlists: {', '.join(enabled_dayparts)}")
+    try:
+        return _main_inner(settings, files, music_dir, track_db)
+    finally:
+        track_db.close()
+
+
+def _main_inner(
+    settings: Any,
+    files: list[Path],
+    music_dir: Path,
+    track_db: TrackDB,
+) -> int:
+    """Inner main logic (TrackDB is guaranteed to be closed by caller)."""
+    # Show current day type
+    current_day = get_current_day_type()
+    day_labels = {
+        DayType.WEEKDAY: "Lundi-Jeudi (Semaine)",
+        DayType.FRIDAY: "Vendredi",
+        DayType.SATURDAY: "Samedi",
+        DayType.SUNDAY: "Dimanche",
+    }
+    logger.info("Aujourd'hui: %s", day_labels[current_day])
+
+    # Show all possible playlists (daypart × day)
+    all_playlist_names = get_all_playlist_names()
+
+    logger.info("Files: %s", len(files))
+    logger.info("Server: %s", settings.azuracast_url)
+    logger.info("Total playlists possible: %s", len(all_playlist_names))
+
+    # Show audio filters
+    if AUDIO_FILTERS.duration_min or AUDIO_FILTERS.duration_max:
+        filter_parts = []
+        if AUDIO_FILTERS.duration_min:
+            filter_parts.append(f"min {format_duration(AUDIO_FILTERS.duration_min)}")
+        if AUDIO_FILTERS.duration_max:
+            filter_parts.append(f"max {format_duration(AUDIO_FILTERS.duration_max)}")
+        logger.info("Duration filter: %s", ", ".join(filter_parts))
+
+    if AUDIO_FILTERS.min_confidence:
+        logger.info("Min confidence: %.0f%%", AUDIO_FILTERS.min_confidence * 100)
 
     # Initialize robust client with retry logic
     client = ClassifyClient(
@@ -471,43 +807,51 @@ def main() -> int:
     # Get playlists (with retry logic)
     try:
         playlists = client.get_playlists_map()
-    except (ClientError, ServerError, ConnectionError) as e:
-        logger.error(f"Cannot connect to AzuraCast: {e}")
+    except (ClientError, ServerError, HTTPConnectionError) as e:
+        logger.error("Cannot connect to AzuraCast: %s", e)
         return 1
 
     if not playlists:
         logger.error("Error: Could not fetch playlists")
         return 1
-    logger.info(f"Available playlists: {', '.join(playlists.keys())}")
+    logger.info("Available playlists (%s): %s", len(playlists), ", ".join(playlists.keys()))
 
-    # Check that all enabled dayparts have playlists
-    missing = [dp for dp in enabled_dayparts if dp not in playlists]
+    # Check which playlists exist vs expected
+    existing_expected = [p for p in all_playlist_names if p in playlists]
+    missing = [p for p in all_playlist_names if p not in playlists]
+
+    logger.info("Found playlists: %s/%s", len(existing_expected), len(all_playlist_names))
     if missing:
-        logger.warning(f"Warning: Missing playlists for: {', '.join(missing)}")
-        logger.warning("Run: ./scripts/setup_playlists.sh")
+        logger.warning("Missing playlists: %s", len(missing))
+        logger.warning("Run setup_playlists.py to create missing playlists")
 
     # Get existing files (with retry logic)
     try:
         existing = client.get_existing_paths()
-    except (ClientError, ServerError, ConnectionError) as e:
-        logger.error(f"Cannot fetch existing files: {e}")
+    except (ClientError, ServerError, HTTPConnectionError) as e:
+        logger.error("Cannot fetch existing files: %s", e)
         logger.error("Aborting to prevent duplicates.")
         return 1
 
-    logger.info(f"Existing files: {len(existing)}")
+    logger.info("Existing files: %s", len(existing))
 
-    # Enforce rotation before uploading new tracks
+    # Enforce tiered rotation ALWAYS (even with 0 new files)
     try:
-        enforce_rotation(client, len(files))
-    except (ClientError, ServerError, ConnectionError) as e:
-        logger.warning(f"Rotation check failed: {e}")
+        enforce_tiered_rotation(client, track_db, len(files))
+    except (ClientError, ServerError, HTTPConnectionError) as e:
+        logger.warning("Rotation check failed: %s", e)
         # Continue anyway - rotation is not critical
 
     # Refresh existing paths after rotation
     try:
         existing = client.get_existing_paths()
-    except (ClientError, ServerError, ConnectionError):
+    except (ClientError, ServerError, HTTPConnectionError):
         pass  # Use previous set if refresh fails
+
+    # If no new files, we're done (rotation already ran)
+    if not files:
+        logger.info("No MP3 files to process")
+        return 0
 
     # Initialize stats
     results: dict[str, int] = {
@@ -516,29 +860,46 @@ def main() -> int:
         "skipped": 0,
         "failed": 0,
     }
-    daypart_counts: dict[str, int] = {dp: 0 for dp in enabled_dayparts}
+    playlist_counts: dict[str, int] = {}
 
     # Process files
     for filepath in files:
-        status, assigned_dayparts = process_track(filepath, client, playlists, existing)
+        status, assigned_playlists = process_track(
+            filepath, client, playlists, existing, track_db
+        )
         results[status] += 1
 
-        # Count assignments per daypart
-        for dp in assigned_dayparts:
-            daypart_counts[dp] += 1
+        # Count assignments per playlist
+        for pl in assigned_playlists:
+            playlist_counts[pl] = playlist_counts.get(pl, 0) + 1
 
     # Print results
     logger.info("\n=== Results ===")
-    logger.info(f"  Uploaded: {results['uploaded']}")
-    logger.info(f"  Rejected: {results['rejected']}")
-    logger.info(f"  Skipped: {results['skipped']}")
-    logger.info(f"  Failed: {results['failed']}")
+    logger.info("  Uploaded: %s", results['uploaded'])
+    logger.info("  Rejected: %s", results['rejected'])
+    logger.info("  Skipped: %s", results['skipped'])
+    logger.info("  Failed: %s", results['failed'])
 
-    if results['uploaded'] > 0:
-        logger.info("\n=== Daypart Distribution ===")
-        for dp in enabled_dayparts:
-            if daypart_counts[dp] > 0:
-                logger.info(f"  {dp}: {daypart_counts[dp]}")
+    if results['uploaded'] > 0 and playlist_counts:
+        logger.info("\n=== Playlist Distribution ===")
+        for name, count in sorted(playlist_counts.items()):
+            logger.info("  %s: %s", name, count)
+
+    # Write actual upload count for run.sh stats
+    upload_count_file = Path(__file__).parent.parent / "data" / "last_upload_count.txt"
+    upload_count_file.parent.mkdir(parents=True, exist_ok=True)
+    upload_count_file.write_text(str(results['uploaded']), encoding="utf-8")
+
+    # Cleanup: clear tracks-to-download.json after processing
+    tracks_file = Path(__file__).parent.parent / "tracks-to-download.json"
+    if tracks_file.exists():
+        tracks_file.write_text("[]", encoding="utf-8")
+        logger.info("\nCleanup: tracks-to-download.json cleared")
+
+    # Cleanup: remove downloads directory if empty
+    if music_dir.exists() and not any(music_dir.iterdir()):
+        music_dir.rmdir()
+        logger.info("Cleanup: downloads/ directory removed")
 
     return 0
 

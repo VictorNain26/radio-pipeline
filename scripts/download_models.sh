@@ -1,5 +1,5 @@
 #!/bin/bash
-# Download Essentia pre-trained mood classification models
+# Download Essentia pre-trained models for audio analysis
 # Models from: https://essentia.upf.edu/models.html
 
 set -e
@@ -10,13 +10,18 @@ MODELS_DIR="$PIPELINE_DIR/models"
 
 BASE_URL="https://essentia.upf.edu/models"
 
-# Models to download (using MusiCNN embeddings)
+# MusiCNN embedding + 3 arousal-valence heads
+# Discogs-EffNet embedding + mood_aggressive + genre_discogs400
 declare -A MODELS=(
+    # MusiCNN (arousal-valence ensemble)
     ["msd-musicnn-1.pb"]="feature-extractors/musicnn/msd-musicnn-1.pb"
-    ["mood_aggressive-msd-musicnn-1.pb"]="classification-heads/mood_aggressive/mood_aggressive-msd-musicnn-1.pb"
-    ["mood_happy-msd-musicnn-1.pb"]="classification-heads/mood_happy/mood_happy-msd-musicnn-1.pb"
-    ["mood_relaxed-msd-musicnn-1.pb"]="classification-heads/mood_relaxed/mood_relaxed-msd-musicnn-1.pb"
-    ["mood_sad-msd-musicnn-1.pb"]="classification-heads/mood_sad/mood_sad-msd-musicnn-1.pb"
+    ["deam-msd-musicnn-2.pb"]="classification-heads/deam/deam-msd-musicnn-2.pb"
+    ["emomusic-msd-musicnn-2.pb"]="classification-heads/emomusic/emomusic-msd-musicnn-2.pb"
+    ["muse-msd-musicnn-2.pb"]="classification-heads/muse/muse-msd-musicnn-2.pb"
+    # Discogs-EffNet (multi-signal filtering)
+    ["discogs-effnet-bs64-1.pb"]="feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb"
+    ["mood_aggressive-discogs-effnet-1.pb"]="classification-heads/mood_aggressive/mood_aggressive-discogs-effnet-1.pb"
+    ["genre_discogs400-discogs-effnet-1.pb"]="classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1.pb"
 )
 
 echo "=== Downloading Essentia Models ==="
