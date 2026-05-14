@@ -33,6 +33,7 @@ from discovery_sources import (  # noqa: E402
     DiscoverySource,
     HypeMachineSource,
     LastFMTagSource,
+    ManualPicksSource,
     RSSFeedConfig,
     RSSSource,
     Track,
@@ -56,6 +57,7 @@ logger = logging.getLogger(__name__)
 PIPELINE_DIR = Path(__file__).parent.parent
 OUTPUT_FILE = PIPELINE_DIR / "tracks-to-download.json"
 CUSTOM_FEEDS_FILE = PIPELINE_DIR / "data" / "custom_feeds.json"
+MANUAL_PICKS_FILE = PIPELINE_DIR / "data" / "manual_picks.json"
 
 # A bigger HypeMachine batch keeps the legacy source competitive among many.
 HYPEM_COUNT = 50
@@ -95,6 +97,10 @@ def _build_sources() -> list[DiscoverySource]:
         )
     elif LASTFM_TAGS and not settings.lastfm_api_key:
         logger.warning("LASTFM_API_KEY not set — skipping Last.fm tag sources")
+
+    # Manual picks: editorial overrides (data/manual_picks.json).
+    # Used to be a separate step (discover_manual.py); folded in here now.
+    sources.append(ManualPicksSource(path=MANUAL_PICKS_FILE))
 
     # User-added custom feeds (rss.app etc.)
     sources.append(CustomFeedsSource(path=CUSTOM_FEEDS_FILE))

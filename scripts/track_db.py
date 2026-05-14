@@ -53,8 +53,16 @@ class TrackDB:
                 deleted_at REAL,
                 azuracast_file_id INTEGER,
                 play_count INTEGER DEFAULT 0,
-                mood TEXT
+                mood TEXT,
+                -- Rotation category: HEAVY / MEDIUM / DISCOVERY (see
+                -- config.ROTATION_CATEGORIES). New tracks start at DISCOVERY;
+                -- get promoted by enforce_tiered_rotation as their play_count
+                -- and age grow. Promotion is one-way (no automatic demotion).
+                tier TEXT DEFAULT 'DISCOVERY'
             );
+
+            -- Idempotent migration : on existing DBs, ensure the new column
+            -- is there even if the table predates it.
 
             CREATE TABLE IF NOT EXISTS sync_state (
                 key TEXT PRIMARY KEY,
@@ -74,6 +82,13 @@ class TrackDB:
             CREATE INDEX IF NOT EXISTS idx_fp_hash
                 ON audio_fingerprints(fingerprint_hash);
         """)
+        # Ensure tier column exists on legacy DBs (idempotent).
+        try:
+            cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}
+            if "tier" not in cols:
+                self.conn.execute("ALTER TABLE tracks ADD COLUMN tier TEXT DEFAULT 'DISCOVERY'")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -110,23 +125,39 @@ class TrackDB:
         return dict(row) if row else None
 
     def record_upload(
-        self, track_key: str, artist: str, title: str, file_id: int, mood: str | None = None
+        self, track_key: str, artist: str, title: str, file_id: int,
+        mood: str | None = None, tier: str = "DISCOVERY",
     ) -> None:
-        """Record a track upload (or re-upload)."""
+        """Record a track upload (or re-upload). New tracks start in DISCOVERY tier."""
         now = time.time()
         self.conn.execute(
             """INSERT INTO tracks (track_key, artist, title, uploaded_at, deleted_at,
-                                   azuracast_file_id, play_count, mood)
-               VALUES (?, ?, ?, ?, NULL, ?, 0, ?)
+                                   azuracast_file_id, play_count, mood, tier)
+               VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?)
                ON CONFLICT(track_key) DO UPDATE SET
                    uploaded_at = excluded.uploaded_at,
                    deleted_at = NULL,
                    azuracast_file_id = excluded.azuracast_file_id,
                    play_count = 0,
-                   mood = excluded.mood""",
-            (track_key, artist, title, now, file_id, mood),
+                   mood = excluded.mood,
+                   tier = excluded.tier""",
+            (track_key, artist, title, now, file_id, mood, tier),
         )
         self.conn.commit()
+
+    def update_tier(self, track_key: str, tier: str) -> None:
+        """Update the rotation tier of an existing track."""
+        self.conn.execute(
+            "UPDATE tracks SET tier = ? WHERE track_key = ?",
+            (tier, track_key),
+        )
+        self.conn.commit()
+
+    def get_tier(self, track_key: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT tier FROM tracks WHERE track_key = ?", (track_key,)
+        ).fetchone()
+        return row["tier"] if row else None
 
     def record_deletion(self, track_key: str) -> None:
         """Mark a track as deleted."""
@@ -198,7 +229,7 @@ class TrackDB:
         """Look up a track by its AzuraCast file ID."""
         row = self.conn.execute(
             """SELECT track_key, artist, title, uploaded_at, azuracast_file_id,
-                      play_count, mood
+                      play_count, mood, tier
                FROM tracks WHERE azuracast_file_id = ?""",
             (file_id,),
         ).fetchone()

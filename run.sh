@@ -249,10 +249,10 @@ main() {
     # Health check
     check_azuracast
 
-    # Step 1: Discover tracks from HypeMachine API
+    # Step 1: Discover tracks (multi-source : HypeMachine + RSS + Last.fm + manual picks)
     echo ""
     echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│ STEP 1/4: DISCOVER (HypeMachine API)                           │"
+    echo "│ STEP 1/4: DISCOVER (multi-source)                              │"
     echo "└─────────────────────────────────────────────────────────────────┘"
 
     if ! python3 scripts/discover.py; then
@@ -260,45 +260,36 @@ main() {
         exit 1
     fi
 
-    # Step 1b: Merge manual picks (secondary source)
-    if [ -f "data/manual_picks.json" ]; then
-        log_info "Checking manual picks..."
-        python3 scripts/discover_manual.py || log_warn "Manual picks step failed, continuing..."
-    fi
-
     DOWNLOAD_COUNT=0
-
-    # Check if we have tracks to download
     HAS_TRACKS=false
     if [ -f "tracks-to-download.json" ]; then
         HAS_TRACKS=true
     else
-        log_info "No tracks to download (HypeMachine returned nothing)"
+        log_info "No tracks-to-download.json (all sources empty)"
     fi
 
-    # Step 2: Download from YouTube (only if tracks discovered)
+    # Step 2: Download (yt-dlp, multi-quality-gates: AcoustID dedup + speech filter + loudnorm)
     if [ "$HAS_TRACKS" = true ]; then
         echo ""
         echo "┌─────────────────────────────────────────────────────────────────┐"
-        echo "│ STEP 2/4: DOWNLOAD (yt-dlp)                                    │"
+        echo "│ STEP 2/4: DOWNLOAD (yt-dlp + quality gates)                    │"
         echo "└─────────────────────────────────────────────────────────────────┘"
 
         if ! python3 scripts/download.py; then
             log_warn "Download step failed, continuing for rotation..."
         fi
 
-        # Check if downloads succeeded
         DOWNLOAD_COUNT=$(find downloads -name "*.mp3" 2>/dev/null | wc -l)
         log_info "Downloaded $DOWNLOAD_COUNT files"
 
-        # Step 3: Analyze audio (only if new downloads)
+        # Step 3: Analyze (Essentia + optional CLAP)
         if [ "$DOWNLOAD_COUNT" -gt 0 ]; then
             echo ""
             echo "┌─────────────────────────────────────────────────────────────────┐"
-            echo "│ STEP 3/4: ANALYZE (Essentia/MTG)                               │"
+            echo "│ STEP 3/4: ANALYZE (Essentia/MTG + CLAP)                        │"
             echo "└─────────────────────────────────────────────────────────────────┘"
 
-            if ! ./scripts/analyze.sh; then
+            if ! python3 scripts/analyze.py; then
                 log_warn "Analyze step had issues, continuing..."
             fi
         fi
@@ -307,7 +298,7 @@ main() {
     # Step 4: Classify and Upload to AzuraCast (ALWAYS runs for rotation)
     echo ""
     echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│ STEP 4/4: UPLOAD (AzuraCast)                                   │"
+    echo "│ STEP 4/4: CLASSIFY + UPLOAD + ROTATE                           │"
     echo "└─────────────────────────────────────────────────────────────────┘"
 
     if ! python3 scripts/classify.py; then
@@ -320,13 +311,16 @@ main() {
     echo "║                    PIPELINE COMPLETE                          ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
 
-    # Read actual upload count from classify.py output
-    UPLOAD_COUNT=0
-    if [ -f "data/last_upload_count.txt" ]; then
-        UPLOAD_COUNT=$(cat data/last_upload_count.txt 2>/dev/null || echo 0)
-    fi
+    # Upload count from last_download_stats.json (single source of truth).
+    UPLOAD_COUNT=$(python3 -c "
+import json,sys
+try:
+    d = json.load(open('data/last_download_stats.json'))
+    print(d.get('downloaded', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
 
-    # Write stats with distinct download/upload counts
     write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
     notify "AubeSonore Pipeline OK" "Pipeline OK. DL:${DOWNLOAD_COUNT:-0} UL:${UPLOAD_COUNT:-0}" "low" "white_check_mark"
 

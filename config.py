@@ -531,16 +531,62 @@ AUDIO_FILTERS = AudioFilters(
     reject_low_quality=True,
 )
 
-# Rotation de la bibliothèque (3-tiers)
+# Rotation de la bibliothèque.
+# max_tracks 600 → 700 : laisse une marge pour la stratification HEAVY/MEDIUM/
+# DISCOVERY (sinon les 3 catégories sont trop serrées). Lifetime moyen passe
+# de ~24j à ~35-40j → davantage de plays par track avant éviction → expérience
+# auditeur plus "memorable" (les hits émergent vraiment au lieu d'être noyés).
 ROTATION = RotationConfig(
-    max_tracks=600,
-    fresh_days=10,
-    current_days=30,
-    max_age_days=50,
+    max_tracks=700,
+    fresh_days=14,           # 10 → 14 : laisse plus de temps à un nouveau track de "prouver" via plays
+    current_days=35,         # 30 → 35
+    max_age_days=60,         # 50 → 60 : alignement avec cooldown
     cooldown_days=60,
     fading_max_pct=20.0,
-    min_plays_before_delete=3,
+    min_plays_before_delete=5,  # 3 → 5 : un peu plus exigeant avant éviction
 )
+
+
+# =============================================================================
+# ROTATION CATEGORIES — tier-based playlist assignment (MusicMaster-inspired)
+# =============================================================================
+#
+# Plutôt que toute track aille dans TOUS les dayparts compatibles avec son
+# mood, on stratifie par "tier" basé sur l'âge et le play_count :
+#
+#   HEAVY     — anchors prouvés : play_count >= heavy_min_plays ET age >= heavy_min_age_days.
+#               Va dans TOUS les dayparts compatibles → forte rotation.
+#   MEDIUM    — backbone : tracks établies, performance moyenne.
+#               Va dans medium_daypart_count dayparts max.
+#   DISCOVERY — nouveaux ou pas encore prouvés : age < discovery_max_age_days.
+#               Va dans discovery_daypart_count dayparts seulement → light rotation.
+#
+# Cible de mix dans la library : HEAVY ~15%, MEDIUM ~60%, DISCOVERY ~25%.
+# Ces % se forment naturellement : les tracks DISCOVERY vieillissent et
+# accumulent (ou pas) des plays → passent en MEDIUM puis HEAVY.
+#
+# Cette stratification est ce qui transforme une rotation "uniformément
+# aléatoire" (statu quo) en rotation BBC 6 / KEXP-style (où les anchors
+# jouent 2-3× plus souvent que les discoveries).
+# =============================================================================
+
+
+@dataclass
+class RotationCategoryConfig:
+    """Tier-based rotation for autonomous discovery webradio (2026 best practices)."""
+    enabled: bool = True
+    # HEAVY : un track entre dans cette catégorie quand il a fait ses preuves
+    heavy_min_plays: int = 15
+    heavy_min_age_days: int = 14
+    # DISCOVERY : "nouveau" — encore en phase d'exposition
+    discovery_max_age_days: int = 14
+    # Nombre de dayparts max où chaque tier apparaît (dans les dayparts
+    # compatibles avec son mood). HEAVY ignore ce cap (toujours partout).
+    medium_daypart_count: int = 3
+    discovery_daypart_count: int = 1
+
+
+ROTATION_CATEGORIES = RotationCategoryConfig()
 
 # =============================================================================
 # DISCOVERY — Sources de découverte multi-RSS + Last.fm
@@ -621,9 +667,10 @@ LASTFM_TAGS: tuple[str, ...] = (
 LASTFM_TAG_LIMIT: int = 15
 
 # Plafond global de tracks remontées par l'étape discover (toutes sources
-# confondues, après dédup). Évite que le pipeline soit submergé un jour de
-# RSS bavards.
-DISCOVER_MAX_TRACKS: int = 120
+# confondues, après dédup). Réduit de 120 à 60 après analyse : on n'avait
+# jamais besoin de plus de 60 candidates (la queue tombait à 15-25 réels
+# après filtrage), donc générer 120 était du gaspillage de requêtes API.
+DISCOVER_MAX_TRACKS: int = 60
 
 
 # =============================================================================

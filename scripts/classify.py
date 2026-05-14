@@ -34,6 +34,7 @@ try:
         DayType,
         EnergyLevel,
         ROTATION,
+        ROTATION_CATEGORIES,
         AUDIO_FILTERS,
         AGGRESSIVE_FILTER,
         MULTI_SIGNAL_FILTER,
@@ -48,6 +49,49 @@ try:
 except ImportError as e:
     print(f"Error: config.py not found or invalid in pipeline root: {e}")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Rotation tier system (MusicMaster-inspired, 2026 best practice for
+# autonomous discovery webradios). See config.ROTATION_CATEGORIES.
+# ---------------------------------------------------------------------------
+
+TIER_RANK = {"DISCOVERY": 0, "MEDIUM": 1, "HEAVY": 2}
+
+
+def compute_rotation_tier(play_count: int, age_days: float) -> str:
+    """
+    Map (play_count, age_days) → HEAVY / MEDIUM / DISCOVERY.
+
+    Rules:
+      HEAVY     : age >= heavy_min_age_days AND play_count >= heavy_min_plays
+      DISCOVERY : age <= discovery_max_age_days (and not yet enough plays)
+      MEDIUM    : everything else
+    """
+    cfg = ROTATION_CATEGORIES
+    if age_days >= cfg.heavy_min_age_days and play_count >= cfg.heavy_min_plays:
+        return "HEAVY"
+    if age_days <= cfg.discovery_max_age_days:
+        return "DISCOVERY"
+    return "MEDIUM"
+
+
+def tier_filter_dayparts(
+    mood_dayparts: list[DaypartSegment], tier: str,
+) -> list[DaypartSegment]:
+    """
+    Restrict the list of mood-compatible dayparts based on the rotation tier.
+
+    HEAVY     : all matching dayparts (anchor → ubiquitous rotation)
+    MEDIUM    : first medium_daypart_count matching dayparts
+    DISCOVERY : first discovery_daypart_count matching dayparts (typically 1)
+    """
+    if not ROTATION_CATEGORIES.enabled or tier == "HEAVY":
+        return list(mood_dayparts)
+    if tier == "MEDIUM":
+        return list(mood_dayparts)[: ROTATION_CATEGORIES.medium_daypart_count]
+    # DISCOVERY
+    return list(mood_dayparts)[: ROTATION_CATEGORIES.discovery_daypart_count]
 
 # Configure logging
 logging.basicConfig(
@@ -525,10 +569,16 @@ def process_track(
             filepath.unlink()
             return "rejected", []
 
-    # Assign to daypart playlists based on mood compatibility
+    # Assign to daypart playlists based on mood compatibility.
+    # New tracks are DISCOVERY tier → restricted to discovery_daypart_count
+    # dayparts (default 1), so they don't compete head-on with anchors.
+    # Promotion to MEDIUM/HEAVY happens later in enforce_tiered_rotation
+    # as the track accumulates plays.
+    initial_tier = "DISCOVERY"
+    mood_dayparts = get_dayparts_for_mood(mood)
+    tier_dayparts = tier_filter_dayparts(mood_dayparts, initial_tier)
     assigned_playlists: list[str] = []
-
-    for segment in get_dayparts_for_mood(mood):
+    for segment in tier_dayparts:
         playlist_name = segment.value
         if playlist_name in playlists and playlist_name not in assigned_playlists:
             assigned_playlists.append(playlist_name)
@@ -556,7 +606,9 @@ def process_track(
         # Record in persistent TrackDB
         if track_db and file_id:
             track_key = normalize_track_key(artist, title)
-            track_db.record_upload(track_key, artist, title, file_id, mood)
+            track_db.record_upload(
+                track_key, artist, title, file_id, mood, tier=initial_tier,
+            )
 
         filepath.unlink()
         return "uploaded", assigned_playlists
@@ -621,11 +673,15 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
             uploaded_at = db_track["uploaded_at"]
             play_count = db_track["play_count"]
             track_key = db_track["track_key"]
+            mood = db_track.get("mood")
+            tier_stored = db_track.get("tier") or "DISCOVERY"
         else:
             # Auto-register untracked files using AzuraCast's uploaded_at
             uploaded_at = f.get("uploaded_at") or f.get("mtime") or now
             play_count = 0
             track_key = normalize_track_key(artist, title) if artist and title else ""
+            mood = None
+            tier_stored = "DISCOVERY"
             # Persist into TrackDB so future runs have accurate data
             if track_key and file_id:
                 track_db.register_untracked_file(track_key, artist, title, uploaded_at, file_id)
@@ -640,6 +696,10 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
             "age_days": age_days,
             "play_count": play_count,
             "uploaded_at": uploaded_at,
+            "mood": mood,
+            "tier_stored": tier_stored,
+            # Set of playlist names this file is currently assigned to in AzuraCast
+            "playlist_names": {p.get("name") for p in (f.get("playlists") or []) if p.get("name")},
         }
 
         if age_days <= fresh_days:
@@ -710,9 +770,54 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
                 deleted_count += 1
                 overflow -= 1
 
-    # --- Phase 6: Summary ---
+    # --- Phase 6: Tier promotion (one-way) ---
+    # DISCOVERY tracks that have accumulated plays + age get promoted to
+    # MEDIUM or HEAVY, which adds them to MORE daypart playlists for
+    # broader rotation. Demotion is never done here — natural aging via
+    # FRESH→CURRENT→FADING→EXPIRED handles cleanup of underperformers.
+    # FRESH tracks (< fresh_days) are intentionally skipped : they need
+    # more time to gather a fair play_count signal.
+    promoted_count = 0
+    if ROTATION_CATEGORIES.enabled:
+        try:
+            playlist_id_map = client.get_playlists_map()
+        except Exception as e:
+            logger.warning("Tier promotion skipped (cannot fetch playlists): %s", e)
+            playlist_id_map = {}
+
+        if playlist_id_map:
+            for entry in (tiers["CURRENT"] + tiers["FADING"]):
+                stored = entry["tier_stored"]
+                new_tier = compute_rotation_tier(entry["play_count"], entry["age_days"])
+                if TIER_RANK[new_tier] <= TIER_RANK[stored]:
+                    continue  # already at/above target tier
+                mood = entry["mood"]
+                if not mood:
+                    continue
+                target_dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), new_tier)
+                target_names = {dp.value for dp in target_dayparts}
+                new_names = target_names - entry["playlist_names"]
+                # Always persist the new tier even if no playlist add needed
+                if entry["track_key"]:
+                    track_db.update_tier(entry["track_key"], new_tier)
+                if not new_names:
+                    continue
+                # Combine current + new, push via the replace-style assign API
+                all_names = entry["playlist_names"] | new_names
+                all_ids = [playlist_id_map[n] for n in all_names if n in playlist_id_map]
+                if client.assign_playlists(entry["file_id"], all_ids):
+                    promoted_count += 1
+                    logger.info(
+                        "  PROMOTED %s→%s: %s - %s (added %s)",
+                        stored, new_tier, entry["artist"], entry["title"],
+                        ", ".join(sorted(new_names)),
+                    )
+
+    # --- Phase 7: Summary ---
     logger.info("\n=== Rotation Summary ===")
     logger.info("Deleted: %s", deleted_count)
+    if ROTATION_CATEGORIES.enabled:
+        logger.info("Tier promotions: %s", promoted_count)
     logger.info("Library after rotation: %s (+ %s new)", current_count - deleted_count, new_tracks_count)
 
     stats = track_db.get_stats()
