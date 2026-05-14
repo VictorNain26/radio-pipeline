@@ -97,7 +97,52 @@ python3 scripts/reanalyze_server.py              # appliquer
 
 Aucune ré-upload, juste re-classification + réassignation playlist.
 
-### 4. Mise à jour `yt-dlp` (automatisée via systemd)
+### 4. CLAP smart sequencing (optionnel — opt-in)
+
+CLAP (Contrastive Language-Audio Pretraining) calcule un embedding
+512-dim par track. FAISS sert ensuite à retrouver des "nearest
+neighbours" (smart_queue.py) et à construire des walks dans l'espace
+sonore pour des transitions douces.
+
+**Activation (étape par étape)** :
+
+```bash
+# 1. Installer les dépendances lourdes (~1 Go disque, modèle 1.7 Go)
+pip install --user --break-system-packages -r requirements-clap.txt
+
+# 2. Pre-warm + télécharger le modèle CLAP (une seule fois)
+python3 -c "from scripts.audio_embeddings import _load_model; _load_model()"
+
+# 3. Backfill de la bibliothèque AzuraCast (~30 min pour 600 tracks)
+python3 scripts/backfill_embeddings.py
+#   --dry-run pour voir ce qui serait fait
+#   --limit N pour tester sur N tracks
+# Reprend automatiquement si interrompu (idempotent).
+
+# 4. Activer dans config.py
+#   CLAP = CLAPConfig(enabled=True)
+# Le prochain run cron calculera les embeddings des nouveaux tracks
+# en plus du reste (+3-5 s/track sur CPU).
+```
+
+**Utilisation** :
+
+```bash
+# Trouver les 5 tracks similaires à une seed
+python3 scripts/smart_queue.py similar "beach house - space song" -k 5
+
+# Greedy walk de longueur 10 dans l'espace embedding
+python3 scripts/smart_queue.py walk "beach house - space song" -n 10
+
+# Stats du store
+python3 scripts/smart_queue.py info
+```
+
+Le store est stocké dans `data/embeddings.npy` + `data/embeddings_index.json`
+(gitignored). Pour rebuild from scratch : supprimer ces deux fichiers,
+relancer le backfill.
+
+### 5. Mise à jour `yt-dlp` (automatisée via systemd)
 
 Géré par `radio-pipeline-ytdlp.timer` (dimanche 02:00, une heure avant
 le run quotidien). Le script vérifie la dernière release GitHub et

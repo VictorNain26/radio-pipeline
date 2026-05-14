@@ -68,6 +68,24 @@ entre runs. Blocklist et allowlist sont configurées dans `config.py`
   corrompu
 - Cover art HypeMachine embed + ID3 tags
 
+### 3.5 Quality gates v4 (avant analyse)
+
+Trois gates additionnels tournent post-yt-dlp pour économiser l'analyse
+Essentia et garder la library propre :
+
+- **AcoustID dedup** (`scripts/audio_fingerprint.py`) — Chromaprint
+  fingerprint exact match contre `data/tracks.db`. Catches les
+  re-uploads d'un même enregistrement sous métadonnées différentes
+  (remasters, "feat." rewrites). Pas d'appel réseau.
+- **Speech filter** (Essentia `voice_instrumental` head) — rejette les
+  tracks > 60 % voice probability (interviews / podcasts qui sneak via
+  les feeds RSS).
+- **EBU R128 loudnorm** (ffmpeg, -16 LUFS / -1.5 dBTP) — normalisation
+  broadcast pour cohérence sonore.
+
+Tous sont feature-flaggés dans `config.py` (`ACOUSTID_DEDUP`,
+`SPEECH_FILTER`, `LOUDNORM`), defaults `enabled=True`.
+
 ### 4. Analyse audio — Essentia-TensorFlow + MTG (v3)
 
 `scripts/analyze.py` utilise un ensemble de modèles MTG :
@@ -122,6 +140,30 @@ Dayparts (configurables dans `config.py`) :
 | Evening_Commute  | 17:00–19:00 | Energetic, Relaxed                            |
 | Evening          | 19:00–22:00 | Relaxed, Melancholic, Sad, Calm, Angry        |
 | Night            | 22:00–05:00 | Calm, Sad, Melancholic, Intense, Angry        |
+
+### 6.5 Smart sequencing — CLAP + FAISS (opt-in)
+
+Quand `config.CLAP.enabled=True`, `analyze.py` calcule en plus un
+embedding 512-dim L2-normalisé via le modèle LAION-CLAP HTSAT. Les
+embeddings vivent dans `data/embeddings.npy` + `data/embeddings_index.json`.
+
+`scripts/smart_queue.py` construit un index FAISS en mémoire (cosine
+similarité = inner product sur vecteurs normalisés) et permet :
+
+- **Nearest neighbour** : top-k tracks les plus similaires à une seed
+- **Greedy walk** : séquence de longueur N partant d'une seed, chaque
+  pas sélectionne le voisin le plus proche pas encore utilisé,
+  optionnellement restreint à un set de candidats (utile par daypart)
+
+C'est ce qui rendra émergentes les règles `tempo_max_variance`,
+`mood_min_separation` et `genre_min_separation` documentées dans
+`config.SEPARATION` mais non enforceables par AzuraCast natif :
+deux tracks proches dans l'espace embedding ont *par construction*
+des BPM, moods et timbres proches.
+
+Voir `MAINTENANCE.md` section "CLAP smart sequencing" pour
+l'activation (installation des deps, backfill de la library, etc.).
+Activation impacte `+3-5 s/track` de temps CPU dans `analyze.py`.
 
 ### 7. Rotation 3-tiers + cooldown
 

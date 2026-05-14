@@ -31,7 +31,7 @@ MODELS_DIR = PIPELINE_DIR / "models"
 sys.path.insert(0, str(PIPELINE_DIR))
 
 try:
-    from config import MoodCategory, EnergyLevel, SPEECH_FILTER
+    from config import MoodCategory, EnergyLevel, SPEECH_FILTER, CLAP as CLAP_CFG
 except ImportError:
     logger.error("Failed to import config.py - ensure it exists in %s", PIPELINE_DIR)
     sys.exit(1)
@@ -540,6 +540,26 @@ def process_file(filepath: str) -> bool:
     # Write tags
     if not write_tags(filepath, artist, title, features):
         return False
+
+    # CLAP embedding (opt-in via config.CLAP.enabled).
+    # Stored separately in data/embeddings.{npy,index.json} for later use
+    # by scripts/smart_queue.py — no impact on the rest of the pipeline.
+    if CLAP_CFG.enabled:
+        try:
+            from audio_embeddings import EmbeddingStore, compute_embedding
+            from track_db import normalize_track_key
+
+            track_key = normalize_track_key(artist, title)
+            store = EmbeddingStore(PIPELINE_DIR / "data")
+            if not store.has(track_key):
+                emb = compute_embedding(Path(filepath))
+                if emb is not None:
+                    store.add(track_key, emb)
+                    logger.info("  CLAP: embedding stored (%d-dim)", emb.shape[0])
+                else:
+                    logger.warning("  CLAP: embedding failed (non-fatal)")
+        except ImportError as e:
+            logger.warning("  CLAP integration unavailable (%s); set CLAP.enabled=False to silence", e)
 
     return True
 

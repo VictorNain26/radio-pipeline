@@ -801,9 +801,33 @@ class LoudnormConfig:
     true_peak: float = -1.5
 
 
+@dataclass
+class CLAPConfig:
+    """
+    CLAP audio embeddings (LAION-CLAP HTSAT) for content-based similarity.
+
+    When enabled, analyze.py computes a 512-dim L2-normalised embedding
+    per track and persists it under data/embeddings.npy. Smart sequencing
+    (scripts/smart_queue.py) then uses FAISS over those embeddings to
+    derive nearest-neighbour walks per daypart, making mood/tempo
+    separation rules emergent from the geometry rather than heuristic.
+
+    Disabled by default because:
+      - First load downloads ~1.7 GB model from HF Hub
+      - Each track adds ~3-5 s of CPU inference
+
+    To enable in production:
+      1. Pre-warm the model: `python3 -c "from audio_embeddings import _load_model; _load_model()"`
+      2. Flip `enabled=True` here.
+      3. Backfill existing library with `scripts/backfill_embeddings.py` (TBD).
+    """
+    enabled: bool = False
+
+
 ACOUSTID_DEDUP = AcoustIDDedupConfig()
 SPEECH_FILTER = SpeechFilterConfig()
 LOUDNORM = LoudnormConfig()
+CLAP = CLAPConfig()
 
 # Seuils de classification
 THRESHOLDS = ClassificationThresholds(
