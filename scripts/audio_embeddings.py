@@ -76,6 +76,47 @@ def _load_model() -> tuple[Any, Any] | None:
     return _MODEL, _PROCESSOR
 
 
+def compute_text_embedding(text: str) -> np.ndarray | None:
+    """
+    Embed an arbitrary text query in the same 512-dim space as the
+    audio embeddings. Enables natural-language search like
+    "ambient melancholic 60bpm" via cosine similarity against the
+    audio side.
+
+    Returns a 512-dim L2-normalised float32 numpy array, or None on
+    failure (missing dep, model error).
+    """
+    loaded = _load_model()
+    if loaded is None:
+        return None
+    model, processor = loaded
+    try:
+        import torch
+    except ImportError:
+        return None
+    try:
+        try:
+            inputs = processor(text=text, return_tensors="pt", padding=True)
+        except TypeError:
+            inputs = processor(texts=text, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            out = model.get_text_features(**inputs)
+            if hasattr(out, "pooler_output") and out.pooler_output is not None:
+                pooled = out.pooler_output
+            elif isinstance(out, tuple) and len(out) > 1:
+                pooled = out[1]
+            else:
+                pooled = out
+            embedding = pooled[0].cpu().numpy().astype(np.float32)
+    except (RuntimeError, ValueError, AttributeError) as e:
+        logger.warning("CLAP text inference failed: %s", e)
+        return None
+    norm = float(np.linalg.norm(embedding))
+    if norm == 0.0:
+        return None
+    return embedding / norm
+
+
 def compute_embedding(audio_path: Path) -> np.ndarray | None:
     """
     Returns a 512-dim L2-normalised float32 numpy array, or None on

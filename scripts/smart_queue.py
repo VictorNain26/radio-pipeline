@@ -186,6 +186,34 @@ def _cmd_walk(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_text(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data_dir or (Path(__file__).parent.parent / "data"))
+    from audio_embeddings import compute_text_embedding
+    store = EmbeddingStore(data_dir)
+    keys, emb = store.all()
+    if not keys or emb is None:
+        print("Embedding store empty.")
+        return 1
+    text_vec = compute_text_embedding(args.query)
+    if text_vec is None:
+        print("CLAP text embedding failed (model issue?).")
+        return 1
+    try:
+        import faiss
+    except ImportError:
+        print("faiss-cpu required for text search.")
+        return 1
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(emb.astype(np.float32))
+    scores, idxs = index.search(text_vec.reshape(1, -1).astype(np.float32), args.k)
+    print(f"Top {args.k} tracks matching {args.query!r} :")
+    for i, s in zip(idxs[0], scores[0]):
+        if i < 0:
+            continue
+        print(f"  {float(s):+.3f}  {keys[i]}")
+    return 0
+
+
 def _cmd_info(args: argparse.Namespace) -> int:
     data_dir = Path(args.data_dir or (Path(__file__).parent.parent / "data"))
     store = EmbeddingStore(data_dir)
@@ -217,6 +245,14 @@ def main() -> int:
 
     p_info = sub.add_parser("info", help="Show embedding store stats")
     p_info.set_defaults(func=_cmd_info)
+
+    p_text = sub.add_parser(
+        "text",
+        help="Natural-language search via CLAP text encoder (e.g. \"ambient melancholic 60bpm\")",
+    )
+    p_text.add_argument("query", help="Free-text query")
+    p_text.add_argument("-k", type=int, default=10)
+    p_text.set_defaults(func=_cmd_text)
 
     args = parser.parse_args()
     return args.func(args)
