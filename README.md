@@ -54,11 +54,33 @@ Un cache disque (`data/genre_cache.json`, TTL 30 j) persiste les lookups
 entre runs. Blocklist et allowlist sont configurées dans `config.py`
 (`GENRE_FILTER.blocked_genres` et `ALLOWED_GENRES`).
 
-### 3. Téléchargement — yt-dlp robuste
+### 3. Téléchargement — multi-source (SoundCloud + YouTube)
 
-`scripts/download.py` :
+`scripts/download.py` sonde les **deux plateformes en parallèle**
+(`scsearch5` + `ytsearch5`, ~10s wall time vs ~20s sequential), score
+tous les candidats avec le même algorithme rapidfuzz + duration sanity
++ channel trust + negative-keyword filter, et garde le meilleur peu
+importe la source.
 
-- Probe via `ytsearch5` + scoring rapidfuzz pour choisir le bon candidat
+Pourquoi multi-source en 2026 :
+
+- **YouTube** = catalogue le plus large mais plateforme hostile (SABR
+  rollout, PoToken requirements). Incidents fréquents en 2026.
+- **SoundCloud** = plus stable et fort sur indie/électronique/hip-hop
+  (l'esthétique AubeSonore). Beaucoup d'artistes uploadent leurs
+  pleines versions directement.
+
+Garde-fou hard sur la durée : tout candidat <60s (preview clip
+SoundCloud pour artistes signés) ou >600s (DJ mix / full album) est
+**rejeté au scoring** — pas téléchargé puis filtré, vraiment rejeté.
+Sur 10 tracks test (mai 2026), 8 winners YT + 1 SC + 1 timeout = 90%.
+
+Pour chaque téléchargement, la source est trackée dans
+`data/last_download_stats.json` (`source_youtube`, `source_soundcloud`,
+`source_other`).
+
+Autres garde-fous :
+- Probe via `ytsearch5/scsearch5` + scoring rapidfuzz pour choisir le bon candidat
 - Téléchargement MP3 qualité maximale (`--audio-quality 0`)
 - Sleep intervals (3–8 s) + 5 retries pour éviter le throttling YouTube
   (3 workers parallèles depuis une IP unique)

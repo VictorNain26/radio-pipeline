@@ -23,7 +23,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-from typing import Literal, TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -72,6 +72,12 @@ MAX_PARALLEL_DOWNLOADS = 3
 _download_lock = Lock()
 
 DownloadResult = Literal["downloaded", "skipped", "filtered", "blocked", "failed", "duplicate"]
+
+
+class DownloadOutcome(NamedTuple):
+    """Result of a download_track call : status + which audio source served it."""
+    status: DownloadResult
+    source: str | None  # "youtube" / "soundcloud" / ... or None if no probe done
 
 
 def loudnorm_inplace(filepath: Path) -> bool:
@@ -236,13 +242,14 @@ class Track(TypedDict):
 
 
 class SearchResult(TypedDict):
-    """YouTube search result with metadata."""
+    """Multi-source audio search result with metadata."""
     url: str
     title: str
     uploader: str
     channel: str
     duration: float
     score: float
+    source: str  # "youtube" / "soundcloud" / ...  (yt-dlp extractor_key, lowercased)
 
 
 def normalize_track_key(artist: str, title: str) -> str:
@@ -412,18 +419,25 @@ def _check_negative_keywords(
 # ---------------------------------------------------------------------------
 
 def _score_duration(duration: float) -> float:
-    """Score duration plausibility for a single track (0.0-1.0)."""
+    """
+    Score duration plausibility (0.0-1.0).
+
+    Hard-zero for clips < 60s : these are SoundCloud previews (the artist
+    is signed to a label and only an excerpt is hosted). Downloading
+    them is pure waste — AUDIO_FILTERS.duration_min would filter them
+    out post-download anyway. Killing them at scoring time means the
+    full-length candidate (typically on YouTube) wins instead of being
+    silently shadowed by a 30s preview that ranked higher on fuzzy match.
+    """
     if duration <= 0:
-        return 0.5  # Unknown, neutral
-    if duration < 30 or duration > 600:
-        return 0.0  # Clip or full album
+        return 0.5  # Unknown — fall through, post-download filters catch it
+    if duration < 60 or duration > 600:
+        return 0.0  # Preview clip OR full album/DJ mix — both useless for the radio
     if 120 <= duration <= 330:
         return 1.0  # Sweet spot 2-5.5 min
     if 60 <= duration < 120 or 330 < duration <= 480:
         return 0.8  # Acceptable
-    if duration < 60:
-        return 0.3
-    return 0.5  # 480-600 range
+    return 0.5  # 480-600 grey zone
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +549,13 @@ def _score_candidate(
     ch_score = _score_channel_trust(expected_artist, info)
     parts.append("ch=%.2f" % ch_score)
 
-    # Phase 2d: duration plausibility
+    # Phase 2d: duration plausibility.
+    # A 0.0 from _score_duration is a *hard reject* signal (preview clip
+    # < 60s, or full album/mix > 600s) — bail out before structured
+    # metadata can resurrect the candidate via its +0.05 bonus.
     dur_score = _score_duration(float(duration))
+    if dur_score == 0.0 and duration and duration > 0:
+        return 0.0, f"rejected:duration={duration:.0f}s"
     parts.append("dur=%.2f" % dur_score)
 
     # Phase 3: weighted combination
@@ -563,18 +582,20 @@ def _score_candidate(
     return final, " | ".join(parts)
 
 
-def find_best_youtube_match(
-    search: str, artist: str, title: str,
-) -> SearchResult | None:
+def _probe_source(
+    search_prefix: str, artist: str, title: str, timeout: int = 45,
+) -> list[dict]:
     """
-    Find the best YouTube match using comprehensive scoring.
+    Run a single yt-dlp metadata probe for a given search prefix.
 
-    Uses --dump-json for full metadata (structured artist/track,
-    subscriber count, tags). Scores each candidate with rapidfuzz,
-    negative keyword filtering, duration validation, and channel trust.
+    `search_prefix` is either:
+      - "ytsearch5"  → YouTube top-5 results
+      - "scsearch5"  → SoundCloud top-5 results
 
-    Returns:
-        Best SearchResult if score >= MATCH_SCORE_THRESHOLD, else None.
+    Returns a list of candidate `info` dicts as yt-dlp emits them with
+    --dump-json (one JSON line per candidate). Empty list on probe failure
+    (timeout, non-zero exit, no parseable JSON). Failure is logged loudly
+    so we never have a "silent skip".
     """
     cmd = [
         "yt-dlp",
@@ -583,37 +604,83 @@ def find_best_youtube_match(
         "--no-warnings",
         "--no-playlist",
         "--socket-timeout", "20",
-        "--", f'ytsearch5:"{artist}" "{title}"',
+        "--", f'{search_prefix}:"{artist}" "{title}"',
     ]
-    # NOTE: 2026-05-14 incident — forcing player_client=web_safari,web
-    # broke audio-only format negotiation (YouTube's SABR rollout makes
-    # the web clients return SABR-only streams). Default yt-dlp behaviour
-    # (player_client=default, includes android) is the most resilient.
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        logger.warning("  YouTube search timed out")
-        return None
-
+        logger.warning("  Probe %s timed out (%ds)", search_prefix, timeout)
+        return []
     if result.returncode != 0:
-        logger.warning("  YouTube search failed: %s", result.stderr[:200])
-        return None
+        logger.warning(
+            "  Probe %s failed (rc=%d): %s",
+            search_prefix, result.returncode, (result.stderr or "")[:200],
+        )
+        return []
+    candidates: list[dict] = []
+    for line in result.stdout.strip().splitlines():
+        try:
+            candidates.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return candidates
+
+
+def find_best_audio_match(
+    search: str, artist: str, title: str,
+) -> SearchResult | None:
+    """
+    Find the best audio match across SoundCloud + YouTube.
+
+    Both platforms are probed in parallel (~5-10s total wall time vs
+    ~15s sequential). Every candidate is scored with the same algorithm
+    — rapidfuzz on artist/title, duration sanity, channel trust,
+    negative-keyword filter — and the highest-scoring one wins
+    regardless of source.
+
+    Why two sources :
+    - YouTube has the broadest catalogue but is increasingly hostile
+      (SABR rollout, PoToken requirements). 2026 incidents are frequent.
+    - SoundCloud is more stable and stronger for indie / electronic /
+      hip-hop (the AubeSonore aesthetic). Many indie artists upload
+      full-length tracks directly; preview clips for label-signed
+      artists get filtered out by the duration score (<60s → 0.3).
+    - The scoring already handles SoundCloud's quirks (remix / slowed
+      / sped-up variants are caught by _NEGATIVE_KEYWORDS_REJECT and
+      _NEGATIVE_KEYWORDS_PENALTY).
+
+    Returns the best SearchResult (with `source` field) if score
+    >= MATCH_SCORE_THRESHOLD, else None.
+    """
+    queries = [("scsearch5", "soundcloud"), ("ytsearch5", "youtube")]
+    all_candidates: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as ex:
+        futures = {
+            ex.submit(_probe_source, q, artist, title): label
+            for q, label in queries
+        }
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                cands = fut.result()
+            except Exception as e:
+                logger.warning("  Probe %s crashed: %s", label, e)
+                cands = []
+            logger.debug("  %s returned %d candidates", label, len(cands))
+            all_candidates.extend(cands)
 
     best: SearchResult | None = None
     best_score = 0.0
 
-    for line in result.stdout.strip().splitlines():
-        try:
-            info = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
+    for info in all_candidates:
         score, explanation = _score_candidate(artist, title, info)
         vid_title = info.get("title", "")
         url = info.get("webpage_url", "")
+        src = (info.get("extractor_key") or info.get("extractor") or "?").lower()
 
-        logger.debug("  Candidate: %s | %s | %s", vid_title[:60], explanation, url)
+        logger.debug("  Candidate[%s]: %s | %s | %s",
+                     src, vid_title[:60], explanation, url)
 
         if score > best_score:
             best_score = score
@@ -624,17 +691,19 @@ def find_best_youtube_match(
                 channel=info.get("channel", ""),
                 duration=float(info.get("duration", 0) or 0),
                 score=score,
+                source=src,
             )
 
     if best is None or best["score"] < MATCH_SCORE_THRESHOLD:
         logger.warning(
-            "  No good match for '%s' (best=%.2f, threshold=%.2f)",
-            search, best_score, MATCH_SCORE_THRESHOLD,
+            "  No good match for '%s' across %d candidates (best=%.2f < %.2f)",
+            search, len(all_candidates), best_score, MATCH_SCORE_THRESHOLD,
         )
         return None
 
     logger.info(
-        "  Match: %s (%.2f) %s", best["title"], best["score"], best["url"],
+        "  Match[%s]: %s (%.2f) %s",
+        best["source"], best["title"], best["score"], best["url"],
     )
     return best
 
@@ -811,7 +880,7 @@ def download_track(
     genre_client: GenreClient | None = None,
     _retry_count: int = 0,
     track_db: "TrackDB | None" = None,
-) -> DownloadResult:
+) -> DownloadOutcome:
     """
     Download a single track and apply metadata.
 
@@ -840,13 +909,13 @@ def download_track(
     track_key = normalize_track_key(artist, title)
     with _download_lock:
         if track_key in existing_library:
-            return 'skipped'
+            return DownloadOutcome('skipped', None)
         existing_library.add(track_key)
 
     # Check cooldown (skip recently deleted tracks)
     if track_db and track_db.is_in_cooldown(track_key, ROTATION.cooldown_days):
         logger.info("  Cooldown: recently deleted, skipping")
-        return 'skipped'
+        return DownloadOutcome('skipped', None)
 
     # Genre filtering via Last.fm (before download to save bandwidth)
     has_lastfm_tags = False
@@ -857,12 +926,12 @@ def download_track(
         lastfm_tags_str = ", ".join(genre_result.tags) if genre_result.tags else ""
         if genre_result.is_blocked:
             logger.info("  Blocked: %s", genre_result.blocked_reason)
-            return 'blocked'
+            return DownloadOutcome('blocked', None)
         if genre_result.top_tag:
             logger.debug("  Genre: %s", genre_result.top_tag)
         if GENRE_FILTER.require_tags and not genre_result.tags:
             logger.info("  Blocked: No genre tags found")
-            return 'blocked'
+            return DownloadOutcome('blocked', None)
 
     # Create safe filename
     safe_name = sanitize_filename(f"{artist} - {title}")
@@ -871,21 +940,23 @@ def download_track(
     # Skip if already exists locally
     if final_path.exists():
         logger.info("  Already exists locally")
-        return 'skipped'
+        return DownloadOutcome('skipped', None)
 
-    # Phase 1: Probe YouTube for best match (no download)
-    match = find_best_youtube_match(search, artist, title)
+    # Phase 1: Probe SoundCloud + YouTube in parallel, pick best across sources
+    match = find_best_audio_match(search, artist, title)
     if match is None:
-        return 'failed'
+        return DownloadOutcome('failed', None)
+
+    match_source = match["source"]
 
     # Pre-check duration from probe metadata
     if match["duration"] > 0:
         if AUDIO_FILTERS.duration_min and match["duration"] <= AUDIO_FILTERS.duration_min:
             logger.info("  Filtered (too short: %s)", format_duration(int(match['duration'])))
-            return 'filtered'
+            return DownloadOutcome('filtered', match_source)
         if AUDIO_FILTERS.duration_max and match["duration"] >= AUDIO_FILTERS.duration_max:
             logger.info("  Filtered (too long: %s)", format_duration(int(match['duration'])))
-            return 'filtered'
+            return DownloadOutcome('filtered', match_source)
 
     # Phase 2: Download the specific matched URL (thread-safe temp dir)
     thread_temp = TEMP_DIR / f"worker_{threading.current_thread().ident}"
@@ -920,7 +991,7 @@ def download_track(
     except subprocess.TimeoutExpired:
         logger.warning("  yt-dlp download timed out (5min)")
         cleanup_temp()
-        return 'failed'
+        return DownloadOutcome('failed', match_source)
 
     # Find the downloaded file
     temp_files = list(thread_temp.glob("temp_download.mp3"))
@@ -929,14 +1000,14 @@ def download_track(
 
     if not temp_files:
         logger.warning("  No file found after download")
-        return 'failed'
+        return DownloadOutcome('failed', match_source)
 
     temp_file = temp_files[0]
 
     if temp_file.suffix != '.mp3':
         logger.warning("  Unexpected format: %s", temp_file.suffix)
         temp_file.unlink()
-        return 'failed'
+        return DownloadOutcome('failed', match_source)
 
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     shutil.move(str(temp_file), str(final_path))
@@ -953,7 +1024,7 @@ def download_track(
             return download_track(track, existing_library, genre_client, _retry_count + 1, track_db)
 
         logger.error("  Failed after %d retries - file corrupted", MAX_DOWNLOAD_RETRIES)
-        return 'failed'
+        return DownloadOutcome('failed', match_source)
 
     # Content-based dedup via Chromaprint (catches re-uploads under
     # different metadata: remasters, feat. rewrites, etc.)
@@ -969,7 +1040,7 @@ def download_track(
                     existing.get("artist") or "?", existing.get("title") or "?",
                 )
                 final_path.unlink(missing_ok=True)
-                return 'duplicate'
+                return DownloadOutcome('duplicate', match_source)
             track_db.record_fingerprint(track_key, fp_h, dur)
 
     # EBU R128 loudness normalisation (broadcast standard -16 LUFS)
@@ -1006,7 +1077,7 @@ def download_track(
     if cover_path and cover_path.exists():
         cover_path.unlink()
 
-    return 'downloaded'
+    return DownloadOutcome('downloaded', match_source)
 
 
 def cleanup_temp() -> None:
@@ -1122,22 +1193,30 @@ def main() -> int:
     db_path = Path(__file__).parent.parent / "data" / "tracks.db"
     track_db = TrackDB(db_path)
 
-    stats = {"downloaded": 0, "skipped": 0, "filtered": 0, "blocked": 0, "failed": 0, "duplicate": 0}
+    stats = {
+        "downloaded": 0, "skipped": 0, "filtered": 0, "blocked": 0,
+        "failed": 0, "duplicate": 0,
+        # Per-source download counts. Filled by download_track via the
+        # `match["source"]` returned from find_best_audio_match.
+        "source_youtube": 0,
+        "source_soundcloud": 0,
+        "source_other": 0,
+    }
 
-    def _process_track(idx_track: tuple[int, Track]) -> tuple[str, DownloadResult]:
+    def _process_track(idx_track: tuple[int, Track]) -> tuple[str, DownloadOutcome]:
         i, track = idx_track
         artist = track.get('artist', 'Unknown')
         title = track.get('title', 'Unknown')
         logger.info("\n[%d/%d] %s - %s", i, len(tracks), artist, title)
 
-        result = download_track(track, existing_library, genre_client, track_db=track_db)
+        outcome = download_track(track, existing_library, genre_client, track_db=track_db)
 
-        if result == 'downloaded':
-            logger.info("  OK")
-        elif result == 'skipped':
+        if outcome.status == 'downloaded':
+            logger.info("  OK (%s)", outcome.source or "?")
+        elif outcome.status == 'skipped':
             logger.info("  Skipped (duplicate or cooldown)")
 
-        return f"{artist} - {title}", result
+        return f"{artist} - {title}", outcome
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_DOWNLOADS) as executor:
@@ -1147,8 +1226,15 @@ def main() -> int:
             }
             for future in as_completed(futures):
                 try:
-                    _name, result = future.result()
-                    stats[result] += 1
+                    _name, outcome = future.result()
+                    stats[outcome.status] += 1
+                    # Per-source tracking: only count when we actually downloaded.
+                    if outcome.status == 'downloaded' and outcome.source:
+                        key = f"source_{outcome.source}"
+                        if key in stats:
+                            stats[key] += 1
+                        else:
+                            stats["source_other"] += 1
                 except Exception as e:
                     logger.error("  Unexpected download error: %s", e)
                     stats["failed"] += 1
@@ -1161,6 +1247,10 @@ def main() -> int:
 
     logger.info("\n=== Results ===")
     logger.info("Downloaded: %d", stats['downloaded'])
+    logger.info("  → from YouTube   : %d", stats['source_youtube'])
+    logger.info("  → from SoundCloud: %d", stats['source_soundcloud'])
+    if stats['source_other']:
+        logger.info("  → from other     : %d", stats['source_other'])
     logger.info("Skipped (artist/title or cooldown): %d", stats['skipped'])
     logger.info("Duplicate (audio fingerprint): %d", stats['duplicate'])
     logger.info("Blocked (genre): %d", stats['blocked'])
