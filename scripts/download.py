@@ -582,13 +582,13 @@ def find_best_youtube_match(
         "--no-download",
         "--no-warnings",
         "--no-playlist",
-        # Escape hatch when YouTube ships a player change (yt-dlp 2026 best
-        # practice). Probing only needs basic info; web client is enough.
-        "--extractor-args", "youtube:player_client=web_safari,web",
-        # Short probe; we hit ytsearch5 which already returns 5 candidates.
         "--socket-timeout", "20",
         "--", f'ytsearch5:"{artist}" "{title}"',
     ]
+    # NOTE: 2026-05-14 incident — forcing player_client=web_safari,web
+    # broke audio-only format negotiation (YouTube's SABR rollout makes
+    # the web clients return SABR-only streams). Default yt-dlp behaviour
+    # (player_client=default, includes android) is the most resilient.
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
@@ -907,8 +907,11 @@ def download_track(
         # Retries with internal backoff (yt-dlp 2026 defaults are too low).
         "--retries", "5",
         "--fragment-retries", "5",
-        # Player-client escape hatch (same reason as in the probe).
-        "--extractor-args", "youtube:player_client=web_safari,web",
+        # Explicit best-audio format selection. We intentionally do NOT
+        # pin player_client — YouTube's SABR rollout (2026) makes web
+        # clients return streams that can't be downloaded directly, so
+        # we let yt-dlp pick the best client (default includes android).
+        "--format", "bestaudio/best",
         match["url"],
     ]
 
