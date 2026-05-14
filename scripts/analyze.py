@@ -394,15 +394,16 @@ def analyze_audio(filepath: str) -> AudioFeatures | None:
         mood_str = mood.value if hasattr(mood, 'value') else str(mood)
         energy_str = energy_level.value if hasattr(energy_level, 'value') else str(energy_level)
 
-        # Discogs-EffNet analysis (mood_aggressive + genre + voice/instrumental)
-        mood_aggressive = 0.0
-        genre_top = ""
-        genre_top_prob = 0.0
-        voice_prob = 0.0
+        # Discogs-EffNet analysis (mood_aggressive + genre + voice/instrumental).
+        # No silent fallback: if this fails we return None so process_file
+        # rejects the track. Letting it through with voice_prob=0 would
+        # silently bypass the speech filter — that's exactly the kind of
+        # silent-pass behaviour we want to avoid.
         try:
             mood_aggressive, genre_top, genre_top_prob, voice_prob = analyze_discogs_effnet(audio)
         except (RuntimeError, OSError, ValueError) as e:
-            logger.warning("  Discogs-EffNet analysis failed (non-fatal): %s", e)
+            logger.error("  Discogs-EffNet analysis FAILED: %s — rejecting track", e)
+            return None
 
         return AudioFeatures(
             bpm=bpm,

@@ -52,28 +52,63 @@ except ImportError as e:
 
 
 # ---------------------------------------------------------------------------
-# Rotation tier system (MusicMaster-inspired, 2026 best practice for
-# autonomous discovery webradios). See config.ROTATION_CATEGORIES.
+# Rotation tier system — designed for an AUTONOMOUS DISCOVERY webradio.
+#
+# Goal: new tracks must be heard (that's the whole point of "discovery"),
+# while tracks that fail to engage listeners fade out. The semantics are
+# the BBC 6 Music / MusicMaster A/B/C model:
+#
+#   HEAVY  — high rotation. Two reasons a track lands here:
+#            (a) GRACE PERIOD : age < grace_period_days. Every new track
+#                gets full visibility for its first ~2 weeks. No exception.
+#            (b) PROVEN        : after the grace period, the play rate
+#                (plays/day) is at or above the expected library average
+#                (boosted by heavy_above_average_ratio).
+#   MEDIUM — standard rotation. Post-grace tracks with average performance.
+#   LIGHT  — fading rotation. Post-grace tracks with below-average plays.
+#            Reduced exposure means they accumulate fewer plays, accelerating
+#            their natural eviction at max_age_days.
+#
+# Mapping to playlists (tier_filter_dayparts):
+#   HEAVY  → ALL mood-compatible dayparts (max exposure)
+#   MEDIUM → medium_daypart_count dayparts (default 3)
+#   LIGHT  → light_daypart_count dayparts (default 1)
+#
+# The expected play rate is computed from the library size + AzuraCast's
+# observed plays/hour, set in config.ROTATION_CATEGORIES.expected_plays_per_day.
+# It does NOT depend on per-track play history alone (which would be too
+# noisy for short ages). It's an absolute reference point.
 # ---------------------------------------------------------------------------
 
-TIER_RANK = {"DISCOVERY": 0, "MEDIUM": 1, "HEAVY": 2}
+# Rank for promotion comparisons. Legacy "DISCOVERY" label maps to LIGHT
+# (rank 0) — the rename happens implicitly via the re-tier pass.
+TIER_RANK = {"LIGHT": 0, "DISCOVERY": 0, "MEDIUM": 1, "HEAVY": 2}
 
 
 def compute_rotation_tier(play_count: int, age_days: float) -> str:
     """
-    Map (play_count, age_days) → HEAVY / MEDIUM / DISCOVERY.
+    Compute the rotation tier for a track from its (play_count, age_days).
 
-    Rules:
-      HEAVY     : age >= heavy_min_age_days AND play_count >= heavy_min_plays
-      DISCOVERY : age <= discovery_max_age_days (and not yet enough plays)
-      MEDIUM    : everything else
+    Two cases:
+    - In the grace period (age < grace_period_days) → always HEAVY
+      regardless of plays. This is the DISCOVERY emphasis: new tracks
+      get a fair shot at being heard.
+    - Past the grace period → compare actual play rate against the
+      library's expected rate:
+        * rate >= expected × heavy_above_average_ratio  → HEAVY (proven hit)
+        * rate >= expected × light_below_average_ratio  → MEDIUM (average)
+        * else                                          → LIGHT (waning)
     """
     cfg = ROTATION_CATEGORIES
-    if age_days >= cfg.heavy_min_age_days and play_count >= cfg.heavy_min_plays:
+    if age_days < cfg.grace_period_days:
         return "HEAVY"
-    if age_days <= cfg.discovery_max_age_days:
-        return "DISCOVERY"
-    return "MEDIUM"
+    rate = play_count / max(1.0, age_days)
+    expected = cfg.expected_plays_per_day
+    if rate >= expected * cfg.heavy_above_average_ratio:
+        return "HEAVY"
+    if rate >= expected * cfg.light_below_average_ratio:
+        return "MEDIUM"
+    return "LIGHT"
 
 
 def tier_filter_dayparts(
@@ -82,16 +117,18 @@ def tier_filter_dayparts(
     """
     Restrict the list of mood-compatible dayparts based on the rotation tier.
 
-    HEAVY     : all matching dayparts (anchor → ubiquitous rotation)
-    MEDIUM    : first medium_daypart_count matching dayparts
-    DISCOVERY : first discovery_daypart_count matching dayparts (typically 1)
+    Returns:
+      HEAVY  → all matching dayparts (max exposure)
+      MEDIUM → first medium_daypart_count matching dayparts
+      LIGHT  → first light_daypart_count matching dayparts
+      (legacy DISCOVERY treated as LIGHT)
     """
     if not ROTATION_CATEGORIES.enabled or tier == "HEAVY":
         return list(mood_dayparts)
     if tier == "MEDIUM":
         return list(mood_dayparts)[: ROTATION_CATEGORIES.medium_daypart_count]
-    # DISCOVERY
-    return list(mood_dayparts)[: ROTATION_CATEGORIES.discovery_daypart_count]
+    # LIGHT (or legacy DISCOVERY)
+    return list(mood_dayparts)[: ROTATION_CATEGORIES.light_daypart_count]
 
 # Configure logging
 logging.basicConfig(
@@ -569,12 +606,11 @@ def process_track(
             filepath.unlink()
             return "rejected", []
 
-    # Assign to daypart playlists based on mood compatibility.
-    # New tracks are DISCOVERY tier → restricted to discovery_daypart_count
-    # dayparts (default 1), so they don't compete head-on with anchors.
-    # Promotion to MEDIUM/HEAVY happens later in enforce_tiered_rotation
-    # as the track accumulates plays.
-    initial_tier = "DISCOVERY"
+    # Assign to daypart playlists. NEW tracks land in HEAVY tier because
+    # they're in the grace period (age=0) — full exposure so listeners can
+    # actually discover them. They'll be re-tiered after grace_period_days
+    # by enforce_tiered_rotation's re-tier pass.
+    initial_tier = compute_rotation_tier(play_count=0, age_days=0.0)  # → HEAVY
     mood_dayparts = get_dayparts_for_mood(mood)
     tier_dayparts = tier_filter_dayparts(mood_dayparts, initial_tier)
     assigned_playlists: list[str] = []
@@ -770,54 +806,83 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
                 deleted_count += 1
                 overflow -= 1
 
-    # --- Phase 6: Tier promotion (one-way) ---
-    # DISCOVERY tracks that have accumulated plays + age get promoted to
-    # MEDIUM or HEAVY, which adds them to MORE daypart playlists for
-    # broader rotation. Demotion is never done here — natural aging via
-    # FRESH→CURRENT→FADING→EXPIRED handles cleanup of underperformers.
-    # FRESH tracks (< fresh_days) are intentionally skipped : they need
-    # more time to gather a fair play_count signal.
-    promoted_count = 0
+    # --- Phase 6: Re-tier pass (HEAVY ↔ MEDIUM ↔ LIGHT) ---
+    # Two-way: tracks moving up gain playlists, tracks moving down lose them.
+    # Demotion is NOT silent: assign_playlists() is REPLACE semantics, so a
+    # demoted track is actually removed from the dayparts it no longer
+    # qualifies for. This is what makes "discovery" emergent: anchors stay
+    # heavy, average performers stay average, fading tracks fade out.
+    #
+    # We skip FRESH tracks: their tier is whatever compute_rotation_tier
+    # says (HEAVY during grace period), and they already got assigned to
+    # the right playlists at upload time. Including them in the re-tier
+    # would be a no-op + waste API calls.
+    retier_changed = 0
+    retier_skipped_no_mood = 0
     if ROTATION_CATEGORIES.enabled:
         try:
             playlist_id_map = client.get_playlists_map()
-        except Exception as e:
-            logger.warning("Tier promotion skipped (cannot fetch playlists): %s", e)
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.error("Re-tier pass SKIPPED — cannot fetch playlist map: %s", e)
             playlist_id_map = {}
 
         if playlist_id_map:
+            # Re-tier post-grace tracks only (CURRENT + FADING). FRESH stay
+            # at their upload-time HEAVY assignment.
             for entry in (tiers["CURRENT"] + tiers["FADING"]):
-                stored = entry["tier_stored"]
-                new_tier = compute_rotation_tier(entry["play_count"], entry["age_days"])
-                if TIER_RANK[new_tier] <= TIER_RANK[stored]:
-                    continue  # already at/above target tier
                 mood = entry["mood"]
                 if not mood:
+                    retier_skipped_no_mood += 1
                     continue
+                stored = entry["tier_stored"]
+                # Treat the legacy "DISCOVERY" label as unset (TIER_RANK 0)
+                new_tier = compute_rotation_tier(entry["play_count"], entry["age_days"])
+
                 target_dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), new_tier)
                 target_names = {dp.value for dp in target_dayparts}
-                new_names = target_names - entry["playlist_names"]
-                # Always persist the new tier even if no playlist add needed
+                current_names = entry["playlist_names"]
+
+                # Only push the membership update if the set actually differs.
+                # Persist the tier label in DB on every iteration (cheap).
                 if entry["track_key"]:
                     track_db.update_tier(entry["track_key"], new_tier)
-                if not new_names:
+
+                if target_names == current_names:
                     continue
-                # Combine current + new, push via the replace-style assign API
-                all_names = entry["playlist_names"] | new_names
-                all_ids = [playlist_id_map[n] for n in all_names if n in playlist_id_map]
-                if client.assign_playlists(entry["file_id"], all_ids):
-                    promoted_count += 1
-                    logger.info(
-                        "  PROMOTED %s→%s: %s - %s (added %s)",
-                        stored, new_tier, entry["artist"], entry["title"],
-                        ", ".join(sorted(new_names)),
+
+                target_ids = [playlist_id_map[n] for n in target_names if n in playlist_id_map]
+                if not target_ids:
+                    logger.warning(
+                        "  Re-tier %s skipped (no playlist IDs for target dayparts): %s - %s",
+                        new_tier, entry["artist"], entry["title"],
                     )
+                    continue
+
+                if client.assign_playlists(entry["file_id"], target_ids):
+                    retier_changed += 1
+                    added = target_names - current_names
+                    removed = current_names - target_names
+                    bits = []
+                    if added:
+                        bits.append("+" + ",".join(sorted(added)))
+                    if removed:
+                        bits.append("-" + ",".join(sorted(removed)))
+                    logger.info(
+                        "  RE-TIER %s→%s: %s - %s [%s]",
+                        stored, new_tier, entry["artist"], entry["title"],
+                        " ".join(bits) if bits else "no playlist diff",
+                    )
+        if retier_skipped_no_mood:
+            logger.warning(
+                "Re-tier: %d tracks skipped (no mood in DB — possibly pre-MTG legacy uploads)",
+                retier_skipped_no_mood,
+            )
 
     # --- Phase 7: Summary ---
     logger.info("\n=== Rotation Summary ===")
     logger.info("Deleted: %s", deleted_count)
     if ROTATION_CATEGORIES.enabled:
-        logger.info("Tier promotions: %s", promoted_count)
+        logger.info("Re-tier changes (playlists updated): %s", retier_changed)
     logger.info("Library after rotation: %s (+ %s new)", current_count - deleted_count, new_tracks_count)
 
     stats = track_db.get_stats()

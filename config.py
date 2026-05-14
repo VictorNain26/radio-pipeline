@@ -548,42 +548,64 @@ ROTATION = RotationConfig(
 
 
 # =============================================================================
-# ROTATION CATEGORIES — tier-based playlist assignment (MusicMaster-inspired)
+# ROTATION CATEGORIES — A/B/C-style rotation for a discovery webradio
 # =============================================================================
 #
-# Plutôt que toute track aille dans TOUS les dayparts compatibles avec son
-# mood, on stratifie par "tier" basé sur l'âge et le play_count :
+# Inspired by BBC 6 Music / MusicMaster's A-list / B-list / C-list model
+# adapted to an autonomous discovery webradio (no human curator).
 #
-#   HEAVY     — anchors prouvés : play_count >= heavy_min_plays ET age >= heavy_min_age_days.
-#               Va dans TOUS les dayparts compatibles → forte rotation.
-#   MEDIUM    — backbone : tracks établies, performance moyenne.
-#               Va dans medium_daypart_count dayparts max.
-#   DISCOVERY — nouveaux ou pas encore prouvés : age < discovery_max_age_days.
-#               Va dans discovery_daypart_count dayparts seulement → light rotation.
+# Tier assignment (computed daily by enforce_tiered_rotation):
 #
-# Cible de mix dans la library : HEAVY ~15%, MEDIUM ~60%, DISCOVERY ~25%.
-# Ces % se forment naturellement : les tracks DISCOVERY vieillissent et
-# accumulent (ou pas) des plays → passent en MEDIUM puis HEAVY.
+#   HEAVY  — max rotation. Two ways to land here:
+#            (1) GRACE PERIOD: age < grace_period_days. Every new track
+#                gets full exposure during its first ~2 weeks. No exception.
+#                This is what makes it a *discovery* radio: new music gets heard.
+#            (2) PROVEN: past grace, plays/day ≥ expected × heavy_above_average_ratio.
+#   MEDIUM — average rotation. Post-grace tracks performing around the
+#            library mean.
+#   LIGHT  — fading. Below-average performers. Reduced visibility means
+#            they accumulate fewer plays, accelerating eviction at max_age_days.
 #
-# Cette stratification est ce qui transforme une rotation "uniformément
-# aléatoire" (statu quo) en rotation BBC 6 / KEXP-style (où les anchors
-# jouent 2-3× plus souvent que les discoveries).
+# Playlist mapping (tier_filter_dayparts):
+#   HEAVY  → all mood-compatible dayparts
+#   MEDIUM → first medium_daypart_count dayparts (default 3)
+#   LIGHT  → first light_daypart_count dayparts (default 1)
+#
+# Demotion is real, not silent: the re-tier pass uses assign_playlists()
+# (REPLACE semantics) so a HEAVY track demoted to LIGHT is actually removed
+# from the extra playlists. No accidental zombies kept in all dayparts.
+#
+# expected_plays_per_day: how often the average track plays in a day.
+# Computed from library_size + observed plays/hour at AzuraCast. With 597
+# tracks and ~16 plays/hour (~384/day total), the per-track expectation
+# is 384/597 ≈ 0.64. Set to 0.65 (slightly above true mean → conservative
+# = harder to qualify as HEAVY, fewer false-positive "hits").
 # =============================================================================
 
 
 @dataclass
 class RotationCategoryConfig:
-    """Tier-based rotation for autonomous discovery webradio (2026 best practices)."""
+    """A/B/C-style rotation for an autonomous discovery webradio."""
     enabled: bool = True
-    # HEAVY : un track entre dans cette catégorie quand il a fait ses preuves
-    heavy_min_plays: int = 15
-    heavy_min_age_days: int = 14
-    # DISCOVERY : "nouveau" — encore en phase d'exposition
-    discovery_max_age_days: int = 14
-    # Nombre de dayparts max où chaque tier apparaît (dans les dayparts
-    # compatibles avec son mood). HEAVY ignore ce cap (toujours partout).
+
+    # Grace period: every new track is HEAVY for this many days regardless
+    # of plays. Makes "discovery" actually mean discovery.
+    grace_period_days: int = 14
+
+    # Reference rate: what an "average" track plays per day, library-wide.
+    # Tune this based on AzuraCast playlists' total scheduled time + observed
+    # listener-driven dynamics. For AubeSonore (597 tracks, ~16 plays/h),
+    # the empirical mean is ~0.64 plays/track/day.
+    expected_plays_per_day: float = 0.65
+
+    # Above-average bar to qualify as HEAVY (post-grace). 1.2 = 20% above mean.
+    heavy_above_average_ratio: float = 1.2
+    # Below-average floor — under this, tier drops from MEDIUM to LIGHT.
+    light_below_average_ratio: float = 0.6
+
+    # Daypart caps per tier. HEAVY isn't capped.
     medium_daypart_count: int = 3
-    discovery_daypart_count: int = 1
+    light_daypart_count: int = 1
 
 
 ROTATION_CATEGORIES = RotationCategoryConfig()
