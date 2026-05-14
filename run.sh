@@ -89,6 +89,7 @@ def _read(name):
 
 discover = _read("last_discover_stats.json")
 dl_breakdown = _read("last_download_stats.json")
+analyze_breakdown = _read("last_analyze_stats.json")
 
 stats = {
     "timestamp": datetime.now().isoformat(),
@@ -97,8 +98,9 @@ stats = {
     "downloads": int(downloads),
     "uploads": int(uploads),
     "errors": errors or None,
-    "discover": discover,           # raw_total, deduped_total, per_source
-    "download_breakdown": dl_breakdown,  # downloaded/skipped/filtered/blocked/failed
+    "discover": discover,                # raw_total, deduped_total, per_source
+    "download_breakdown": dl_breakdown,    # downloaded/skipped/.../loudnorm_failed
+    "analyze_breakdown": analyze_breakdown, # analyzed_ok/rejected_speech/clap_failed
 }
 try:
     with open(stats_file) as f:
@@ -322,7 +324,55 @@ except Exception:
 " 2>/dev/null || echo 0)
 
     write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
-    notify "AubeSonore Pipeline OK" "Pipeline OK. DL:${DOWNLOAD_COUNT:-0} UL:${UPLOAD_COUNT:-0}" "low" "white_check_mark"
+
+    # Silent-fallback regression alerts.
+    # These counters were added 2026-05-14 after a 37/37 silent loudnorm
+    # failure that uploaded un-normalised audio to the radio. Any non-zero
+    # loudnorm_failed → urgent ntfy. fingerprint_failed >2 → default ntfy
+    # (small numbers are normal — SC extractor flakiness).
+    LOUDNORM_FAIL=$(python3 -c "
+import json
+try:
+    print(json.load(open('data/last_download_stats.json')).get('loudnorm_failed', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+    FINGERPRINT_FAIL=$(python3 -c "
+import json
+try:
+    print(json.load(open('data/last_download_stats.json')).get('fingerprint_failed', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+    CLAP_FAIL=$(python3 -c "
+import json
+try:
+    print(json.load(open('data/last_analyze_stats.json')).get('clap_failed', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+
+    if [ "${LOUDNORM_FAIL:-0}" -gt 0 ]; then
+        log_warn "Loudnorm regression: $LOUDNORM_FAIL tracks uploaded un-normalised"
+        notify "AubeSonore: loudnorm regression" \
+            "$LOUDNORM_FAIL tracks uploaded un-normalised (ffmpeg loudnorm failed). Check cron.log for 'loudnorm failed'." \
+            "urgent" "warning"
+    fi
+
+    if [ "${FINGERPRINT_FAIL:-0}" -gt 2 ]; then
+        log_warn "Fingerprint failures: $FINGERPRINT_FAIL (>2 unusual — check fpcalc)"
+        notify "AubeSonore: fingerprint failures" \
+            "$FINGERPRINT_FAIL Chromaprint fingerprint failures. Dedup is skipped for those tracks. Check fpcalc availability." \
+            "default" "warning"
+    fi
+
+    if [ "${CLAP_FAIL:-0}" -gt 0 ]; then
+        log_warn "CLAP embedding failures: $CLAP_FAIL (non-blocking, smart_queue coverage drops)"
+    fi
+
+    notify "AubeSonore Pipeline OK" \
+        "Pipeline OK. DL:${DOWNLOAD_COUNT:-0} UL:${UPLOAD_COUNT:-0} loudnorm_fail:${LOUDNORM_FAIL:-0} fp_fail:${FINGERPRINT_FAIL:-0}" \
+        "low" "white_check_mark"
 
     log_info "Pipeline completed successfully"
 }

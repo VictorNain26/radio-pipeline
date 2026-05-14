@@ -75,9 +75,28 @@ DownloadResult = Literal["downloaded", "skipped", "filtered", "blocked", "failed
 
 
 class DownloadOutcome(NamedTuple):
-    """Result of a download_track call : status + which audio source served it."""
+    """
+    Result of a download_track call.
+
+    `status` and `source` are the primary signals consumed by stats.
+    The two boolean flags surface failures of post-download steps that
+    used to be "logged but uncountable" silent fallbacks :
+
+      - loudnorm_failed   : ffmpeg loudnorm pass returned non-zero.
+                            Track is kept but un-normalised (volume drift).
+      - fingerprint_failed: fpcalc / Chromaprint failed. Track is kept
+                            but absent from the AcoustID dedup index,
+                            so a true audio duplicate could slip in
+                            on a future run.
+
+    Both default to False so all the pre-download returns
+    ('skipped'/'blocked'/'failed-before-probe'/...) keep their concise
+    constructor shape.
+    """
     status: DownloadResult
-    source: str | None  # "youtube" / "soundcloud" / ... or None if no probe done
+    source: str | None = None
+    loudnorm_failed: bool = False
+    fingerprint_failed: bool = False
 
 
 def loudnorm_inplace(filepath: Path) -> bool:
@@ -1033,6 +1052,7 @@ def download_track(
 
     # Content-based dedup via Chromaprint (catches re-uploads under
     # different metadata: remasters, feat. rewrites, etc.)
+    fingerprint_failed = False
     if ACOUSTID_DEDUP.enabled and track_db is not None:
         fp_result = compute_fingerprint(final_path)
         if fp_result is not None:
@@ -1045,15 +1065,24 @@ def download_track(
                     existing.get("artist") or "?", existing.get("title") or "?",
                 )
                 final_path.unlink(missing_ok=True)
-                return DownloadOutcome('duplicate', match_source)
+                return DownloadOutcome('duplicate', match_source,
+                                       fingerprint_failed=False)
             track_db.record_fingerprint(track_key, fp_h, dur)
+        else:
+            # fpcalc unavailable / decode error / etc. Already logged by
+            # compute_fingerprint. Track passes but dedup is skipped.
+            fingerprint_failed = True
 
     # EBU R128 loudness normalisation (broadcast standard -16 LUFS)
+    loudnorm_failed = False
     if LOUDNORM.enabled:
         if loudnorm_inplace(final_path):
             logger.debug("  Loudnorm: -> %.1f LUFS target", LOUDNORM.target_lufs)
-        # On failure we keep the unnormalised file rather than reject —
-        # the loudnorm log warning has already been emitted.
+        else:
+            # ffmpeg failure already logged in loudnorm_inplace. Track is
+            # kept at native loudness so the radio still works — but the
+            # caller can now alert on a non-zero counter.
+            loudnorm_failed = True
 
     # Fix MP3 timestamps (best practice 2026)
     # Prevents "Could not update timestamps" warnings in Liquidsoap
@@ -1082,7 +1111,11 @@ def download_track(
     if cover_path and cover_path.exists():
         cover_path.unlink()
 
-    return DownloadOutcome('downloaded', match_source)
+    return DownloadOutcome(
+        'downloaded', match_source,
+        loudnorm_failed=loudnorm_failed,
+        fingerprint_failed=fingerprint_failed,
+    )
 
 
 def cleanup_temp() -> None:
@@ -1199,13 +1232,20 @@ def main() -> int:
     track_db = TrackDB(db_path)
 
     stats = {
+        # Primary status counts (one of these is incremented per track)
         "downloaded": 0, "skipped": 0, "filtered": 0, "blocked": 0,
         "failed": 0, "duplicate": 0,
         # Per-source download counts. Filled by download_track via the
-        # `match["source"]` returned from find_best_audio_match.
+        # match["source"] returned from find_best_audio_match.
         "source_youtube": 0,
         "source_soundcloud": 0,
         "source_other": 0,
+        # Post-download step failures (logged + counted, no silent skips).
+        # These were the 3 silent fallback paths identified in the
+        # 2026-05-14 audit. loudnorm_failed > 0 fires an ntfy alert from
+        # run.sh because that's broadcast-quality critical.
+        "loudnorm_failed": 0,
+        "fingerprint_failed": 0,
     }
 
     def _process_track(idx_track: tuple[int, Track]) -> tuple[str, DownloadOutcome]:
@@ -1240,6 +1280,11 @@ def main() -> int:
                             stats[key] += 1
                         else:
                             stats["source_other"] += 1
+                    # Post-download silent fallback counters
+                    if outcome.loudnorm_failed:
+                        stats["loudnorm_failed"] += 1
+                    if outcome.fingerprint_failed:
+                        stats["fingerprint_failed"] += 1
                 except Exception as e:
                     logger.error("  Unexpected download error: %s", e)
                     stats["failed"] += 1
@@ -1261,6 +1306,10 @@ def main() -> int:
     logger.info("Blocked (genre): %d", stats['blocked'])
     logger.info("Filtered (duration): %d", stats['filtered'])
     logger.info("Failed: %d", stats['failed'])
+    if stats['loudnorm_failed']:
+        logger.warning("Loudnorm failed (un-normalised uploads): %d", stats['loudnorm_failed'])
+    if stats['fingerprint_failed']:
+        logger.warning("Fingerprint failed (dedup skipped): %d", stats['fingerprint_failed'])
 
     # Persist for run.sh aggregation.
     stats_path = Path(__file__).parent.parent / "data" / "last_download_stats.json"

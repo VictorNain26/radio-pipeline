@@ -119,10 +119,9 @@ def test_download_outcome_is_namedtuple_with_status_and_source():
     out = DownloadOutcome("downloaded", "youtube")
     assert out.status == "downloaded"
     assert out.source == "youtube"
-    # NamedTuple unpacking works
-    status, source = out
-    assert status == "downloaded"
-    assert source == "youtube"
+    # Defaults: silent-fallback flags False unless set
+    assert out.loudnorm_failed is False
+    assert out.fingerprint_failed is False
 
 
 def test_download_outcome_source_can_be_none_for_pre_match_returns():
@@ -130,3 +129,18 @@ def test_download_outcome_source_can_be_none_for_pre_match_returns():
     out = DownloadOutcome("skipped", None)
     assert out.status == "skipped"
     assert out.source is None
+    assert out.loudnorm_failed is False
+    assert out.fingerprint_failed is False
+
+
+def test_download_outcome_silent_fallback_flags_surface_post_download_failures():
+    """
+    The new flags expose loudnorm / fingerprint failures that used to be
+    logged-only. Stats aggregator counts them per run.
+    """
+    out = DownloadOutcome(
+        "downloaded", "youtube",
+        loudnorm_failed=True, fingerprint_failed=True,
+    )
+    assert out.loudnorm_failed is True
+    assert out.fingerprint_failed is True

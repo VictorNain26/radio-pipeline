@@ -37,6 +37,19 @@ except ImportError:
     sys.exit(1)
 
 
+# Module-level stats accumulated during a single analyze.py invocation
+# (no concurrency — process_file is called sequentially). Flushed to
+# data/last_analyze_stats.json at the end of main() so run.sh can fold
+# the counts into pipeline_stats.json.
+_ANALYZE_STATS: dict[str, int] = {
+    "analyzed_ok": 0,        # process_file returned True
+    "analysis_failed": 0,    # analyze_audio returned None (no mood/tags written)
+    "rejected_speech": 0,    # voice_probability over SPEECH_FILTER.max_voice_probability
+    "clap_succeeded": 0,     # CLAP embedding computed + stored
+    "clap_failed": 0,        # CLAP enabled but embedding returned None / import failed
+}
+
+
 @dataclass
 class AudioFeatures:
     """Complete audio analysis features."""
@@ -504,6 +517,7 @@ def process_file(filepath: str) -> bool:
 
     if not features:
         logger.error("  ERROR: Analysis failed")
+        _ANALYZE_STATS["analysis_failed"] += 1
         return False
 
     # Speech filter — reject podcasts / interviews caught by RSS discovery.
@@ -522,6 +536,7 @@ def process_file(filepath: str) -> bool:
             Path(filepath).unlink()
         except OSError as e:
             logger.warning("  Could not delete rejected file: %s", e)
+        _ANALYZE_STATS["rejected_speech"] += 1
         return False
 
     # Display results
@@ -557,10 +572,13 @@ def process_file(filepath: str) -> bool:
                 if emb is not None:
                     store.add(track_key, emb)
                     logger.info("  CLAP: embedding stored (%d-dim)", emb.shape[0])
+                    _ANALYZE_STATS["clap_succeeded"] += 1
                 else:
                     logger.warning("  CLAP: embedding failed (non-fatal)")
+                    _ANALYZE_STATS["clap_failed"] += 1
         except ImportError as e:
             logger.warning("  CLAP integration unavailable (%s); set CLAP.enabled=False to silence", e)
+            _ANALYZE_STATS["clap_failed"] += 1
 
     return True
 
@@ -598,8 +616,23 @@ def main() -> int:
     for filepath in sorted(files):
         if process_file(str(filepath)):
             success_count += 1
+            _ANALYZE_STATS["analyzed_ok"] += 1
 
     logger.info("\n=== Done (%d/%d successful) ===", success_count, len(files))
+    if _ANALYZE_STATS["rejected_speech"]:
+        logger.info("Speech-rejected : %d", _ANALYZE_STATS["rejected_speech"])
+    if _ANALYZE_STATS["clap_failed"]:
+        logger.warning("CLAP embedding failures : %d", _ANALYZE_STATS["clap_failed"])
+
+    # Persist stats for run.sh to fold into pipeline_stats.json
+    stats_path = PIPELINE_DIR / "data" / "last_analyze_stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import json as _json
+        stats_path.write_text(_json.dumps(_ANALYZE_STATS, indent=2), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not write last_analyze_stats.json: %s", e)
+
     return 0 if success_count == len(files) else 1
 
 
