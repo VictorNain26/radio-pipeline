@@ -41,8 +41,11 @@ def test_get_daypart_for_hour_handles_midnight_wrap():
     assert get_daypart_for_hour(22) == DaypartSegment.NIGHT
     assert get_daypart_for_hour(2) == DaypartSegment.NIGHT
     assert get_daypart_for_hour(4) == DaypartSegment.NIGHT
-    # 5 belongs to Early_Morning (boundary handled exclusive end)
-    assert get_daypart_for_hour(5) == DaypartSegment.EARLY_MORNING
+    # 5 belongs to DAWN (boundary handled exclusive end of NIGHT)
+    assert get_daypart_for_hour(5) == DaypartSegment.DAWN
+    # All 4 zones reachable
+    assert get_daypart_for_hour(9) == DaypartSegment.DAY
+    assert get_daypart_for_hour(17) == DaypartSegment.DUSK
 
 
 def test_dayparts_for_mood_returns_at_least_one():

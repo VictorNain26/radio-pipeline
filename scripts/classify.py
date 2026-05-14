@@ -4,7 +4,7 @@ Upload tracks to AzuraCast with daypart-based playlist assignment.
 
 Features v2.0:
 - Reads 8-mood circumplex classification from ID3 tags
-- Routes tracks to 8 daypart playlists
+- Routes tracks to zone playlists (Dawn / Day / Dusk / Night)
 - Uses energy levels for smooth programming
 - Confidence-based quality filtering
 - Professional separation rules support

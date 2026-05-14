@@ -5,7 +5,8 @@ Playlist Management Script for AzuraCast.
 Creates daypart-based playlists and assigns existing tracks based on mood/energy.
 
 Features:
-- Creates 8 daypart playlists (each covering all 7 days)
+- Creates the zone playlists defined in config.DAYPARTS (currently 4:
+  Dawn/Day/Dusk/Night), each scheduled for its time window every day
 - Deletes old/orphaned playlists
 - Assigns existing tracks to correct playlists based on mood
 - Configures playlist scheduling

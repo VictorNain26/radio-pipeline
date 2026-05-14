@@ -8,8 +8,8 @@ Aggregates tracks from:
 - Last.fm tag charts (config.LASTFM_TAGS) — fills the hip-hop angle
 - data/custom_feeds.json — arbitrary user-added RSS (e.g. rss.app)
 
-discover_manual.py (manual picks) still runs separately after this step
-via run.sh; we don't touch its UX.
+Manual picks (data/manual_picks.json) are integrated as a regular
+source — see ManualPicksSource in discovery_sources.py.
 
 Dedup is done globally on a normalized (artist, title) key, capped to
 config.DISCOVER_MAX_TRACKS. Writes tracks-to-download.json with the same
@@ -98,8 +98,7 @@ def _build_sources() -> list[DiscoverySource]:
     elif LASTFM_TAGS and not settings.lastfm_api_key:
         logger.warning("LASTFM_API_KEY not set — skipping Last.fm tag sources")
 
-    # Manual picks: editorial overrides (data/manual_picks.json).
-    # Used to be a separate step (discover_manual.py); folded in here now.
+    # Manual picks : editorial overrides (data/manual_picks.json).
     sources.append(ManualPicksSource(path=MANUAL_PICKS_FILE))
 
     # User-added custom feeds (rss.app etc.)

@@ -112,7 +112,7 @@ rejeter les tracks agressives qui auraient passé le filtre genre :
 
 Rejet si **2 signaux ou plus concordants** OU `mood_aggressive > 0.85`.
 
-### 6. 8 moods × 8 dayparts (modèle de Russell)
+### 6. 8 moods × 4 zones (modèle de Russell + cycles lumière)
 
 Les tracks sont routées vers des playlists AzuraCast selon le mood et le
 créneau horaire :
@@ -132,13 +132,11 @@ Dayparts (configurables dans `config.py`) :
 
 | Daypart          | Horaire     | Moods cibles                                  |
 |------------------|-------------|-----------------------------------------------|
-| Early_Morning    | 05:00–07:00 | Calm, Relaxed                                 |
-| Morning_Commute  | 07:00–09:00 | Energetic, Excited                            |
-| Morning_Work     | 09:00–12:00 | Energetic, Relaxed                            |
-| Lunch            | 12:00–14:00 | Relaxed, Energetic, Excited                   |
-| Afternoon        | 14:00–17:00 | Energetic, Relaxed, Melancholic               |
-| Evening_Commute  | 17:00–19:00 | Energetic, Relaxed                            |
-| Evening          | 19:00–22:00 | Relaxed, Melancholic, Sad, Calm, Angry        |
+| Zone   | Horaire     | Identité sonore                                                       | Moods cibles                                  |
+|--------|-------------|-----------------------------------------------------------------------|-----------------------------------------------|
+| Dawn   | 05:00–09:00 | Réveil — ambient, modern classical, slowcore                          | Calm, Relaxed                                 |
+| Day    | 09:00–17:00 | Activité — indie/electro mid-tempo, hip-hop chill                     | Energetic, Excited, Relaxed, Melancholic      |
+| Dusk   | 17:00–22:00 | Transition — dream pop, trip hop, downtempo                           | Relaxed, Melancholic, Sad, Angry              |
 | Night            | 22:00–05:00 | Calm, Sad, Melancholic, Intense, Angry        |
 
 ### 6.5 Smart sequencing — CLAP + FAISS (opt-in)
@@ -165,7 +163,26 @@ Voir `MAINTENANCE.md` section "CLAP smart sequencing" pour
 l'activation (installation des deps, backfill de la library, etc.).
 Activation impacte `+3-5 s/track` de temps CPU dans `analyze.py`.
 
-### 7. Rotation 3-tiers + cooldown
+Migration historique des 8 anciens dayparts → 4 zones : voir
+`scripts/migrate_to_4_zones.py` (one-shot exécuté 2026-05-14).
+
+### 7. Rotation A/B/C — système BBC 6 Music adapté
+
+Chaque track porte un **rotation tier** dans `data/tracks.db` :
+
+- **HEAVY** — full visibilité dans toutes les zones compatibles avec
+  son mood. Deux entrées :
+  - *Grace period* : tout track nouveau (age < 14j) est HEAVY,
+    quoi qu'il en soit. C'est ce qui fait qu'une "radio découverte"
+    fait vraiment découvrir.
+  - *Performance prouvée* : age >= 14j ET play rate ≥ moyenne library × 1.2.
+- **MEDIUM** — 2 zones max parmi les compatibles. Performance moyenne.
+- **LIGHT** — 1 zone. En sous-performance, va vers l'éviction.
+
+Le re-tier pass tourne dans `enforce_tiered_rotation` à chaque cron : promotions et démotions appliquées via `assign_playlists` (REPLACE) — pas
+de zombie dans les playlists.
+
+### 8. Rotation 3-tiers âge + cooldown
 
 `classify.enforce_tiered_rotation` sépare les tracks en 4 tiers basés
 sur l'âge :
@@ -189,7 +206,7 @@ cd radio-pipeline
 ./scripts/setup.sh
 cp .env.example .env && nano .env       # remplir AzuraCast / Last.fm / Discogs
 ./scripts/download_models.sh            # ~600 Mo de modèles Essentia
-./scripts/setup_playlists.sh            # crée les 8 playlists dans AzuraCast
+python3 scripts/setup_playlists.py      # crée les 4 zones dans AzuraCast
 sudo ./scripts/install_logrotate.sh     # rotation des logs (recommandé)
 ./scripts/setup_systemd.sh              # timers user-scoped : pipeline 03:00 + yt-dlp dimanche 02:00
 ```
@@ -242,7 +259,7 @@ radio-pipeline/
 ├── scripts/
 │   ├── discover.py          # Orchestrateur multi-source
 │   ├── discovery_sources.py # HypeMachine + RSS + Last.fm tags
-│   ├── discover_manual.py   # Manual picks (legacy, branché par run.sh)
+│   ├── migrate_to_4_zones.py # One-shot migration 8 dayparts → 4 zones (mai 2026)
 │   ├── download.py          # yt-dlp + ffprobe + ID3 + checksum
 │   ├── analyze.py           # Essentia-TF (arousal-valence + genre)
 │   ├── classify.py          # Filtre multi-signal + rotation 3-tiers
@@ -255,7 +272,7 @@ radio-pipeline/
 │   ├── audit_server.py      # Vérif library AzuraCast
 │   ├── reanalyze*.py        # Réanalyse forcée (maintenance)
 │   ├── redownload_corrupted.py
-│   ├── setup_playlists.py   # Crée les 8 playlists AzuraCast
+│   ├── setup_playlists.py   # Crée les 4 zones AzuraCast
 │   ├── logrotate.conf       # Config logrotate
 │   └── install_logrotate.sh # Installeur (sudo)
 └── models/                  # Modèles Essentia pré-entraînés

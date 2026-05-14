@@ -90,20 +90,19 @@ def test_tier_table(plays, age, expected_tier):
 
 def test_heavy_keeps_all_dayparts():
     all_dps = [
-        DaypartSegment.MORNING_COMMUTE,
-        DaypartSegment.LUNCH,
-        DaypartSegment.AFTERNOON,
-        DaypartSegment.EVENING,
+        DaypartSegment.DAWN,
+        DaypartSegment.DAY,
+        DaypartSegment.DUSK,
+        DaypartSegment.NIGHT,
     ]
     assert tier_filter_dayparts(all_dps, "HEAVY") == all_dps
 
 
 def test_medium_keeps_first_n():
     all_dps = [
-        DaypartSegment.MORNING_COMMUTE,
-        DaypartSegment.LUNCH,
-        DaypartSegment.AFTERNOON,
-        DaypartSegment.EVENING,
+        DaypartSegment.DAWN,
+        DaypartSegment.DAY,
+        DaypartSegment.DUSK,
         DaypartSegment.NIGHT,
     ]
     n = ROTATION_CATEGORIES.medium_daypart_count
@@ -112,10 +111,9 @@ def test_medium_keeps_first_n():
 
 def test_light_keeps_first_one_by_default():
     all_dps = [
-        DaypartSegment.MORNING_COMMUTE,
-        DaypartSegment.LUNCH,
-        DaypartSegment.AFTERNOON,
-        DaypartSegment.EVENING,
+        DaypartSegment.DAY,
+        DaypartSegment.DUSK,
+        DaypartSegment.NIGHT,
     ]
     n = ROTATION_CATEGORIES.light_daypart_count
     result = tier_filter_dayparts(all_dps, "LIGHT")
@@ -125,7 +123,7 @@ def test_light_keeps_first_one_by_default():
 
 def test_legacy_discovery_label_treated_as_light():
     """Legacy DBs may have 'DISCOVERY' as tier value — treat as LIGHT."""
-    all_dps = [DaypartSegment.LUNCH, DaypartSegment.EVENING, DaypartSegment.NIGHT]
+    all_dps = [DaypartSegment.DAY, DaypartSegment.DUSK, DaypartSegment.NIGHT]
     assert tier_filter_dayparts(all_dps, "DISCOVERY") == all_dps[: ROTATION_CATEGORIES.light_daypart_count]
 
 
@@ -154,7 +152,7 @@ def test_disabled_config_returns_all_dayparts():
     original = cfg.ROTATION_CATEGORIES.enabled
     try:
         cfg.ROTATION_CATEGORIES.enabled = False
-        dps = [DaypartSegment.LUNCH, DaypartSegment.EVENING]
+        dps = [DaypartSegment.DAY, DaypartSegment.DUSK]
         assert tier_filter_dayparts(dps, "LIGHT") == dps
         assert tier_filter_dayparts(dps, "MEDIUM") == dps
     finally:

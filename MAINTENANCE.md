@@ -19,20 +19,16 @@ hebdo/mensuels gardent la bibliothèque saine.
 | `scripts/audit_server.py` | Idem mais directement sur les fichiers du serveur AzuraCast | Mensuel | Serveur AzuraCast (SSH) |
 | `scripts/redownload_corrupted.py` | Re-télécharge la liste produite par `audit_server.py --fix` | Après audit_server | Pipeline |
 | `scripts/reanalyze_server.py` | Ré-analyse les tracks où `mood IS NULL` dans `tracks.db` | Au besoin | Pipeline |
-| `scripts/reanalyze.py` | **Ré-analyse globale** (lourd, ~600 tracks × ~30s) | One-shot historique | Pipeline |
 | `scripts/redownload_corrupted.py` | Re-DL des fichiers corrompus identifiés | Après audit | Pipeline |
 | `scripts/update-ytdlp.sh` | Met à jour `yt-dlp` (release ~toutes les 2 semaines) | Hebdo (cron séparé) | Pipeline |
+| `scripts/migrate_to_4_zones.py` | **One-shot historique** — migration 8 dayparts → 4 zones (mai 2026). Documenté pour audit, non re-exécutable | one-shot | Pipeline |
+| `scripts/source_coverage_test.py` | Diagnostic outil pour mesurer la couverture des sources de download (SoundCloud vs YouTube) | Au besoin | Pipeline |
 
-`reanalyze.py` (ré-analyse globale) est essentiellement un outil
-**one-shot historique** issu de la migration vers les modèles MTG
-Arousal-Valence. Il peut être archivé sauf si tu changes encore une fois
-de modèle. À mettre dans `scripts/legacy/` si tu veux faire du ménage,
-ou laisser tel quel — il n'est plus appelé par `run.sh`.
-
-Les autres scripts sont **toujours utiles** :
+Les scripts d'audit/maintenance toujours utiles :
 - `audit_integrity` / `audit_server` détectent les fichiers corrompus
 - `reanalyze_server` répare les tracks classify échouées
 - `redownload_corrupted` répare les fichiers cassés
+- `audit_separation` vérifie cohérence config Python ↔ AzuraCast
 
 ---
 

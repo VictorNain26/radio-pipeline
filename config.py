@@ -48,17 +48,27 @@ class MoodCategory(str, Enum):
 
 class DaypartSegment(str, Enum):
     """
-    8 segments de journée pour une programmation granulaire.
-    Basé sur les habitudes d'écoute et les contextes d'usage.
+    4 zones de programmation alignées sur les cycles d'attention/lumière —
+    et sur l'identité "aube sonore" de la radio.
+
+    Pourquoi 4 (et pas 8) :
+    - une webradio découverte n'a pas d'auditeur "en voiture pendant le
+      morning commute". L'auditeur est chez lui / au studio / au boulot.
+    - Best practice 2026 = "do less, but better" (Radio World). Moins de
+      segments = identité plus forte par zone.
+    - 597 tracks / 4 zones = ~150 par playlist (vs ~30 par 8e) → meilleur
+      shuffle, moins de répétition.
+
+    Chaque zone a son personnage sonore :
+      DAWN  — ambient/modern classical/slowcore, réveil doux
+      DAY   — indie/electro mid-tempo/hip-hop chill, fond de travail
+      DUSK  — dream pop/trip hop/downtempo, transition émotionnelle
+      NIGHT — ambient profond/sad/expérimental/intense, introspection
     """
-    EARLY_MORNING = "Early_Morning"      # 05:00-07:00 - Réveil doux
-    MORNING_COMMUTE = "Morning_Commute"  # 07:00-09:00 - Trajet, énergie
-    MORNING_WORK = "Morning_Work"        # 09:00-12:00 - Concentration
-    LUNCH = "Lunch"                      # 12:00-14:00 - Pause, détente
-    AFTERNOON = "Afternoon"              # 14:00-17:00 - Productivité
-    EVENING_COMMUTE = "Evening_Commute"  # 17:00-19:00 - Retour, transition
-    EVENING = "Evening"                  # 19:00-22:00 - Détente
-    NIGHT = "Night"                      # 22:00-05:00 - Calme, introspection
+    DAWN = "Dawn"     # 05:00-09:00 - Réveil, basse énergie, lumière qui se lève
+    DAY = "Day"       # 09:00-17:00 - Activité, énergie modérée, fond
+    DUSK = "Dusk"     # 17:00-22:00 - Transition, émotionnel, soir
+    NIGHT = "Night"   # 22:00-05:00 - Nuit, introspection, intense ou profond
 
 
 class EnergyLevel(str, Enum):
@@ -416,66 +426,40 @@ MOODS: dict[MoodCategory, MoodProfile] = {
 # =============================================================================
 
 DAYPARTS: dict[DaypartSegment, DaypartProfile] = {
-    DaypartSegment.EARLY_MORNING: DaypartProfile(
+    DaypartSegment.DAWN: DaypartProfile(
         enabled=True,
         start_hour=5,
-        end_hour=7,
-        description="Réveil en douceur - transition nuit vers jour",
-        target_moods=[MoodCategory.CALM, MoodCategory.RELAXED],
-        energy_curve=EnergyLevel.VERY_LOW,
-        transition_flex=0.2,
-    ),
-    DaypartSegment.MORNING_COMMUTE: DaypartProfile(
-        enabled=True,
-        start_hour=7,
         end_hour=9,
-        description="Trajet du matin - boost d'énergie progressif",
-        target_moods=[MoodCategory.ENERGETIC, MoodCategory.EXCITED],
-        energy_curve=EnergyLevel.HIGH,
-        transition_flex=0.4,
-    ),
-    DaypartSegment.MORNING_WORK: DaypartProfile(
-        enabled=True,
-        start_hour=9,
-        end_hour=12,
-        description="Matinée de travail - concentration avec énergie modérée",
-        target_moods=[MoodCategory.ENERGETIC, MoodCategory.RELAXED],
-        energy_curve=EnergyLevel.MEDIUM,
+        description="Réveil — ambient, modern classical, slowcore. Lumière qui se lève.",
+        target_moods=[MoodCategory.CALM, MoodCategory.RELAXED],
+        energy_curve=EnergyLevel.LOW,
         transition_flex=0.3,
     ),
-    DaypartSegment.LUNCH: DaypartProfile(
+    DaypartSegment.DAY: DaypartProfile(
         enabled=True,
-        start_hour=12,
-        end_hour=14,
-        description="Pause déjeuner - ambiance détendue et positive",
-        target_moods=[MoodCategory.RELAXED, MoodCategory.ENERGETIC, MoodCategory.EXCITED],
-        energy_curve=EnergyLevel.MEDIUM,
-        transition_flex=0.5,
-    ),
-    DaypartSegment.AFTERNOON: DaypartProfile(
-        enabled=True,
-        start_hour=14,
+        start_hour=9,
         end_hour=17,
-        description="Après-midi - maintien productivité, mix varié",
-        target_moods=[MoodCategory.ENERGETIC, MoodCategory.RELAXED, MoodCategory.MELANCHOLIC],
+        description="Activité — indie/electro mid-tempo, hip-hop chill. Fond de travail.",
+        target_moods=[
+            MoodCategory.ENERGETIC,
+            MoodCategory.EXCITED,
+            MoodCategory.RELAXED,
+            MoodCategory.MELANCHOLIC,
+        ],
         energy_curve=EnergyLevel.MEDIUM,
         transition_flex=0.4,
     ),
-    DaypartSegment.EVENING_COMMUTE: DaypartProfile(
+    DaypartSegment.DUSK: DaypartProfile(
         enabled=True,
         start_hour=17,
-        end_hour=19,
-        description="Retour maison - transition travail vers détente",
-        target_moods=[MoodCategory.ENERGETIC, MoodCategory.RELAXED],
-        energy_curve=EnergyLevel.MEDIUM,
-        transition_flex=0.4,
-    ),
-    DaypartSegment.EVENING: DaypartProfile(
-        enabled=True,
-        start_hour=19,
         end_hour=22,
-        description="Soirée - détente, émotions, découverte",
-        target_moods=[MoodCategory.RELAXED, MoodCategory.MELANCHOLIC, MoodCategory.SAD, MoodCategory.CALM, MoodCategory.ANGRY],
+        description="Transition — dream pop, trip hop, downtempo. Plus émotionnel.",
+        target_moods=[
+            MoodCategory.RELAXED,
+            MoodCategory.MELANCHOLIC,
+            MoodCategory.SAD,
+            MoodCategory.ANGRY,
+        ],
         energy_curve=EnergyLevel.LOW,
         transition_flex=0.5,
     ),
@@ -483,8 +467,14 @@ DAYPARTS: dict[DaypartSegment, DaypartProfile] = {
         enabled=True,
         start_hour=22,
         end_hour=5,
-        description="Nuit - ambiance intime, introspection, découverte",
-        target_moods=[MoodCategory.CALM, MoodCategory.SAD, MoodCategory.MELANCHOLIC, MoodCategory.INTENSE, MoodCategory.ANGRY],
+        description="Nuit — ambient profond, sad, expérimental, intense. Introspection.",
+        target_moods=[
+            MoodCategory.CALM,
+            MoodCategory.SAD,
+            MoodCategory.MELANCHOLIC,
+            MoodCategory.INTENSE,
+            MoodCategory.ANGRY,
+        ],
         energy_curve=EnergyLevel.LOW,
         transition_flex=0.6,
     ),
@@ -603,8 +593,12 @@ class RotationCategoryConfig:
     # Below-average floor — under this, tier drops from MEDIUM to LIGHT.
     light_below_average_ratio: float = 0.6
 
-    # Daypart caps per tier. HEAVY isn't capped.
-    medium_daypart_count: int = 3
+    # Daypart caps per tier. HEAVY isn't capped (always all matching zones).
+    # With 4 zones: MEDIUM=2 (50%), LIGHT=1 (25%). For moods that already
+    # only match 1-2 zones, these caps are mostly no-ops — the tier system's
+    # main effect there comes from playlist weight tuning rather than
+    # zone count.
+    medium_daypart_count: int = 2
     light_daypart_count: int = 1
 
 
@@ -1225,12 +1219,7 @@ def get_playlist_name(daypart: DaypartSegment, day_type: DayType | None = None) 
 
 
 def get_all_playlist_names() -> list[str]:
-    """
-    Génère les noms des 8 playlists daypart (sans variantes jour).
-
-    Returns:
-        Liste des 8 noms de playlists
-    """
+    """Génère les noms des zones playlists actuellement actives."""
     return [daypart.value for daypart in get_enabled_dayparts()]
 
 
