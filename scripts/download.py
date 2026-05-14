@@ -89,7 +89,11 @@ def loudnorm_inplace(filepath: Path) -> bool:
     standard for music streaming. Returns True on success; on failure
     the original file is left untouched.
     """
-    tmp = filepath.with_suffix(filepath.suffix + ".ln.tmp")
+    # Tmp filename MUST end in .mp3 so ffmpeg infers the muxer from extension.
+    # An older version used `.mp3.ln.tmp` which made ffmpeg fail with
+    # "Unable to choose an output format" (100% loudnorm fail rate on the
+    # 2026-05-14 manual run, fixed here).
+    tmp = filepath.with_name(filepath.stem + ".ln.mp3")
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(filepath),
@@ -98,6 +102,7 @@ def loudnorm_inplace(filepath: Path) -> bool:
         "-c:a", "libmp3lame", "-q:a", "0",
         "-map_metadata", "0",
         "-id3v2_version", "3",
+        "-f", "mp3",  # belt-and-suspenders: force MP3 muxer explicitly
         str(tmp),
     ]
     try:
