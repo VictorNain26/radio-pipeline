@@ -743,6 +743,68 @@ AGGRESSIVE_FILTER = AggressiveAudioFilter(
 # Combine 4 signaux indépendants pour rejeter les tracks agressives
 MULTI_SIGNAL_FILTER = MultiSignalFilterConfig()
 
+
+# =============================================================================
+# AUDIO PROCESSING — quality gates v4
+# =============================================================================
+
+
+@dataclass
+class AcoustIDDedupConfig:
+    """
+    Content-based dedup via Chromaprint (fpcalc).
+
+    Catches the same recording uploaded under different metadata
+    (remasters, "feat." rewrites, label re-releases). Pure local —
+    no AcoustID web API call, no API key needed.
+
+    Failure mode is graceful: if fpcalc is missing or fails on a
+    given file, dedup is skipped (the artist/title check still runs).
+    """
+    enabled: bool = True
+
+
+@dataclass
+class SpeechFilterConfig:
+    """
+    Reject speech-heavy tracks (podcast episodes, interviews) that
+    can sneak in via RSS feeds (e.g. A Closer Listen "An Interview
+    with Lea Bertucci" matched our tilde parser).
+
+    Uses the Essentia voice_instrumental classifier (discogs-effnet
+    head, ~98% accuracy). Threshold 0.6 = at least 60% voice
+    probability across the track required to reject.
+    """
+    enabled: bool = True
+    max_voice_probability: float = 0.6
+
+
+@dataclass
+class LoudnormConfig:
+    """
+    EBU R128 loudness normalisation pass (broadcast standard).
+
+    AzuraCast does some crossfade-level normalisation but does not
+    target a specific LUFS. Running a single-pass ffmpeg loudnorm
+    before upload gives consistent perceived volume across the library.
+
+    Defaults match the EBU R128 broadcast spec for music streaming:
+      I (integrated)     = -16 LUFS
+      LRA (loudness range) = 11 LU
+      TP (true peak)     = -1.5 dBTP
+
+    Failure mode: if loudnorm fails (rare), the original file is kept.
+    """
+    enabled: bool = True
+    target_lufs: float = -16.0
+    loudness_range: float = 11.0
+    true_peak: float = -1.5
+
+
+ACOUSTID_DEDUP = AcoustIDDedupConfig()
+SPEECH_FILTER = SpeechFilterConfig()
+LOUDNORM = LoudnormConfig()
+
 # Seuils de classification
 THRESHOLDS = ClassificationThresholds(
     aggressive_threshold=0.40,

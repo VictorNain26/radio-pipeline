@@ -30,14 +30,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from http_client import AzuraCastClient, ClientError, HTTPConnectionError, ServerError
+from audio_fingerprint import compute_fingerprint, fingerprint_hash
 from genre_client import GenreClient, create_genre_client
 from settings import get_settings, validate_environment
 
 try:
     from config import (
+        ACOUSTID_DEDUP,
         ALLOWED_GENRES,
         AUDIO_FILTERS,
         GENRE_FILTER,
+        LOUDNORM,
         ROTATION,
         format_duration,
     )
@@ -68,7 +71,40 @@ MAX_PARALLEL_DOWNLOADS = 3
 # Thread-safe lock for shared state
 _download_lock = Lock()
 
-DownloadResult = Literal["downloaded", "skipped", "filtered", "blocked", "failed"]
+DownloadResult = Literal["downloaded", "skipped", "filtered", "blocked", "failed", "duplicate"]
+
+
+def loudnorm_inplace(filepath: Path) -> bool:
+    """
+    EBU R128 single-pass loudness normalisation, in-place rewrite.
+
+    Re-encodes to MP3 V0 (transparent quality at variable bitrate ~245 kbps),
+    keeps ID3 tags via -map_metadata. Target -16 LUFS is the modern
+    standard for music streaming. Returns True on success; on failure
+    the original file is left untouched.
+    """
+    tmp = filepath.with_suffix(filepath.suffix + ".ln.tmp")
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(filepath),
+        "-af",
+        f"loudnorm=I={LOUDNORM.target_lufs}:LRA={LOUDNORM.loudness_range}:TP={LOUDNORM.true_peak}",
+        "-c:a", "libmp3lame", "-q:a", "0",
+        "-map_metadata", "0",
+        "-id3v2_version", "3",
+        str(tmp),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        tmp.unlink(missing_ok=True)
+        return False
+    if result.returncode != 0:
+        logger.warning("  loudnorm failed: %s", (result.stderr or "")[:200])
+        tmp.unlink(missing_ok=True)
+        return False
+    tmp.replace(filepath)
+    return True
 
 
 def compute_sha256(filepath: Path) -> str:
@@ -916,6 +952,30 @@ def download_track(
         logger.error("  Failed after %d retries - file corrupted", MAX_DOWNLOAD_RETRIES)
         return 'failed'
 
+    # Content-based dedup via Chromaprint (catches re-uploads under
+    # different metadata: remasters, feat. rewrites, etc.)
+    if ACOUSTID_DEDUP.enabled and track_db is not None:
+        fp_result = compute_fingerprint(final_path)
+        if fp_result is not None:
+            fp, dur = fp_result
+            fp_h = fingerprint_hash(fp)
+            existing = track_db.find_by_fingerprint(fp_h)
+            if existing and existing.get("track_key") != track_key:
+                logger.info(
+                    "  Duplicate audio (Chromaprint match: %s - %s)",
+                    existing.get("artist") or "?", existing.get("title") or "?",
+                )
+                final_path.unlink(missing_ok=True)
+                return 'duplicate'
+            track_db.record_fingerprint(track_key, fp_h, dur)
+
+    # EBU R128 loudness normalisation (broadcast standard -16 LUFS)
+    if LOUDNORM.enabled:
+        if loudnorm_inplace(final_path):
+            logger.debug("  Loudnorm: -> %.1f LUFS target", LOUDNORM.target_lufs)
+        # On failure we keep the unnormalised file rather than reject —
+        # the loudnorm log warning has already been emitted.
+
     # Fix MP3 timestamps (best practice 2026)
     # Prevents "Could not update timestamps" warnings in Liquidsoap
     fix_mp3_timestamps(final_path)
@@ -1059,7 +1119,7 @@ def main() -> int:
     db_path = Path(__file__).parent.parent / "data" / "tracks.db"
     track_db = TrackDB(db_path)
 
-    stats = {"downloaded": 0, "skipped": 0, "filtered": 0, "blocked": 0, "failed": 0}
+    stats = {"downloaded": 0, "skipped": 0, "filtered": 0, "blocked": 0, "failed": 0, "duplicate": 0}
 
     def _process_track(idx_track: tuple[int, Track]) -> tuple[str, DownloadResult]:
         i, track = idx_track
@@ -1098,7 +1158,8 @@ def main() -> int:
 
     logger.info("\n=== Results ===")
     logger.info("Downloaded: %d", stats['downloaded'])
-    logger.info("Skipped: %d", stats['skipped'])
+    logger.info("Skipped (artist/title or cooldown): %d", stats['skipped'])
+    logger.info("Duplicate (audio fingerprint): %d", stats['duplicate'])
     logger.info("Blocked (genre): %d", stats['blocked'])
     logger.info("Filtered (duration): %d", stats['filtered'])
     logger.info("Failed: %d", stats['failed'])

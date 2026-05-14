@@ -60,8 +60,54 @@ class TrackDB:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- Content-based dedup via Chromaprint
+            -- (see scripts/audio_fingerprint.py). One row per track_key seen
+            -- by the pipeline (whether it ended up uploaded or rejected).
+            -- The hash is indexed for O(1) lookup at download time.
+            CREATE TABLE IF NOT EXISTS audio_fingerprints (
+                track_key TEXT PRIMARY KEY,
+                fingerprint_hash TEXT NOT NULL,
+                duration_sec INTEGER,
+                computed_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fp_hash
+                ON audio_fingerprints(fingerprint_hash);
         """)
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Audio fingerprint (Chromaprint) — see audio_fingerprint.py
+    # ------------------------------------------------------------------
+
+    def record_fingerprint(
+        self, track_key: str, fingerprint_hash: str, duration_sec: int
+    ) -> None:
+        """Persist the Chromaprint hash for this track_key (idempotent)."""
+        self.conn.execute(
+            """INSERT INTO audio_fingerprints
+                   (track_key, fingerprint_hash, duration_sec, computed_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(track_key) DO UPDATE SET
+                   fingerprint_hash = excluded.fingerprint_hash,
+                   duration_sec = excluded.duration_sec,
+                   computed_at = excluded.computed_at""",
+            (track_key, fingerprint_hash, duration_sec, time.time()),
+        )
+        self.conn.commit()
+
+    def find_by_fingerprint(self, fingerprint_hash: str) -> dict[str, Any] | None:
+        """Return the row that matches a Chromaprint hash, or None."""
+        row = self.conn.execute(
+            """SELECT af.track_key, af.duration_sec, af.computed_at,
+                      t.artist, t.title, t.azuracast_file_id
+               FROM audio_fingerprints af
+               LEFT JOIN tracks t ON t.track_key = af.track_key
+               WHERE af.fingerprint_hash = ?
+               LIMIT 1""",
+            (fingerprint_hash,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def record_upload(
         self, track_key: str, artist: str, title: str, file_id: int, mood: str | None = None

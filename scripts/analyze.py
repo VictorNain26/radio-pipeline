@@ -31,7 +31,7 @@ MODELS_DIR = PIPELINE_DIR / "models"
 sys.path.insert(0, str(PIPELINE_DIR))
 
 try:
-    from config import MoodCategory, EnergyLevel
+    from config import MoodCategory, EnergyLevel, SPEECH_FILTER
 except ImportError:
     logger.error("Failed to import config.py - ensure it exists in %s", PIPELINE_DIR)
     sys.exit(1)
@@ -54,6 +54,7 @@ class AudioFeatures:
     mood_aggressive: float = 0.0   # 0-1 probability from binary classifier
     genre_top: str = ""            # Top genre from discogs400
     genre_top_prob: float = 0.0    # Probability of top genre
+    voice_probability: float = 0.0 # 0-1 probability of voice/speech (vs. instrumental)
     lastfm_tags: str = ""          # Raw Last.fm tags (comma-separated)
 
 
@@ -66,6 +67,7 @@ REQUIRED_MODELS = [
     "discogs-effnet-bs64-1.pb",               # Discogs-EffNet embedding
     "mood_aggressive-discogs-effnet-1.pb",    # Mood aggressive binary classifier
     "genre_discogs400-discogs-effnet-1.pb",   # Genre 400 classifier
+    "voice_instrumental-discogs-effnet-1.pb", # Voice vs. instrumental classifier
 ]
 
 
@@ -196,53 +198,64 @@ def classify_mood(valence: float, arousal: float) -> tuple[str, float]:
     return mood, round(confidence, 3)
 
 
-def analyze_discogs_effnet(audio_16k: "np.ndarray") -> tuple[float, str, float]:
+def analyze_discogs_effnet(audio_16k: "np.ndarray") -> tuple[float, str, float, float]:
     """
-    Analyze audio using Discogs-EffNet models for mood_aggressive and genre.
+    Run all three discogs-effnet classification heads from a single
+    embedding pass:
+      - mood_aggressive (binary)
+      - genre_discogs400 (400-way)
+      - voice_instrumental (binary, voice probability)
 
-    Args:
-        audio_16k: Audio signal at 16kHz mono.
+    Sharing the backbone (one EffNet forward pass) costs ~1s/track
+    vs. ~3s if we re-loaded the backbone for each head.
 
     Returns:
-        Tuple of (mood_aggressive_prob, genre_top, genre_top_prob).
+        Tuple of (mood_aggressive_prob, genre_top, genre_top_prob, voice_prob).
     """
     from essentia.standard import TensorflowPredict2D, TensorflowPredictEffnetDiscogs
 
-    # Extract embedding via Discogs-EffNet
+    # Backbone — extract embeddings once
     embedding_model = TensorflowPredictEffnetDiscogs(
         graphFilename=str(MODELS_DIR / "discogs-effnet-bs64-1.pb"),
         output="PartitionedCall:1",
     )
     embeddings = embedding_model(audio_16k)
 
-    # mood_aggressive binary classifier
+    # Head 1: mood_aggressive
     aggressive_model = TensorflowPredict2D(
         graphFilename=str(MODELS_DIR / "mood_aggressive-discogs-effnet-1.pb"),
         input="model/Placeholder",
         output="model/Softmax",
     )
     aggressive_preds = aggressive_model(embeddings)
-    # Average across frames, class[0] = aggressive probability
-    # Essentia convention: [aggressive, not_aggressive]
+    # class[0] = aggressive probability (Essentia convention: [aggressive, not_aggressive])
     mood_aggressive = float(np.mean(aggressive_preds[:, 0]))
 
-    # genre_discogs400 classifier
+    # Head 2: genre_discogs400
     genre_model = TensorflowPredict2D(
         graphFilename=str(MODELS_DIR / "genre_discogs400-discogs-effnet-1.pb"),
         input="serving_default_model_Placeholder",
         output="PartitionedCall:0",
     )
     genre_preds = genre_model(embeddings)
-    # Average across frames, then argmax
     genre_avg = np.mean(genre_preds, axis=0)
     genre_idx = int(np.argmax(genre_avg))
     genre_top_prob = float(genre_avg[genre_idx])
-
-    # Load genre labels
     genre_labels = _get_genre_discogs400_labels()
     genre_top = genre_labels[genre_idx] if genre_idx < len(genre_labels) else f"genre_{genre_idx}"
 
-    return mood_aggressive, genre_top, genre_top_prob
+    # Head 3: voice_instrumental — catches podcast episodes / interviews
+    # that sneak in via RSS discovery (e.g. "An Interview with X").
+    voice_model = TensorflowPredict2D(
+        graphFilename=str(MODELS_DIR / "voice_instrumental-discogs-effnet-1.pb"),
+        input="model/Placeholder",
+        output="model/Softmax",
+    )
+    voice_preds = voice_model(embeddings)
+    # class[0] = voice probability (Essentia convention: [voice, instrumental])
+    voice_prob = float(np.mean(voice_preds[:, 0]))
+
+    return mood_aggressive, genre_top, genre_top_prob, voice_prob
 
 
 # Genre labels for discogs400 (top-level from Discogs taxonomy)
@@ -381,12 +394,13 @@ def analyze_audio(filepath: str) -> AudioFeatures | None:
         mood_str = mood.value if hasattr(mood, 'value') else str(mood)
         energy_str = energy_level.value if hasattr(energy_level, 'value') else str(energy_level)
 
-        # Discogs-EffNet analysis (mood_aggressive + genre)
+        # Discogs-EffNet analysis (mood_aggressive + genre + voice/instrumental)
         mood_aggressive = 0.0
         genre_top = ""
         genre_top_prob = 0.0
+        voice_prob = 0.0
         try:
-            mood_aggressive, genre_top, genre_top_prob = analyze_discogs_effnet(audio)
+            mood_aggressive, genre_top, genre_top_prob, voice_prob = analyze_discogs_effnet(audio)
         except (RuntimeError, OSError, ValueError) as e:
             logger.warning("  Discogs-EffNet analysis failed (non-fatal): %s", e)
 
@@ -403,6 +417,7 @@ def analyze_audio(filepath: str) -> AudioFeatures | None:
             mood_aggressive=round(mood_aggressive, 4),
             genre_top=genre_top,
             genre_top_prob=round(genre_top_prob, 4),
+            voice_probability=round(voice_prob, 4),
         )
 
     except (RuntimeError, OSError, ValueError) as e:
@@ -490,6 +505,24 @@ def process_file(filepath: str) -> bool:
         logger.error("  ERROR: Analysis failed")
         return False
 
+    # Speech filter — reject podcasts / interviews caught by RSS discovery.
+    # Done before tag writing so the file is removed before classify.py
+    # ever sees it.
+    if (
+        SPEECH_FILTER.enabled
+        and features.voice_probability > SPEECH_FILTER.max_voice_probability
+    ):
+        logger.info(
+            "  REJECTED (speech-heavy: %.0f%% voice > %.0f%% threshold) — deleting",
+            features.voice_probability * 100,
+            SPEECH_FILTER.max_voice_probability * 100,
+        )
+        try:
+            Path(filepath).unlink()
+        except OSError as e:
+            logger.warning("  Could not delete rejected file: %s", e)
+        return False
+
     # Display results
     duration_min = features.duration // 60
     duration_sec = features.duration % 60
@@ -498,6 +531,9 @@ def process_file(filepath: str) -> bool:
     logger.info("  Valence: %+.2f | Arousal: %+.2f", features.valence, features.arousal)
     logger.info("  => Mood: %s (%.0f%%)", features.mood, features.confidence * 100)
     logger.info("  => Energy: %s", features.energy_level)
+    logger.info("  => Voice: %.0f%% (instrumental: %.0f%%)",
+                features.voice_probability * 100,
+                (1 - features.voice_probability) * 100)
     if features.mood_aggressive > 0:
         logger.info("  => Aggressive: %.2f | Genre: %s (%.2f)", features.mood_aggressive, features.genre_top, features.genre_top_prob)
 
