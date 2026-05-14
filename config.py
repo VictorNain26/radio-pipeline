@@ -827,7 +827,9 @@ class CLAPConfig:
 ACOUSTID_DEDUP = AcoustIDDedupConfig()
 SPEECH_FILTER = SpeechFilterConfig()
 LOUDNORM = LoudnormConfig()
-CLAP = CLAPConfig()
+# CLAP is enabled in production: backfill has been done (597/597 embedded),
+# new tracks add ~3-5s/track to analyze.py which is well within budget.
+CLAP = CLAPConfig(enabled=True)
 
 # Seuils de classification
 THRESHOLDS = ClassificationThresholds(
