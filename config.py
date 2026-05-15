@@ -835,11 +835,17 @@ class SpeechFilterConfig:
     with Lea Bertucci" matched our tilde parser).
 
     Uses the Essentia voice_instrumental classifier (discogs-effnet
-    head, ~98% accuracy). Threshold 0.6 = at least 60% voice
+    head, ~98% accuracy). Threshold 0.7 = at least 70% voice
     probability across the track required to reject.
+
+    Why 0.7 (not 0.6): on the 2026-05-15 run, Apparat "A Slow Collision"
+    and "Lunes" (electronic ambient, mostly instrumental) scored 0.64 and
+    were wrongly rejected. The real podcasts/interviews in the same run
+    all scored 0.77–0.98, so 0.7 keeps the recall on speech while removing
+    the borderline false positives on electronic / ambient.
     """
     enabled: bool = True
-    max_voice_probability: float = 0.6
+    max_voice_probability: float = 0.7
 
 
 @dataclass

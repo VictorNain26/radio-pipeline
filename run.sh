@@ -100,7 +100,7 @@ stats = {
     "errors": errors or None,
     "discover": discover,                # raw_total, deduped_total, per_source
     "download_breakdown": dl_breakdown,    # downloaded/skipped/.../loudnorm_failed
-    "analyze_breakdown": analyze_breakdown, # analyzed_ok/rejected_speech/clap_failed
+    "analyze_breakdown": analyze_breakdown, # analyzed_ok/rejected_speech/clap_succeeded/clap_cached/clap_failed
 }
 try:
     with open(stats_file) as f:

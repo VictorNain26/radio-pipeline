@@ -45,7 +45,8 @@ _ANALYZE_STATS: dict[str, int] = {
     "analyzed_ok": 0,        # process_file returned True
     "analysis_failed": 0,    # analyze_audio returned None (no mood/tags written)
     "rejected_speech": 0,    # voice_probability over SPEECH_FILTER.max_voice_probability
-    "clap_succeeded": 0,     # CLAP embedding computed + stored
+    "clap_succeeded": 0,     # CLAP embedding computed + stored this run
+    "clap_cached": 0,        # CLAP embedding already in store (skip recompute, not a failure)
     "clap_failed": 0,        # CLAP enabled but embedding returned None / import failed
 }
 
@@ -567,7 +568,10 @@ def process_file(filepath: str) -> bool:
 
             track_key = normalize_track_key(artist, title)
             store = EmbeddingStore(PIPELINE_DIR / "data")
-            if not store.has(track_key):
+            if store.has(track_key):
+                logger.info("  CLAP: cached (already indexed)")
+                _ANALYZE_STATS["clap_cached"] += 1
+            else:
                 emb = compute_embedding(Path(filepath))
                 if emb is not None:
                     store.add(track_key, emb)
@@ -621,6 +625,8 @@ def main() -> int:
     logger.info("\n=== Done (%d/%d successful) ===", success_count, len(files))
     if _ANALYZE_STATS["rejected_speech"]:
         logger.info("Speech-rejected : %d", _ANALYZE_STATS["rejected_speech"])
+    if _ANALYZE_STATS["clap_cached"]:
+        logger.info("CLAP cached (already indexed) : %d", _ANALYZE_STATS["clap_cached"])
     if _ANALYZE_STATS["clap_failed"]:
         logger.warning("CLAP embedding failures : %d", _ANALYZE_STATS["clap_failed"])
 
@@ -633,7 +639,10 @@ def main() -> int:
     except OSError as e:
         logger.warning("Could not write last_analyze_stats.json: %s", e)
 
-    return 0 if success_count == len(files) else 1
+    # Speech rejection is an intentional outcome, not a failure. Only true
+    # analysis errors (analyze_audio returned None) should trip exit 1 so
+    # run.sh's [WARN] alerts stay meaningful.
+    return 1 if _ANALYZE_STATS["analysis_failed"] > 0 else 0
 
 
 if __name__ == "__main__":
