@@ -20,9 +20,9 @@ cd "$SCRIPT_DIR"
 
 # Configuration
 LOCK_FILE="/tmp/radio-pipeline.lock"
+LOCK_ACQUIRED=0
 LOG_FILE="$SCRIPT_DIR/pipeline.log"
 STATS_FILE="$SCRIPT_DIR/data/pipeline_stats.json"
-MAX_LOCK_AGE=7200  # 2 hours in seconds
 
 # ntfy.sh configuration (free push notifications)
 # Set NTFY_TOPIC in .env to enable (e.g. NTFY_TOPIC=aubesonore-pipeline)
@@ -120,8 +120,14 @@ PYEOF
 cleanup() {
     local exit_code=$?
 
-    # Release lock (fd 200 is closed automatically)
-    rm -f "$LOCK_FILE"
+    # If we never acquired the lock, another instance is running: touching
+    # temp dirs, stats or notifications here would sabotage that instance.
+    # The lock file itself is never deleted — flock on the fd is the lock;
+    # deleting the file would let a third instance lock a fresh inode while
+    # the first still holds the old one (two concurrent pipelines).
+    if [ "${LOCK_ACQUIRED:-0}" -ne 1 ]; then
+        exit $exit_code
+    fi
 
     # Clean all temp directories
     for d in "$SCRIPT_DIR/temp" "$SCRIPT_DIR/temp_reanalyze" "$SCRIPT_DIR/temp_reanalyze_server" "$SCRIPT_DIR/temp_playlist_setup"; do
@@ -153,6 +159,7 @@ acquire_lock() {
     fi
     # Write PID for info (lock is held via fd 200)
     echo $$ >&200
+    LOCK_ACQUIRED=1
     log_info "Lock acquired (PID: $$)"
 }
 
