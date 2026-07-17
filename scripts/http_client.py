@@ -213,7 +213,9 @@ class RobustHTTPClient:
 
                 # Check for errors
                 if response.status_code >= 400:
-                    self._handle_error_response(response, attempt)
+                    # Either raises (terminal) or returns True after backoff (retry)
+                    if self._handle_error_response(response, attempt):
+                        continue
 
                 # Success
                 self.circuit_breaker.record_success()
@@ -247,11 +249,17 @@ class RobustHTTPClient:
 
         raise HTTPConnectionError(f"Request failed: {last_exception}")
 
-    def _handle_error_response(self, response: requests.Response, attempt: int) -> None:
-        """Handle HTTP error responses."""
+    def _handle_error_response(self, response: requests.Response, attempt: int) -> bool:
+        """
+        Handle an HTTP error response.
+
+        Returns True when the caller should retry (backoff already applied);
+        raises ClientError/ServerError for terminal failures. Never falls
+        through silently — an error response must never reach the success path.
+        """
         status = response.status_code
 
-        # Client errors (4xx) - don't retry
+        # Client errors (4xx) - don't retry, except 429
         if 400 <= status < 500:
             self.circuit_breaker.record_success()  # Service is responding
 
@@ -262,26 +270,26 @@ class RobustHTTPClient:
             if status == 404:
                 raise ClientError("Resource not found", status, response)
             if status == 429:
-                # Rate limited - do retry with backoff
-                retry_after = response.headers.get("Retry-After", "60")
-                delay = min(float(retry_after), 300.0) if retry_after.isdigit() else 60.0
-                logger.warning(f"Rate limited, waiting {delay}s")
-                time.sleep(delay)
-                raise ServerError("Rate limited", status, response)
+                if attempt < self.retry_config.max_retries:
+                    retry_after = response.headers.get("Retry-After", "60")
+                    delay = min(float(retry_after), 300.0) if retry_after.isdigit() else 60.0
+                    logger.warning(f"Rate limited, retrying in {delay}s")
+                    time.sleep(delay)
+                    return True
+                raise ClientError(f"Rate limited after {attempt + 1} attempts", status, response)
 
             raise ClientError(f"Client error: {status}", status, response)
 
-        # Server errors (5xx) - retry
-        if status >= 500:
-            self.circuit_breaker.record_failure()
+        # Server errors (5xx) - retry with backoff
+        self.circuit_breaker.record_failure()
 
-            if attempt < self.retry_config.max_retries:
-                delay = self.retry_config.get_delay(attempt)
-                logger.warning(f"Server error {status}, retrying in {delay:.1f}s")
-                time.sleep(delay)
-                # Don't raise, let the retry loop continue
-            else:
-                raise ServerError(f"Server error after {attempt + 1} attempts: {status}", status, response)
+        if attempt < self.retry_config.max_retries:
+            delay = self.retry_config.get_delay(attempt)
+            logger.warning(f"Server error {status}, retrying in {delay:.1f}s")
+            time.sleep(delay)
+            return True
+
+        raise ServerError(f"Server error after {attempt + 1} attempts: {status}", status, response)
 
     def get(self, endpoint: str, **kwargs: Any) -> requests.Response:
         """HTTP GET request."""
