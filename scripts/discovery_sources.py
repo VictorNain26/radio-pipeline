@@ -110,9 +110,9 @@ def parse_tilde(entry: Any) -> tuple[str, str] | None:
     return _parse_tilde_title(entry.get("title") or "")
 
 
-def parse_dash_then_quoted(entry: Any) -> tuple[str, str] | None:
-    """For 'Artist – "Track"' (Stereogum-style)."""
-    return _parse_dash_title(entry.get("title") or "")
+# 'Artist – "Track"' (Stereogum-style): _clean() already strips the quotes,
+# so this is genuinely the same parser — kept as a distinct config name.
+parse_dash_then_quoted = parse_dash
 
 
 def parse_pitchfork(entry: Any) -> tuple[str, str] | None:
@@ -253,7 +253,6 @@ class RSSFeedConfig:
     label: str = ""                            # short label used as source name
     enabled: bool = True
     limit: int = 30                            # max items processed from the feed
-    require_track_artist_separator: bool = True
 
 
 @dataclass

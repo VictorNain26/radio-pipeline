@@ -206,8 +206,16 @@ class TrackDB:
                 (key,),
             )
 
-        # Update last sync timestamp
-        now = str(time.time())
+        # Advance the sync cursor to the newest entry actually seen, not to
+        # "now" — plays occurring between the history query and this write
+        # would otherwise be skipped by the next sync.
+        played_ats = []
+        for entry in history_entries:
+            try:
+                played_ats.append(float(entry.get("played_at") or 0))
+            except (TypeError, ValueError):
+                pass
+        now = str(max(played_ats, default=time.time()))
         self.conn.execute(
             """INSERT INTO sync_state (key, value) VALUES ('last_history_sync', ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
