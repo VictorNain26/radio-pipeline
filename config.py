@@ -820,12 +820,43 @@ class CLAPConfig:
     enabled: bool = False
 
 
+@dataclass
+class TasteFilterConfig:
+    """
+    Personal taste filter — compares each candidate's CLAP embedding to
+    the profile built from Victor's own library (scripts/build_taste_profile.py,
+    data/taste_profile.npy).
+
+    Score = mean cosine similarity with the k nearest profile vectors.
+    Below `threshold` → reject before AzuraCast upload.
+
+    `log_only=True` keeps the filter in observation mode: verdicts are
+    logged (and counted in stats) but nothing is blocked. Arm it only
+    after the calibration audit shows clean separation.
+
+    `min_profile_size` guards against a truncated/partial profile
+    silently rejecting everything.
+    """
+    enabled: bool = True
+    log_only: bool = True
+    k: int = 5
+    threshold: float = 0.50   # placeholder — calibrated empirically
+    min_profile_size: int = 200
+
+
 ACOUSTID_DEDUP = AcoustIDDedupConfig()
 SPEECH_FILTER = SpeechFilterConfig()
 LOUDNORM = LoudnormConfig()
 # CLAP is enabled in production: backfill has been done (597/597 embedded),
 # new tracks add ~3-5s/track to analyze.py which is well within budget.
 CLAP = CLAPConfig(enabled=True)
+TASTE_FILTER = TasteFilterConfig()
+
+# Personal-library discovery: seed artists (from taste_profile_index.json)
+# are rotated through Last.fm artist.getSimilar each night.
+TASTE_DISCOVERY_SEEDS_PER_RUN: int = 15
+TASTE_DISCOVERY_SIMILAR_PER_SEED: int = 4
+TASTE_DISCOVERY_TRACKS_PER_ARTIST: int = 2
 
 # =============================================================================
 # FONCTIONS UTILITAIRES

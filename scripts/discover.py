@@ -34,11 +34,13 @@ from discovery_sources import (  # noqa: E402
     HypeMachineSource,
     LastFMTagSource,
     ManualPicksSource,
+    PersonalArtistsSource,
     RSSFeedConfig,
     RSSSource,
     Track,
 )
 from settings import get_settings, validate_environment  # noqa: E402
+from taste_profile import load_seed_artists  # noqa: E402
 from track_db import normalize_track_key  # noqa: E402
 
 try:
@@ -47,6 +49,9 @@ try:
         LASTFM_TAGS,
         LASTFM_TAG_LIMIT,
         RSS_FEEDS,
+        TASTE_DISCOVERY_SEEDS_PER_RUN,
+        TASTE_DISCOVERY_SIMILAR_PER_SEED,
+        TASTE_DISCOVERY_TRACKS_PER_ARTIST,
     )
 except ImportError as e:
     print(f"Error: config.py missing discovery fields: {e}")
@@ -99,6 +104,23 @@ def _build_sources() -> list[DiscoverySource]:
         )
     elif LASTFM_TAGS and not settings.lastfm_api_key:
         logger.warning("LASTFM_API_KEY not set — skipping Last.fm tag sources")
+
+    # Personal-library discovery: seeds from the taste profile, rotated
+    # through Last.fm getSimilar. Silently absent until the profile is
+    # built (build_taste_profile.py) — the other sources keep running.
+    if settings.lastfm_api_key:
+        seed_artists = load_seed_artists(PIPELINE_DIR / "data")
+        if seed_artists:
+            sources.append(
+                PersonalArtistsSource(
+                    api_key=settings.lastfm_api_key,
+                    seeds=seed_artists,
+                    cursor_path=PIPELINE_DIR / "data" / "personal_seeds_cursor.json",
+                    seeds_per_run=TASTE_DISCOVERY_SEEDS_PER_RUN,
+                    similar_per_seed=TASTE_DISCOVERY_SIMILAR_PER_SEED,
+                    tracks_per_artist=TASTE_DISCOVERY_TRACKS_PER_ARTIST,
+                )
+            )
 
     # Manual picks : editorial overrides (data/manual_picks.json).
     sources.append(ManualPicksSource(path=MANUAL_PICKS_FILE))

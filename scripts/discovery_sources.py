@@ -369,6 +369,127 @@ class LastFMTagSource(DiscoverySource):
 
 
 @dataclass
+class PersonalArtistsSource(DiscoverySource):
+    """
+    Discovery driven by Victor's own library (taste profile seeds).
+
+    Each run takes `seeds_per_run` artists from the seed list (round-robin
+    via a persistent cursor file), asks Last.fm artist.getSimilar for each,
+    keeps similar artists NOT already in the seed list (maximise novelty),
+    and pulls their top tracks. Complements — not replaces — the RSS/tag
+    sources.
+    """
+    api_key: str
+    seeds: list[str]
+    cursor_path: Path = Path("data/personal_seeds_cursor.json")
+    seeds_per_run: int = 15
+    similar_per_seed: int = 4
+    tracks_per_artist: int = 2
+    min_match: float = 0.35        # Last.fm similarity score floor
+    name: str = "personal"
+
+    def _read_cursor(self) -> int:
+        try:
+            return int(json.loads(self.cursor_path.read_text(encoding="utf-8"))["cursor"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return 0
+
+    def _write_cursor(self, cursor: int) -> None:
+        try:
+            self.cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cursor_path.write_text(
+                json.dumps({"cursor": cursor}), encoding="utf-8")
+        except OSError as e:
+            logger.warning("personal: cannot persist cursor: %s", e)
+
+    def _pick_seeds(self) -> list[str]:
+        if not self.seeds:
+            return []
+        n = min(self.seeds_per_run, len(self.seeds))
+        start = self._read_cursor() % len(self.seeds)
+        picked = [self.seeds[(start + i) % len(self.seeds)] for i in range(n)]
+        self._write_cursor((start + n) % len(self.seeds))
+        return picked
+
+    def _get_similar(self, artist: str) -> list[str]:
+        url = (
+            "https://ws.audioscrobbler.com/2.0/?method=artist.getsimilar"
+            f"&artist={urllib.parse.quote(artist)}"
+            f"&limit={self.similar_per_seed * 3}"   # headroom for filtering
+            f"&api_key={self.api_key}"
+            "&format=json&autocorrect=1"
+        )
+        data = _http_get_json(url)
+        if not data:
+            return []
+        entries = (data.get("similarartists") or {}).get("artist") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        seed_names = {s.strip().lower() for s in self.seeds}
+        out: list[str] = []
+        for entry in entries:
+            name = (entry.get("name") or "").strip()
+            try:
+                match = float(entry.get("match", 0))
+            except (TypeError, ValueError):
+                match = 0.0
+            if not name or match < self.min_match:
+                continue
+            if name.lower() in seed_names:
+                continue  # already in the personal library — prioritise novelty
+            out.append(name)
+            if len(out) >= self.similar_per_seed:
+                break
+        return out
+
+    def _get_top_tracks(self, artist: str) -> list[tuple[str, str | None]]:
+        url = (
+            "https://ws.audioscrobbler.com/2.0/?method=artist.gettoptracks"
+            f"&artist={urllib.parse.quote(artist)}"
+            f"&limit={self.tracks_per_artist}"
+            f"&api_key={self.api_key}"
+            "&format=json&autocorrect=1"
+        )
+        data = _http_get_json(url)
+        if not data:
+            return []
+        entries = (data.get("toptracks") or {}).get("track") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        out: list[tuple[str, str | None]] = []
+        for entry in entries[: self.tracks_per_artist]:
+            title = (entry.get("name") or "").strip()
+            if not title:
+                continue
+            cover = None
+            for img in entry.get("image") or []:
+                if img.get("size") in ("extralarge", "large") and img.get("#text"):
+                    cover = img["#text"]
+                    break
+            out.append((title, cover))
+        return out
+
+    def fetch(self) -> list[Track]:
+        seeds = self._pick_seeds()
+        if not seeds:
+            logger.info("  personal: no seed artists (taste profile not built)")
+            return []
+        out: list[Track] = []
+        similar_seen: set[str] = set()
+        for seed in seeds:
+            for similar in self._get_similar(seed):
+                key = similar.lower()
+                if key in similar_seen:
+                    continue
+                similar_seen.add(key)
+                for title, cover in self._get_top_tracks(similar):
+                    out.append(_make_track(self.name, similar, title, cover))
+        logger.info("  personal: %d seeds → %d similar artists → %d tracks",
+                    len(seeds), len(similar_seen), len(out))
+        return out
+
+
+@dataclass
 class ManualPicksSource(DiscoverySource):
     """Reads data/manual_picks.json. Same shape as before."""
     path: Path

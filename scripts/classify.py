@@ -38,6 +38,7 @@ try:
         AUDIO_FILTERS,
         AGGRESSIVE_FILTER,
         MULTI_SIGNAL_FILTER,
+        TASTE_FILTER,
         get_dayparts_for_mood,
         get_enabled_dayparts,
         get_current_day_type,
@@ -488,6 +489,65 @@ def should_reject_multisignal(features: TrackFeatures) -> tuple[bool, str]:
     return False, ""
 
 
+# ---------------------------------------------------------------------------
+# Personal taste filter (CLAP profile of Victor's own library).
+# Profile is loaded once per run; every failure path degrades to "skip"
+# so a missing/corrupt profile can never block the pipeline.
+# ---------------------------------------------------------------------------
+
+_TASTE_CACHE: dict[str, Any] = {}
+
+
+def _get_taste_profile() -> Any | None:
+    if "profile" not in _TASTE_CACHE:
+        profile = None
+        try:
+            from taste_profile import load_taste_profile
+            profile = load_taste_profile(Path(__file__).parent.parent / "data")
+        except Exception as e:
+            logger.warning("Taste profile unavailable: %s", e)
+        if profile is not None and profile.size < TASTE_FILTER.min_profile_size:
+            logger.warning(
+                "Taste profile too small (%d < %d) — filter disabled",
+                profile.size, TASTE_FILTER.min_profile_size,
+            )
+            profile = None
+        _TASTE_CACHE["profile"] = profile
+    return _TASTE_CACHE["profile"]
+
+
+def check_taste(track_key: str) -> tuple[str, float | None]:
+    """
+    Score a track against the personal taste profile.
+
+    Returns (verdict, score):
+      verdict "reject" — score below threshold (caller decides whether
+                          to enforce, per TASTE_FILTER.log_only)
+      verdict "ok"     — score at/above threshold
+      verdict "skip"   — filter disabled, profile missing, or no
+                          embedding for this track (never blocks)
+    """
+    if not TASTE_FILTER.enabled:
+        return "skip", None
+    profile = _get_taste_profile()
+    if profile is None:
+        return "skip", None
+    try:
+        from audio_embeddings import EmbeddingStore
+        store = _TASTE_CACHE.setdefault(
+            "store", EmbeddingStore(Path(__file__).parent.parent / "data"))
+        if not store.has(track_key):
+            logger.info("  [taste] no embedding for %s — skipping check", track_key)
+            return "skip", None
+        embedding = store.get(track_key)
+        score = profile.score(embedding, k=TASTE_FILTER.k)
+    except Exception as e:
+        logger.warning("  [taste] scoring failed: %s", e)
+        return "skip", None
+    verdict = "ok" if score >= TASTE_FILTER.threshold else "reject"
+    return verdict, score
+
+
 def process_track(
     filepath: Path,
     client: ClassifyClient,
@@ -590,6 +650,19 @@ def process_track(
         if is_aggressive or is_blocked_mood:
             reason = "Audio agressif détecté (V:%+.2f/A:%+.2f, mood:%s)" % (valence, arousal, mood)
             logger.info("  Rejected: %s", reason)
+            filepath.unlink()
+            return "rejected", []
+
+    # Personal taste filter — the candidate must sound like Victor's
+    # library. In log_only mode the verdict is logged but not enforced.
+    taste_verdict, taste_score = check_taste(normalize_track_key(artist, title))
+    if taste_verdict != "skip" and taste_score is not None:
+        logger.info("  [taste] score=%.3f threshold=%.3f verdict=%s%s",
+                    taste_score, TASTE_FILTER.threshold, taste_verdict,
+                    " (log-only)" if TASTE_FILTER.log_only else "")
+        if taste_verdict == "reject" and not TASTE_FILTER.log_only:
+            logger.info("  Rejected: trop éloigné du profil de goût (%.3f < %.3f)",
+                        taste_score, TASTE_FILTER.threshold)
             filepath.unlink()
             return "rejected", []
 
