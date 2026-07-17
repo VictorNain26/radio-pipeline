@@ -939,17 +939,19 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
     logger.info("TrackDB stats: %s", stats)
 
     # Prune CLAP embeddings of deleted tracks — without this the store
-    # grows forever while rotation shrinks the library.
-    if deleted_count > 0:
-        try:
-            from audio_embeddings import EmbeddingStore
+    # grows forever while rotation shrinks the library. Runs even when
+    # this rotation pass deleted nothing: tracks can disappear outside
+    # rotation (manual purge, server-side removal) and their embeddings
+    # must not linger.
+    try:
+        from audio_embeddings import EmbeddingStore
 
-            valid_keys = {t["track_key"] for t in track_db.get_active_tracks()}
-            removed = EmbeddingStore(Path(__file__).parent.parent / "data").prune(valid_keys)
-            if removed:
-                logger.info("Embedding store: pruned %d stale entries", removed)
-        except ImportError:
-            pass  # CLAP deps not installed — nothing to prune
+        valid_keys = {t["track_key"] for t in track_db.get_active_tracks()}
+        removed = EmbeddingStore(Path(__file__).parent.parent / "data").prune(valid_keys)
+        if removed:
+            logger.info("Embedding store: pruned %d stale entries", removed)
+    except ImportError:
+        pass  # CLAP deps not installed — nothing to prune
 
     return deleted_count
 
