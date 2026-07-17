@@ -593,6 +593,19 @@ class AzuraCastClient(RobustHTTPClient):
                 filtered.append(entry)
         return filtered
 
+    def update_file_art(self, file_id: int | str, image_path: Path) -> bool:
+        """Upload artwork for an existing station file."""
+        try:
+            with open(image_path, "rb") as f:
+                response = self.post(
+                    f"/api/station/{self.station_id}/files/{file_id}/art",
+                    files={"art": ("cover.jpg", f, "image/jpeg")},
+                )
+            return response.status_code in (200, 201)
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.error(f"Art update failed for file {file_id}: {e}")
+            return False
+
     def delete_file(self, file_id: int | str) -> bool:
         """
         Delete a file from station library.

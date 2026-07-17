@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -732,6 +733,37 @@ def find_best_audio_match(
     return best
 
 
+def fetch_itunes_cover(artist: str, title: str, output_dir: Path) -> "Path | None":
+    """
+    iTunes Search API fallback for tracks whose discovery source has no cover.
+    Queries the same endpoint as the AubeSonore backend, upgrades 100px → 600px.
+    """
+    query = urllib.parse.quote(f"{artist} {title}")
+    api_url = (
+        f"https://itunes.apple.com/search"
+        f"?term={query}&media=music&entity=song&limit=1&country=FR"
+    )
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (RadioPipeline/2.0)"})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        logger.debug("  iTunes lookup failed: %s", e)
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    artwork_url = results[0].get("artworkUrl100")
+    if not artwork_url:
+        return None
+
+    artwork_url = artwork_url.replace("100x100bb", "600x600bb")
+    cover_path = output_dir / "cover.jpg"
+    return cover_path if download_cover(artwork_url, cover_path) else None
+
+
 def download_cover(url: str, output_path: Path) -> bool:
     """
     Download cover image from URL.
@@ -1100,6 +1132,11 @@ def download_track(
             logger.info("  Cover: OK")
         else:
             cover_path = None
+
+    if cover_path is None:
+        cover_path = fetch_itunes_cover(artist, title, thread_temp)
+        if cover_path:
+            logger.info("  Cover: iTunes fallback OK")
 
     # Write ID3 tags (including Last.fm tags for multi-signal filter)
     if write_id3_tags(final_path, artist, title, cover_path, has_lastfm_tags, lastfm_tags_str):

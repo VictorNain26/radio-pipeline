@@ -24,6 +24,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def is_loopback_host(hostname: str | None) -> bool:
+    """True if the host resolves trivially to the local machine (no network exposure)."""
+    if not hostname:
+        return False
+    host = hostname.strip("[]").lower()
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
 # Get project root directory
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -136,11 +144,9 @@ class Settings(BaseSettings):
             if not parsed.netloc:
                 raise ValueError("URL must include hostname")
 
-            # Warn about HTTP in production
-            if parsed.scheme == "http" and not os.environ.get("ALLOW_HTTP"):
-                logger.warning(
-                    "Using HTTP is insecure. Set ALLOW_HTTP=1 to suppress this warning."
-                )
+            # HTTP is only acceptable when traffic never leaves the machine
+            if parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
+                logger.warning("Using HTTP toward a non-local host is insecure.")
 
             return v
 
@@ -149,12 +155,12 @@ class Settings(BaseSettings):
             """Validate security-related settings."""
             parsed = urlparse(self.azuracast_url)
 
-            # Require HTTPS in production
-            if not self.debug and parsed.scheme == "http":
-                if not os.environ.get("ALLOW_HTTP"):
-                    raise ValueError(
-                        "HTTP is not allowed in production. Use HTTPS or set DEBUG=1 for testing."
-                    )
+            # Require HTTPS in production, except toward loopback (no network exposure)
+            if not self.debug and parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
+                raise ValueError(
+                    "HTTP toward a remote host is not allowed in production. "
+                    "Use HTTPS, or DEBUG=1 for testing."
+                )
 
             # Warn about disabled SSL verification
             if not self.ssl_verify:
@@ -213,8 +219,8 @@ def validate_environment() -> tuple[bool, list[str]]:
         # Additional runtime checks
         parsed = urlparse(settings.azuracast_url)
 
-        if parsed.scheme == "http" and not settings.debug:
-            errors.append("HTTP is insecure. Use HTTPS for production.")
+        if parsed.scheme == "http" and not settings.debug and not is_loopback_host(parsed.hostname):
+            errors.append("HTTP toward a remote host is insecure. Use HTTPS for production.")
 
         if not settings.ssl_verify and not settings.debug:
             errors.append("SSL verification disabled in production.")
