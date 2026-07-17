@@ -201,21 +201,36 @@ Chaque track porte un **rotation tier** dans `data/tracks.db` :
   - *Performance prouvée* : age >= 14j ET play rate ≥ moyenne library × 1.2.
 - **MEDIUM** — 2 zones max parmi les compatibles. Performance moyenne.
 - **LIGHT** — 1 zone. En sous-performance, va vers l'éviction.
+- **GOLD** — catalogue permanent (2026-07) : à l'expiration, un morceau
+  prouvé (rate ≥ moyenne × 1.2) ET dans la couleur (taste ≥ 0.70) survit
+  en rotation douce (1 zone), plafonné à 40 % de la library.
+
+Le taux de référence (`expected_plays_per_day`) est **mesuré** à chaque
+run depuis les données réelles (Σ plays / Σ âge) — la constante de
+config n'est qu'un fallback.
 
 Le re-tier pass tourne dans `enforce_tiered_rotation` à chaque cron : promotions et démotions appliquées via `assign_playlists` (REPLACE) — pas
 de zombie dans les playlists.
 
+**Curation nocturne (2026-07)** : la fournée de la nuit est triée par
+score de goût (profil CLAP personnel) et seuls les
+`ROTATION.max_uploads_per_night` (6) meilleurs sont uploadés — l'antenne
+(~2 700 passages/sem.) ne peut donner ses 15-20 passages hebdo de
+rotation forte qu'à ~42 nouveautés/semaine. Les non-retenus partent en
+cooldown.
+
 ### 8. Rotation 4-tiers âge + cooldown
 
 `classify.enforce_tiered_rotation` sépare les tracks en 4 tiers basés
-sur l'âge :
+sur l'âge (le tier GOLD y est immunisé) :
 
 - **FRESH** (`<= fresh_days`, 14 j) — protection totale
 - **CURRENT** (`<= current_days`, 35 j) — supprimable si library pleine
   ET `play_count >= min_plays_before_delete`
 - **FADING** (`<= max_age_days`, 60 j) — plafonné à 20 % de la library,
   least-played évacuées en premier
-- **EXPIRED** (`> max_age_days`) — force delete
+- **EXPIRED** (`> max_age_days`) — graduation GOLD si prouvé + dans la
+  couleur, sinon suppression
 
 Le `play_count` vient de l'historique AzuraCast (sync à chaque run).
 Cooldown de 60 j après suppression : un track supprimé ne sera pas

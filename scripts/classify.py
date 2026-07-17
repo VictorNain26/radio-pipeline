@@ -85,7 +85,9 @@ except ImportError as e:
 TIER_RANK = {"LIGHT": 0, "DISCOVERY": 0, "MEDIUM": 1, "HEAVY": 2}
 
 
-def compute_rotation_tier(play_count: int, age_days: float) -> str:
+def compute_rotation_tier(
+    play_count: int, age_days: float, expected: float | None = None,
+) -> str:
     """
     Compute the rotation tier for a track from its (play_count, age_days).
 
@@ -94,7 +96,7 @@ def compute_rotation_tier(play_count: int, age_days: float) -> str:
       regardless of plays. This is the DISCOVERY emphasis: new tracks
       get a fair shot at being heard.
     - Past the grace period → compare actual play rate against the
-      library's expected rate:
+      library's expected rate (measured when available, config fallback):
         * rate >= expected × heavy_above_average_ratio  → HEAVY (proven hit)
         * rate >= expected × light_below_average_ratio  → MEDIUM (average)
         * else                                          → LIGHT (waning)
@@ -103,12 +105,54 @@ def compute_rotation_tier(play_count: int, age_days: float) -> str:
     if age_days < cfg.grace_period_days:
         return "HEAVY"
     rate = play_count / max(1.0, age_days)
-    expected = cfg.expected_plays_per_day
+    if expected is None:
+        expected = cfg.expected_plays_per_day
     if rate >= expected * cfg.heavy_above_average_ratio:
         return "HEAVY"
     if rate >= expected * cfg.light_below_average_ratio:
         return "MEDIUM"
     return "LIGHT"
+
+
+def measure_expected_plays_per_day(entries: list[dict[str, Any]]) -> float:
+    """
+    Measure the library-wide average plays/track/day from real data
+    (Σ play_count / Σ age_days over tracks at least 1 day old), instead
+    of trusting the hardcoded config constant — which silently drifts
+    whenever library size or listening volume changes.
+
+    Falls back to ROTATION_CATEGORIES.expected_plays_per_day when there
+    is not enough signal (< 30 track-days). Clamped to [0.2, 3.0].
+    """
+    total_plays = 0
+    total_days = 0.0
+    for e in entries:
+        age = e.get("age_days", 0.0)
+        if age >= 1.0:
+            total_plays += e.get("play_count", 0)
+            total_days += age
+    if total_days < 30.0:
+        return ROTATION_CATEGORIES.expected_plays_per_day
+    return min(3.0, max(0.2, total_plays / total_days))
+
+
+def qualifies_for_gold(
+    play_count: int,
+    age_days: float,
+    taste_score: float | None,
+    expected_rate: float,
+) -> bool:
+    """
+    GOLD graduation rule: at expiry, a track survives as permanent
+    catalogue if it is PROVEN (play rate at least heavy_above_average_ratio
+    times the library rate) and ON-COLOR (taste score at or above
+    ROTATION.gold_min_taste). No taste score (no profile/embedding) means
+    no graduation — the catalogue only takes verified matches.
+    """
+    if taste_score is None or taste_score < ROTATION.gold_min_taste:
+        return False
+    rate = play_count / max(1.0, age_days)
+    return rate >= expected_rate * ROTATION_CATEGORIES.heavy_above_average_ratio
 
 
 def tier_filter_dayparts(
@@ -121,7 +165,7 @@ def tier_filter_dayparts(
       HEAVY  → all matching dayparts (max exposure)
       MEDIUM → first medium_daypart_count matching dayparts
       LIGHT  → first light_daypart_count matching dayparts
-      (legacy DISCOVERY treated as LIGHT)
+      (GOLD catalogue and legacy DISCOVERY treated as LIGHT)
     """
     if not ROTATION_CATEGORIES.enabled or tier == "HEAVY":
         return list(mood_dayparts)
@@ -547,6 +591,39 @@ def check_taste(track_key: str) -> tuple[str, float | None]:
     return verdict, score
 
 
+def _track_key_of_file(filepath: Path) -> str | None:
+    """Read artist/title from ID3 tags and build the pipeline track key."""
+    try:
+        from mutagen.id3 import ID3
+        tags = ID3(str(filepath))
+        artist = str(tags.get("TPE1", "") or "").strip()
+        title = str(tags.get("TIT2", "") or "").strip()
+    except Exception:
+        return None
+    if not artist or not title:
+        return None
+    return normalize_track_key(artist, title)
+
+
+def _rank_by_taste(files: list[Path]) -> list[tuple[Path, str | None, float]]:
+    """
+    Order the night's batch by taste score, best first, for the upload
+    quota. Files without a score (no embedding/profile) rank last but
+    are still processed if the quota allows.
+    """
+    ranked: list[tuple[Path, str | None, float]] = []
+    for filepath in files:
+        track_key = _track_key_of_file(filepath)
+        score = -1.0
+        if track_key:
+            _, taste = check_taste(track_key)
+            if taste is not None:
+                score = taste
+        ranked.append((filepath, track_key, score))
+    ranked.sort(key=lambda t: t[2], reverse=True)
+    return ranked
+
+
 def process_track(
     filepath: Path,
     client: ClassifyClient,
@@ -744,7 +821,7 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
     logger.info("Tiers: FRESH<%sd | CURRENT<%sd | FADING<%sd | EXPIRED", fresh_days, current_days, max_age_days)
 
     tiers: dict[str, list[dict[str, Any]]] = {
-        "FRESH": [], "CURRENT": [], "FADING": [], "EXPIRED": [],
+        "FRESH": [], "CURRENT": [], "FADING": [], "EXPIRED": [], "GOLD": [],
     }
 
     for f in files:
@@ -788,7 +865,10 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
             "playlist_names": {p.get("name") for p in (f.get("playlists") or []) if p.get("name")},
         }
 
-        if age_days <= fresh_days:
+        if tier_stored == "GOLD":
+            # Permanent catalogue: immune to age expiry and re-tiering.
+            tiers["GOLD"].append(entry)
+        elif age_days <= fresh_days:
             tiers["FRESH"].append(entry)
         elif age_days <= current_days:
             tiers["CURRENT"].append(entry)
@@ -799,6 +879,13 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
 
     for tier_name, tracks in tiers.items():
         logger.info("  %s: %s tracks", tier_name, len(tracks))
+
+    # Measured library play rate (replaces the hardcoded constant for
+    # tiering + GOLD graduation; falls back to config on thin signal).
+    all_entries = [e for bucket in tiers.values() for e in bucket]
+    expected_rate = measure_expected_plays_per_day(all_entries)
+    logger.info("  Expected plays/day: %.2f (measured; config fallback %.2f)",
+                expected_rate, ROTATION_CATEGORIES.expected_plays_per_day)
 
     # --- Monitor: warn about active tracks with 0 plays after 7+ days ---
     zero_play_old = [
@@ -814,13 +901,52 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
 
     deleted_count = 0
 
-    # --- Phase 3: Force delete EXPIRED (>max_age_days) ---
-    for entry in tiers["EXPIRED"]:
+    # --- Phase 3: EXPIRED (>max_age_days) — graduate to GOLD or delete ---
+    # Radio practice: proven, on-color tracks become permanent catalogue
+    # instead of dying at max_age_days. Everything else is deleted.
+    gold_cap = int(current_count * ROTATION.gold_max_pct / 100)
+    gold_count = len(tiers["GOLD"])
+    graduated = 0
+    gold_map: dict[str, int] = {}
+    if tiers["EXPIRED"]:
+        try:
+            gold_map = client.get_playlists_map()
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning("  Playlist map unavailable for GOLD shrink: %s", e)
+    # Best candidates graduate first while the cap has room.
+    expired_ranked = sorted(
+        tiers["EXPIRED"], key=lambda e: e["play_count"], reverse=True)
+    for entry in expired_ranked:
+        _, taste_score = (
+            check_taste(entry["track_key"]) if entry["track_key"] else ("skip", None))
+        if (
+            gold_count < gold_cap
+            and qualifies_for_gold(
+                entry["play_count"], entry["age_days"], taste_score, expected_rate)
+        ):
+            track_db.update_tier(entry["track_key"], "GOLD")
+            gold_count += 1
+            graduated += 1
+            logger.info(
+                "  GOLD: %s - %s (%.0fd, %s plays, taste %.2f)",
+                entry["artist"], entry["title"], entry["age_days"],
+                entry["play_count"], taste_score,
+            )
+            # Soft rotation: shrink to LIGHT-style daypart membership.
+            mood = entry["mood"]
+            if mood and gold_map:
+                target = tier_filter_dayparts(get_dayparts_for_mood(mood), "GOLD")
+                ids = [gold_map[dp.value] for dp in target if dp.value in gold_map]
+                if ids:
+                    client.assign_playlists(entry["file_id"], ids)
+            continue
         if client.delete_file(entry["file_id"]):
             logger.info("  EXPIRED: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
             if entry["track_key"]:
                 track_db.record_deletion(entry["track_key"])
             deleted_count += 1
+    if graduated:
+        logger.info("  GOLD catalogue: %d graduated, %d/%d total", graduated, gold_count, gold_cap)
 
     # --- Phase 4: Cap FADING to fading_max_pct% of library ---
     fading_max_count = int(max_tracks * fading_max_pct / 100)
@@ -886,7 +1012,8 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
                     continue
                 stored = entry["tier_stored"]
                 # Treat the legacy "DISCOVERY" label as unset (TIER_RANK 0)
-                new_tier = compute_rotation_tier(entry["play_count"], entry["age_days"])
+                new_tier = compute_rotation_tier(
+                    entry["play_count"], entry["age_days"], expected=expected_rate)
 
                 target_dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), new_tier)
                 target_names = {dp.value for dp in target_dayparts}
@@ -1091,11 +1218,26 @@ def _main_inner(
         "rejected": 0,
         "skipped": 0,
         "failed": 0,
+        "quota": 0,
     }
     playlist_counts: dict[str, int] = {}
 
-    # Process files
-    for filepath in files:
+    # Nightly curation: rank the batch by taste score (best first) so the
+    # upload quota keeps the tracks closest to Victor's colour. The rest
+    # goes to cooldown — airtime is the scarce resource: beyond
+    # max_uploads_per_night adds, a discovery can no longer get its
+    # 15-20 weekly heavy-rotation plays.
+    quota = ROTATION.max_uploads_per_night
+    ranked = _rank_by_taste(files)
+
+    # Process files (best-scoring first)
+    for filepath, track_key, taste_score in ranked:
+        if quota and results["uploaded"] >= quota:
+            if track_key:
+                track_db.record_deletion(track_key)  # cooldown: no re-download
+            filepath.unlink()
+            results["quota"] += 1
+            continue
         status, assigned_playlists = process_track(
             filepath, client, playlists, existing, track_db
         )
@@ -1111,6 +1253,8 @@ def _main_inner(
     logger.info("  Rejected: %s", results['rejected'])
     logger.info("  Skipped: %s", results['skipped'])
     logger.info("  Failed: %s", results['failed'])
+    if results["quota"]:
+        logger.info("  Quota curation (cooldown, non retenus): %s", results["quota"])
 
     if results['uploaded'] > 0 and playlist_counts:
         logger.info("\n=== Playlist Distribution ===")

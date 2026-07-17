@@ -217,6 +217,23 @@ class RotationConfig:
     fading_max_pct: float = 20.0
     min_plays_before_delete: int = 5  # 3 → 5 : plus exigeant avant éviction
 
+    # --- Curation nocturne (2026-07) -------------------------------------
+    # L'antenne offre ~2 700 passages/semaine : au-delà de ~42 ajouts/sem.
+    # (6/nuit), une nouveauté ne peut plus avoir ses 15-20 passages/semaine
+    # de rotation forte. classify trie la fournée de la nuit par score de
+    # goût et n'uploade que les max_uploads_per_night meilleurs ; les
+    # non-retenus partent en cooldown.
+    max_uploads_per_night: int = 6
+
+    # --- Tier GOLD : catalogue permanent (2026-07) -----------------------
+    # À l'expiration (max_age_days), un morceau prouvé (rate >= expected ×
+    # heavy_above_average_ratio) ET dans la couleur (taste >= gold_min_taste)
+    # passe GOLD au lieu d'être supprimé : rotation douce (1 daypart, comme
+    # LIGHT), immunisé contre expiration et re-tiering, plafonné à
+    # gold_max_pct % de la library.
+    gold_min_taste: float = 0.70
+    gold_max_pct: float = 40.0
+
 
 @dataclass
 class GenreFilterConfig:
@@ -515,9 +532,10 @@ class RotationCategoryConfig:
     grace_period_days: int = 14
 
     # Reference rate: what an "average" track plays per day, library-wide.
-    # Tune this based on AzuraCast playlists' total scheduled time + observed
-    # listener-driven dynamics. For AubeSonore (597 tracks, ~16 plays/h),
-    # the empirical mean is ~0.64 plays/track/day.
+    # Since 2026-07 this is a FALLBACK only: enforce_tiered_rotation
+    # measures the real rate every run (Σ play_count / Σ age_days of
+    # active tracks) and uses that for tiering; this constant is used
+    # when there isn't enough signal yet (< 30 track-days).
     expected_plays_per_day: float = 0.65
 
     # Above-average bar to qualify as HEAVY (post-grace). 1.2 = 20% above mean.
@@ -615,10 +633,11 @@ LASTFM_TAGS: tuple[str, ...] = (
 LASTFM_TAG_LIMIT: int = 15
 
 # Plafond global de tracks remontées par l'étape discover (toutes sources
-# confondues, après dédup). Réduit de 120 à 60 après analyse : on n'avait
-# jamais besoin de plus de 60 candidates (la queue tombait à 15-25 réels
-# après filtrage), donc générer 120 était du gaspillage de requêtes API.
-DISCOVER_MAX_TRACKS: int = 60
+# confondues, après dédup). 60 → 30 (2026-07) : l'upload est plafonné à
+# ROTATION.max_uploads_per_night=6 morceaux curatés par le score de goût,
+# 30 candidats suffisent largement (ratio de sélection ~2-3:1) et on
+# divise par deux l'API et la bande passante.
+DISCOVER_MAX_TRACKS: int = 30
 
 
 # =============================================================================
