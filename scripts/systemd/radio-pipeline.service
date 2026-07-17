@@ -1,5 +1,6 @@
 [Unit]
 Description=AubeSonore Radio Pipeline
+Wants=network-online.target
 After=network-online.target
 
 [Service]
@@ -9,6 +10,3 @@ Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=@PIPELINE_DIR@/run.sh
 StandardOutput=append:@PIPELINE_DIR@/cron.log
 StandardError=append:@PIPELINE_DIR@/cron.log
-
-[Install]
-WantedBy=default.target

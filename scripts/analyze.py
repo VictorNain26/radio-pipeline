@@ -212,6 +212,19 @@ def classify_mood(valence: float, arousal: float) -> tuple[str, float]:
     return mood, round(confidence, 3)
 
 
+# TF models are expensive to load (~seconds each); cache them for the whole
+# run instead of re-loading every model for every track.
+_MODEL_CACHE: dict = {}
+
+
+def _get_model(name: str, factory):
+    model = _MODEL_CACHE.get(name)
+    if model is None:
+        model = factory()
+        _MODEL_CACHE[name] = model
+    return model
+
+
 def analyze_discogs_effnet(audio_16k: "np.ndarray") -> tuple[float, str, float, float]:
     """
     Run all three discogs-effnet classification heads from a single
@@ -229,28 +242,28 @@ def analyze_discogs_effnet(audio_16k: "np.ndarray") -> tuple[float, str, float, 
     from essentia.standard import TensorflowPredict2D, TensorflowPredictEffnetDiscogs
 
     # Backbone — extract embeddings once
-    embedding_model = TensorflowPredictEffnetDiscogs(
+    embedding_model = _get_model("effnet_backbone", lambda: TensorflowPredictEffnetDiscogs(
         graphFilename=str(MODELS_DIR / "discogs-effnet-bs64-1.pb"),
         output="PartitionedCall:1",
-    )
+    ))
     embeddings = embedding_model(audio_16k)
 
     # Head 1: mood_aggressive
-    aggressive_model = TensorflowPredict2D(
+    aggressive_model = _get_model("mood_aggressive", lambda: TensorflowPredict2D(
         graphFilename=str(MODELS_DIR / "mood_aggressive-discogs-effnet-1.pb"),
         input="model/Placeholder",
         output="model/Softmax",
-    )
+    ))
     aggressive_preds = aggressive_model(embeddings)
     # class[0] = aggressive probability (Essentia convention: [aggressive, not_aggressive])
     mood_aggressive = float(np.mean(aggressive_preds[:, 0]))
 
     # Head 2: genre_discogs400
-    genre_model = TensorflowPredict2D(
+    genre_model = _get_model("genre_discogs400", lambda: TensorflowPredict2D(
         graphFilename=str(MODELS_DIR / "genre_discogs400-discogs-effnet-1.pb"),
         input="serving_default_model_Placeholder",
         output="PartitionedCall:0",
-    )
+    ))
     genre_preds = genre_model(embeddings)
     genre_avg = np.mean(genre_preds, axis=0)
     genre_idx = int(np.argmax(genre_avg))
@@ -260,11 +273,11 @@ def analyze_discogs_effnet(audio_16k: "np.ndarray") -> tuple[float, str, float, 
 
     # Head 3: voice_instrumental — catches podcast episodes / interviews
     # that sneak in via RSS discovery (e.g. "An Interview with X").
-    voice_model = TensorflowPredict2D(
+    voice_model = _get_model("voice_instrumental", lambda: TensorflowPredict2D(
         graphFilename=str(MODELS_DIR / "voice_instrumental-discogs-effnet-1.pb"),
         input="model/Placeholder",
         output="model/Softmax",
-    )
+    ))
     voice_preds = voice_model(embeddings)
     # class[0] = voice probability (Essentia convention: [voice, instrumental])
     voice_prob = float(np.mean(voice_preds[:, 0]))
@@ -293,27 +306,7 @@ def _get_genre_discogs400_labels() -> list[str]:
             _GENRE_LABELS_CACHE = data.get("classes", [f"genre_{i}" for i in range(400)])
             return _GENRE_LABELS_CACHE
 
-    # Essentia provides metadata with genre names via the model's metadata
-    # Fallback: use essentia's built-in metadata if available
-    try:
-        from essentia.standard import TensorflowPredict2D
-        model = TensorflowPredict2D(
-            graphFilename=str(MODELS_DIR / "genre_discogs400-discogs-effnet-1.pb"),
-            input="model/Placeholder",
-            output="model/PartitionedCall:0",
-        )
-        # Try to get metadata
-        metadata_str = model.paramValue("metadata") if hasattr(model, "paramValue") else ""
-        if metadata_str:
-            import json
-            metadata = json.loads(metadata_str)
-            _GENRE_LABELS_CACHE = metadata.get("classes", [])
-            if _GENRE_LABELS_CACHE:
-                return _GENRE_LABELS_CACHE
-    except Exception:
-        pass
-
-    # Final fallback: numbered labels
+    # Fallback: numbered labels
     _GENRE_LABELS_CACHE = [f"genre_{i}" for i in range(400)]
     return _GENRE_LABELS_CACHE
 
@@ -351,27 +344,24 @@ def analyze_audio(filepath: str) -> AudioFeatures | None:
         bpm, *_ = rhythm_extractor(audio_44k)
         bpm = int(round(bpm))
 
-        # Load MusiCNN embedding model
-        embedding_model = TensorflowPredictMusiCNN(
+        # MusiCNN embedding model (cached across tracks)
+        embedding_model = _get_model("musicnn_backbone", lambda: TensorflowPredictMusiCNN(
             graphFilename=str(MODELS_DIR / "msd-musicnn-1.pb"),
             output="model/dense/BiasAdd"
-        )
+        ))
         embeddings = embedding_model(audio)
 
-        # Load arousal-valence models (ensemble of 3)
+        # Arousal-valence models, ensemble of 3 (cached across tracks)
         av_models = {
-            "deam": TensorflowPredict2D(
-                graphFilename=str(MODELS_DIR / "deam-msd-musicnn-2.pb"),
+            name: _get_model(f"av_{name}", lambda f=fname: TensorflowPredict2D(
+                graphFilename=str(MODELS_DIR / f),
                 output="model/Identity"
-            ),
-            "emomusic": TensorflowPredict2D(
-                graphFilename=str(MODELS_DIR / "emomusic-msd-musicnn-2.pb"),
-                output="model/Identity"
-            ),
-            "muse": TensorflowPredict2D(
-                graphFilename=str(MODELS_DIR / "muse-msd-musicnn-2.pb"),
-                output="model/Identity"
-            ),
+            ))
+            for name, fname in (
+                ("deam", "deam-msd-musicnn-2.pb"),
+                ("emomusic", "emomusic-msd-musicnn-2.pb"),
+                ("muse", "muse-msd-musicnn-2.pb"),
+            )
         }
 
         # Get predictions from each model and average (ensemble)
@@ -567,7 +557,10 @@ def process_file(filepath: str) -> bool:
             from track_db import normalize_track_key
 
             track_key = normalize_track_key(artist, title)
-            store = EmbeddingStore(PIPELINE_DIR / "data")
+            # Reuse one store for the whole run (loading it re-reads the
+            # full matrix + index from disk).
+            store = _get_model("_embedding_store",
+                               lambda: EmbeddingStore(PIPELINE_DIR / "data"))
             if store.has(track_key):
                 logger.info("  CLAP: cached (already indexed)")
                 _ANALYZE_STATS["clap_cached"] += 1

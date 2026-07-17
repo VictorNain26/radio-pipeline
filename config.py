@@ -20,9 +20,6 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-# Constants
-AVERAGE_TRACK_DURATION_MINUTES = 3.5
-
 
 # =============================================================================
 # ENUMS - Types de base
@@ -211,13 +208,16 @@ class RotationConfig:
         fading_max_pct: Pourcentage max de la library pour les tracks FADING
         min_plays_before_delete: Plays minimum avant suppression d'un CURRENT
     """
-    max_tracks: int = 500
-    fresh_days: int = 14
-    current_days: int = 30
-    max_age_days: int = 50
+    # max_tracks 600 → 700 : laisse une marge pour la stratification HEAVY/
+    # MEDIUM/DISCOVERY. Lifetime moyen ~35-40j → davantage de plays par track
+    # avant éviction → les hits émergent au lieu d'être noyés.
+    max_tracks: int = 700
+    fresh_days: int = 14           # 10 → 14 : plus de temps pour "prouver" via plays
+    current_days: int = 35         # 30 → 35
+    max_age_days: int = 60         # 50 → 60 : alignement avec cooldown
     cooldown_days: int = 60
     fading_max_pct: float = 20.0
-    min_plays_before_delete: int = 3
+    min_plays_before_delete: int = 5  # 3 → 5 : plus exigeant avant éviction
 
 
 @dataclass
@@ -288,7 +288,8 @@ class AggressiveAudioFilter:
     enabled: bool = True
     arousal_threshold: float = 0.65  # Arousal > 0.65 = énergique
     valence_threshold: float = -0.2  # Valence < -0.2 = négatif/agressif
-    block_intense_mood: bool = True  # Bloquer mood "Intense" et "Angry" sans tags
+    # Désactivé : le filtre multi-signal gère les tracks agressives
+    block_intense_mood: bool = False
 
 
 @dataclass(frozen=True)
@@ -321,24 +322,6 @@ class MultiSignalFilterConfig:
         "heavy metal", "death metal", "black metal", "grindcore",
         "noise", "industrial", "thrash",
     })
-
-
-@dataclass
-class ClassificationThresholds:
-    """
-    Seuils pour la classification des moods (legacy - kept for backward compat).
-    """
-    aggressive_threshold: float = 0.40
-    happy_threshold: float = 0.45
-    relaxed_threshold: float = 0.45
-    sad_threshold: float = 0.45
-
-    # Seuils BPM pour déterminer l'énergie
-    bpm_very_slow: int = 80
-    bpm_slow: int = 100
-    bpm_moderate: int = 115
-    bpm_fast: int = 128
-    bpm_very_fast: int = 145
 
 
 # =============================================================================
@@ -482,26 +465,13 @@ DAYPARTS: dict[DaypartSegment, DaypartProfile] = {
 
 
 # =============================================================================
-# CONFIGURATION PAR JOUR DE LA SEMAINE
-# =============================================================================
-#
-# Overrides par type de jour. Seuls les dayparts avec des différences sont listés.
-# Les dayparts non mentionnés utilisent la config de base (DAYPARTS).
-#
-# Architecture basée sur:
-# - Nielsen Audio weekday vs weekend listening patterns
-# - Spotify diurnal cycle research
-# - Radio programming best practices (MusicMaster, Music 1)
-
-
-# =============================================================================
 # INSTANCES DE CONFIGURATION
 # =============================================================================
 
 # Règles de séparation — valeurs de RÉFÉRENCE pour la config AzuraCast AutoDJ.
 # Ces règles ne sont PAS appliquées par le pipeline Python (classify.py).
 # Elles documentent les paramètres à configurer dans AzuraCast > AutoDJ > Scheduling.
-# La fonction check_separation_rules() peut être appelée pour du monitoring/debug.
+# scripts/audit_separation.py compare ces valeurs à la config AzuraCast live.
 SEPARATION = SeparationRules(
     artist_min_minutes=60,        # 1 heure entre même artiste
     title_min_minutes=180,        # 3 heures entre même titre
@@ -521,20 +491,9 @@ AUDIO_FILTERS = AudioFilters(
     reject_low_quality=True,
 )
 
-# Rotation de la bibliothèque.
-# max_tracks 600 → 700 : laisse une marge pour la stratification HEAVY/MEDIUM/
-# DISCOVERY (sinon les 3 catégories sont trop serrées). Lifetime moyen passe
-# de ~24j à ~35-40j → davantage de plays par track avant éviction → expérience
-# auditeur plus "memorable" (les hits émergent vraiment au lieu d'être noyés).
-ROTATION = RotationConfig(
-    max_tracks=700,
-    fresh_days=14,           # 10 → 14 : laisse plus de temps à un nouveau track de "prouver" via plays
-    current_days=35,         # 30 → 35
-    max_age_days=60,         # 50 → 60 : alignement avec cooldown
-    cooldown_days=60,
-    fading_max_pct=20.0,
-    min_plays_before_delete=5,  # 3 → 5 : un peu plus exigeant avant éviction
-)
+# Rotation de la bibliothèque — valeurs et rationale dans RotationConfig
+# (les defaults de la classe sont la source de vérité).
+ROTATION = RotationConfig()
 
 
 # =============================================================================
@@ -762,45 +721,13 @@ ALLOWED_GENRES: tuple[str, ...] = (
 
 
 # Filtre de genre (multi-source : MusicBrainz + Discogs + Last.fm)
-# Voir GenreFilterConfig pour la docstring détaillée. Cette instance
-# garde sa propre liste (peut être tunée sans toucher la classe).
-GENRE_FILTER = GenreFilterConfig(
-    enabled=True,
-    blocked_genres=(
-        # Metal — toutes variantes
-        "metal", "death metal", "black metal", "heavy metal",
-        "thrash metal", "doom metal", "nu metal", "groove metal",
-        "power metal", "speed metal", "progressive metal",
-        "sludge metal", "stoner metal", "post-metal",
-        "folk metal", "symphonic metal", "viking metal", "djent",
-        # Metalcore / hardcore famille
-        "grindcore", "metalcore", "deathcore", "mathcore",
-        "melodic metalcore", "post-hardcore",
-        # Hard rock + glam
-        "hard rock", "glam metal", "hair metal",
-        # Punk extrême (post-punk reste autorisé)
-        "hardcore punk", "crust punk", "thrash punk", "d-beat",
-        # Industrial agressif
-        "industrial", "industrial metal", "industrial rock",
-        "aggrotech", "ebm", "death industrial",
-        # Hard electronic
-        "hardcore", "hardstyle", "hard techno", "industrial techno",
-        "gabber", "schranz", "speedcore", "happy hardcore",
-        # Noise extrême uniquement (laisser passer "noise" qui est
-        # surtout utilisé comme texture en shoegaze/dream pop)
-        "harsh noise", "power electronics", "japanoise", "noise music",
-    ),
-    require_tags=False,
-)
+# Voir GenreFilterConfig pour la docstring détaillée et la liste bloquée
+# (les defaults de la classe sont la source de vérité).
+GENRE_FILTER = GenreFilterConfig()
 
 # Filtre audio intelligent (fallback quand Last.fm n'a pas de tags)
 # Bloque les tracks agressives détectées par Essentia (arousal élevé + valence négative)
-AGGRESSIVE_FILTER = AggressiveAudioFilter(
-    enabled=True,
-    arousal_threshold=0.65,   # Arousal > 0.65 = très énergique
-    valence_threshold=-0.2,   # Valence < -0.2 = négatif/agressif
-    block_intense_mood=False,  # Désactivé : le filtre multi-signal gère les tracks agressives
-)
+AGGRESSIVE_FILTER = AggressiveAudioFilter()
 
 # Filtre multi-signal (nouveaux morceaux uniquement)
 # Combine 4 signaux indépendants pour rejeter les tracks agressives
@@ -900,20 +827,6 @@ LOUDNORM = LoudnormConfig()
 # new tracks add ~3-5s/track to analyze.py which is well within budget.
 CLAP = CLAPConfig(enabled=True)
 
-# Seuils de classification
-THRESHOLDS = ClassificationThresholds(
-    aggressive_threshold=0.40,
-    happy_threshold=0.45,
-    relaxed_threshold=0.45,
-    sad_threshold=0.45,
-    bpm_very_slow=80,
-    bpm_slow=100,
-    bpm_moderate=115,
-    bpm_fast=128,
-    bpm_very_fast=145,
-)
-
-
 # =============================================================================
 # FONCTIONS UTILITAIRES
 # =============================================================================
@@ -1000,33 +913,12 @@ def get_daypart_for_hour(hour: int) -> DaypartSegment | None:
     return None
 
 
-def get_effective_daypart_profile(
-    daypart: DaypartSegment,
-    day_type: DayType | None = None
-) -> DaypartProfile:
-    """
-    Récupère le profil d'un daypart.
-
-    Args:
-        daypart: Le segment de journée
-        day_type: Ignoré (gardé pour compatibilité)
-
-    Returns:
-        DaypartProfile
-    """
-    return DAYPARTS[daypart]
-
-
-def get_dayparts_for_mood(
-    mood: MoodCategory | str,
-    day_type: DayType | None = None
-) -> list[DaypartSegment]:
+def get_dayparts_for_mood(mood: MoodCategory | str) -> list[DaypartSegment]:
     """
     Trouve tous les dayparts qui acceptent un mood donné.
 
     Args:
         mood: MoodCategory ou nom du mood
-        day_type: Ignoré (gardé pour compatibilité)
 
     Returns:
         Liste des DaypartSegment compatibles
@@ -1127,158 +1019,15 @@ def should_reject_track(features: dict[str, Any]) -> tuple[bool, str | None]:
     return False, None
 
 
-def check_separation_rules(
-    new_track: dict[str, Any],
-    recent_tracks: list[dict[str, Any]],
-    minutes_since_last: float = 0
-) -> tuple[bool, str | None]:
-    """
-    Vérifie les règles de séparation pour une nouvelle track.
-
-    NOTE: Cette fonction n'est PAS appelée par le pipeline de classification.
-    Les règles de séparation sont appliquées par AzuraCast AutoDJ au moment
-    du scheduling. Cette fonction est disponible pour du monitoring ou debug.
-
-    Args:
-        new_track: Track à vérifier (artist, title, bpm, mood, energy_level)
-        recent_tracks: Liste des tracks récentes (plus récente en premier)
-        minutes_since_last: Minutes depuis la dernière track
-
-    Returns:
-        Tuple (can_play: bool, violation: str | None)
-    """
-    if not recent_tracks:
-        return True, None
-
-    new_artist = new_track.get("artist", "").lower()
-    new_title = new_track.get("title", "").lower()
-    new_bpm = new_track.get("bpm", 0)
-    new_mood = new_track.get("mood", "")
-    new_energy = new_track.get("energy_level", EnergyLevel.MEDIUM)
-
-    # 1. Vérifier séparation artiste
-    for i, track in enumerate(recent_tracks):
-        track_artist = track.get("artist", "").lower()
-        if track_artist and track_artist == new_artist:
-            # Estimer le temps écoulé (approximation: 3.5 min par track)
-            estimated_minutes = i * AVERAGE_TRACK_DURATION_MINUTES + minutes_since_last
-            if estimated_minutes < SEPARATION.artist_min_minutes:
-                return False, f"artiste trop récent ({new_artist})"
-
-    # 2. Vérifier séparation titre
-    for i, track in enumerate(recent_tracks):
-        track_title = track.get("title", "").lower()
-        if track_title and track_title == new_title:
-            estimated_minutes = i * AVERAGE_TRACK_DURATION_MINUTES + minutes_since_last
-            if estimated_minutes < SEPARATION.title_min_minutes:
-                return False, f"titre trop récent"
-
-    # 3. Vérifier variance de tempo (seulement vs la track précédente)
-    if SEPARATION.tempo_max_variance and new_bpm > 0:
-        last_bpm = recent_tracks[0].get("bpm", 0)
-        if last_bpm > 0:
-            variance = abs(new_bpm - last_bpm)
-            if variance > SEPARATION.tempo_max_variance:
-                return False, f"saut de tempo trop grand ({last_bpm} → {new_bpm})"
-
-    # 4. Vérifier transition d'énergie douce
-    if SEPARATION.energy_smooth_transition:
-        last_energy = recent_tracks[0].get("energy_level", EnergyLevel.MEDIUM)
-        if isinstance(last_energy, str):
-            try:
-                last_energy = EnergyLevel(last_energy)
-            except ValueError:
-                last_energy = EnergyLevel.MEDIUM
-        if isinstance(new_energy, str):
-            try:
-                new_energy = EnergyLevel(new_energy)
-            except ValueError:
-                new_energy = EnergyLevel.MEDIUM
-
-        if not is_smooth_energy_transition(last_energy, new_energy):
-            return False, f"transition d'énergie trop brutale ({last_energy.value} → {new_energy.value})"
-
-    # 5. Vérifier séparation de mood
-    if SEPARATION.mood_min_separation and new_mood:
-        same_mood_count = 0
-        for i, track in enumerate(recent_tracks[:SEPARATION.mood_min_separation]):
-            if track.get("mood") == new_mood:
-                same_mood_count += 1
-        if same_mood_count >= SEPARATION.mood_min_separation:
-            return False, f"mood '{new_mood}' trop fréquent"
-
-    return True, None
-
-
-def get_playlist_name(daypart: DaypartSegment, day_type: DayType | None = None) -> str:
-    """
-    Génère le nom de playlist pour un daypart.
-
-    Args:
-        daypart: Le segment de journée
-        day_type: Ignoré (gardé pour compatibilité)
-
-    Returns:
-        Nom de la playlist (ex: "Evening")
-    """
-    return daypart.value
-
-
 def get_all_playlist_names() -> list[str]:
     """Génère les noms des zones playlists actuellement actives."""
     return [daypart.value for daypart in get_enabled_dayparts()]
-
-
-def print_day_schedule(day_type: DayType) -> None:
-    """
-    Affiche le planning pour un type de jour.
-
-    Args:
-        day_type: Type de jour à afficher
-    """
-    day_names = {
-        DayType.WEEKDAY: "LUNDI-JEUDI",
-        DayType.FRIDAY: "VENDREDI",
-        DayType.SATURDAY: "SAMEDI",
-        DayType.SUNDAY: "DIMANCHE",
-    }
-
-    print(f"\n{'='*60}")
-    print(f"  {day_names[day_type]}")
-    print(f"{'='*60}")
-
-    for segment in DaypartSegment:
-        profile = get_effective_daypart_profile(segment, day_type)
-        if not profile.enabled:
-            continue
-
-        # Format horaire
-        start = f"{profile.start_hour:02d}:00"
-        end = f"{profile.end_hour:02d}:00"
-        time_str = f"{start}-{end}"
-
-        # Moods
-        moods = ", ".join(m.value for m in profile.target_moods[:3])
-        if len(profile.target_moods) > 3:
-            moods += "..."
-
-        # Énergie
-        energy = profile.energy_curve.value.upper()
-
-        print(f"  {time_str:12} │ {segment.value:17} │ {energy:10} │ {moods}")
-
-    print(f"{'='*60}")
 
 
 def format_duration(seconds: int) -> str:
     """Formate une durée en MM:SS."""
     mins, secs = divmod(seconds, 60)
     return f"{mins}:{secs:02d}"
-
-
-def format_bpm_range(bpm_range: tuple[int, int]) -> str:
-    """Formate une plage de BPM."""
-    return f"{bpm_range[0]}-{bpm_range[1]}"
 
 
 # =============================================================================
