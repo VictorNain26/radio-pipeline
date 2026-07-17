@@ -1,12 +1,13 @@
 # Maintenance — AubeSonore Radio Pipeline
 
 Procédures d'entretien et scripts d'audit. Le pipeline tourne sans
-intervention sur cycle journalier (cron 03:00), mais certains audits
-hebdo/mensuels gardent la bibliothèque saine.
+intervention sur cycle journalier (timer systemd 03:00), mais certains
+audits hebdo/mensuels gardent la bibliothèque saine.
 
-> **AzuraCast server** — `116.203.46.203` (utilisé par `audit_server.py`
-> et `reanalyze_server.py` qui requièrent un accès SSH direct ou
-> `docker exec`).
+> **AzuraCast server** — `116.203.46.203`. Seuls `audit_server.py` et
+> `backfill_embeddings.py` requièrent un accès SSH / `docker exec` ;
+> les autres scripts (dont `reanalyze_server.py` et `backfill_covers.py`)
+> passent par l'API AzuraCast.
 
 ---
 
@@ -17,12 +18,12 @@ hebdo/mensuels gardent la bibliothèque saine.
 | `scripts/audit_separation.py` | Compare `config.SEPARATION` à la config AzuraCast live | Mensuel ou après modif `config.py` | Pipeline (read-only API) |
 | `scripts/audit_integrity.py` | Télécharge depuis AzuraCast et vérifie chaque fichier audio (ffprobe + tailles) | Hebdo si suspicion, sinon mensuel | Pipeline (lent : download) |
 | `scripts/audit_server.py` | Idem mais directement sur les fichiers du serveur AzuraCast | Mensuel | Serveur AzuraCast (SSH) |
-| `scripts/redownload_corrupted.py` | Re-télécharge la liste produite par `audit_server.py --fix` | Après audit_server | Pipeline |
-| `scripts/reanalyze_server.py` | Ré-analyse les tracks où `mood IS NULL` dans `tracks.db` | Au besoin | Pipeline |
-| `scripts/redownload_corrupted.py` | Re-DL des fichiers corrompus identifiés | Après audit | Pipeline |
-| `scripts/update-ytdlp.sh` | Met à jour `yt-dlp` (release ~toutes les 2 semaines) | Hebdo (cron séparé) | Pipeline |
-| `scripts/migrate_to_4_zones.py` | **One-shot historique** — migration 8 dayparts → 4 zones (mai 2026). Documenté pour audit, non re-exécutable | one-shot | Pipeline |
-| `scripts/source_coverage_test.py` | Diagnostic outil pour mesurer la couverture des sources de download (SoundCloud vs YouTube) | Au besoin | Pipeline |
+| `scripts/redownload_corrupted.py` | Re-télécharge la liste `tracks-to-redownload.json` produite par `audit_server.py --fix` | Après audit_server | Pipeline |
+| `scripts/reanalyze_server.py` | Ré-analyse les tracks où `mood IS NULL` dans `tracks.db` (download via API AzuraCast) | Au besoin | Pipeline (API) |
+| `scripts/setup_playlists.py` | Crée / vérifie les 4 playlists zones dans AzuraCast | Setup initial ou après modif zones | Pipeline (API) |
+| `scripts/backfill_covers.py` | **One-shot** — ajoute une cover iTunes Search aux fichiers de la library qui n'en ont pas (via API) | one-shot / au besoin | Pipeline (API) |
+| `scripts/backfill_embeddings.py` | **One-shot** — calcule les embeddings CLAP de la library existante (fichiers récupérés via SSH + `docker exec`) | one-shot / au besoin | Pipeline (SSH) |
+| `scripts/update-ytdlp.sh` | Met à jour `yt-dlp` (release ~toutes les 2 semaines) | Hebdo (timer séparé) | Pipeline |
 
 Les scripts d'audit/maintenance toujours utiles :
 - `audit_integrity` / `audit_server` détectent les fichiers corrompus
@@ -63,21 +64,33 @@ scope actuel. Les valeurs dans `config.SEPARATION` sont donc
 
 ### 2. Intégrité des fichiers serveur (mensuel)
 
-À exécuter **sur le serveur AzuraCast** (plus rapide, pas de download) :
+À exécuter **sur le serveur AzuraCast** (plus rapide, pas de download).
+Les fichiers média vivent dans le conteneur Docker `azuracast`, sous
+`/var/azuracast/stations/aubesonore/media` :
 
 ```bash
-# Depuis la machine pipeline, déployer puis exécuter
-scp scripts/audit_server.py victormoi@116.203.46.203:/tmp/
-ssh victormoi@116.203.46.203 \
-    "python3 /tmp/audit_server.py /var/azuracast/stations/radio/media --fix --output /tmp/audit_report.json"
-scp victormoi@116.203.46.203:/tmp/audit_report.json data/
+# Depuis la machine pipeline : déployer le script dans le conteneur puis exécuter
+scp scripts/audit_server.py root@116.203.46.203:/tmp/
+ssh root@116.203.46.203 "docker cp /tmp/audit_server.py azuracast:/tmp/ && \
+    docker exec azuracast python3 /tmp/audit_server.py \
+        /var/azuracast/stations/aubesonore/media \
+        --fix --output /tmp/audit_report.json \
+        --redownload-file /tmp/tracks-to-redownload.json"
+
+# Récupérer la liste de re-download écrite par --fix
+ssh root@116.203.46.203 \
+    "docker cp azuracast:/tmp/tracks-to-redownload.json /tmp/"
+scp root@116.203.46.203:/tmp/tracks-to-redownload.json .
 ```
 
-Si `--fix` est passé, les fichiers corrompus sont supprimés et la liste
-écrite dans un JSON. Récupérer ce JSON, puis sur la machine pipeline :
+Avec `--fix`, les fichiers corrompus sont supprimés et la liste des
+tracks à re-télécharger est écrite dans le fichier passé à
+`--redownload-file` (défaut : `tracks-to-redownload.json` — c'est **ce
+fichier**, pas `audit_report.json`, qu'attend le script de redownload).
+Puis, sur la machine pipeline :
 
 ```bash
-python3 scripts/redownload_corrupted.py data/audit_report.json
+python3 scripts/redownload_corrupted.py tracks-to-redownload.json
 ./run.sh   # le pipeline re-DL via le flux normal
 ```
 
@@ -89,18 +102,24 @@ Si `data/tracks.db` contient des tracks où `mood IS NULL` (échec de
 ```bash
 python3 scripts/reanalyze_server.py --dry-run    # voir ce qui serait fait
 python3 scripts/reanalyze_server.py              # appliquer
+python3 scripts/reanalyze_server.py --limit 5    # tester sur 5 tracks
 ```
 
-Aucune ré-upload, juste re-classification + réassignation playlist.
+Tourne entièrement depuis la machine pipeline via l'**API AzuraCast**
+(download des fichiers avec `http_client.download_file_to`) — aucun
+accès SSH / `docker exec` requis. Aucun ré-upload, juste
+re-classification + réassignation playlist.
 
-### 4. CLAP smart sequencing (optionnel — opt-in)
+### 4. CLAP smart sequencing (activé en production)
 
 CLAP (Contrastive Language-Audio Pretraining) calcule un embedding
 512-dim par track. FAISS sert ensuite à retrouver des "nearest
-neighbours" (smart_queue.py) et à construire des walks dans l'espace
-sonore pour des transitions douces.
+neighbours" (smart_queue.py), à construire des walks dans l'espace
+sonore pour des transitions douces, et à faire de la recherche en
+langage naturel (`smart_queue.py text "..."` via le text encoder CLAP).
 
-**Activation (étape par étape)** :
+`CLAP.enabled=True` dans `config.py` et le backfill de la library a
+déjà été fait. Procédure de référence pour une (ré)installation :
 
 ```bash
 # 1. Installer les dépendances lourdes (~1 Go disque, modèle 1.7 Go)
@@ -160,9 +179,11 @@ tail -20 ytdlp-update.log
 
 ## Tests
 
-Suite pytest dans `tests/`. ~50 tests couvrent les fonctions pures
+Suite pytest dans `tests/`. 120+ tests couvrent les fonctions pures
 critiques : parsers RSS, filtre genre (avec mocks des 3 backends),
-sectoring Russell circumplex, validation de la config.
+scoring multi-source, sectoring Russell circumplex, rotation tiers,
+embeddings CLAP / smart queue, client HTTP (`test_http_client.py`),
+TrackDB (`test_track_db.py`), validation de la config.
 
 ```bash
 python3 -m pytest tests/ -q
@@ -218,7 +239,7 @@ Templates dans `scripts/systemd/`, installation idempotente :
 `data/genre_cache.json` stocke les tags genre (MusicBrainz + Discogs +
 Last.fm) avec TTL 30 j. Il grossit progressivement (~1 ko / track).
 Pas de purge nécessaire — au-delà de 30 j les entrées sont ignorées,
-et la rotation `max_tracks=600` borne la taille du cache utile.
+et la rotation `max_tracks=700` borne la taille du cache utile.
 
 Pour forcer un refresh complet (ex. après modification des règles) :
 ```bash

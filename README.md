@@ -4,7 +4,7 @@ Pipeline de découverte musicale automatique pour la webradio
 [AubeSonore](https://radio.aubesonore.fr).
 
 ```
-Discovery (multi-source) ──► yt-dlp (YouTube) ──► Essentia-TensorFlow ──► AzuraCast
+Discovery (multi-source) ──► yt-dlp (SoundCloud + YouTube) ──► Essentia-TensorFlow ──► AzuraCast
        │                                            │
        │                                            │
        └─ MusicBrainz + Discogs + Last.fm (genre filter, multi-source)
@@ -16,7 +16,7 @@ Discovery (multi-source) ──► yt-dlp (YouTube) ──► Essentia-TensorFlo
 
 Le pipeline agrège plusieurs sources de découverte, déduplique sur
 `(artist, title)` normalisé, et plafonne à `DISCOVER_MAX_TRACKS`
-(120 par défaut). Chaque source est best-effort : si l'une tombe, les
+(60 par défaut). Chaque source est best-effort : si l'une tombe, les
 autres continuent.
 
 | Source                | Type     | Notes                                                              |
@@ -88,7 +88,9 @@ Autres garde-fous :
   recommandée par yt-dlp en 2026 quand YouTube ship un player change
 - Validation post-download via `ffprobe` + retry automatique si fichier
   corrompu
-- Cover art HypeMachine embed + ID3 tags
+- Cover art HypeMachine embed + ID3 tags, avec fallback **iTunes Search
+  API** (`download.py::fetch_itunes_cover`) quand la source ne fournit
+  pas de cover (backfill de la library existante : `scripts/backfill_covers.py`)
 
 ### 3.5 Quality gates v4 (avant analyse)
 
@@ -100,7 +102,7 @@ Essentia et garder la library propre :
   re-uploads d'un même enregistrement sous métadonnées différentes
   (remasters, "feat." rewrites). Pas d'appel réseau.
 - **Speech filter** (Essentia `voice_instrumental` head) — rejette les
-  tracks > 60 % voice probability (interviews / podcasts qui sneak via
+  tracks > 70 % voice probability (interviews / podcasts qui sneak via
   les feeds RSS).
 - **EBU R128 loudnorm** (ffmpeg, -16 LUFS / -1.5 dBTP) — normalisation
   broadcast pour cohérence sonore.
@@ -152,28 +154,30 @@ créneau horaire :
 
 Dayparts (configurables dans `config.py`) :
 
-| Daypart          | Horaire     | Moods cibles                                  |
-|------------------|-------------|-----------------------------------------------|
 | Zone   | Horaire     | Identité sonore                                                       | Moods cibles                                  |
 |--------|-------------|-----------------------------------------------------------------------|-----------------------------------------------|
 | Dawn   | 05:00–09:00 | Réveil — ambient, modern classical, slowcore                          | Calm, Relaxed                                 |
 | Day    | 09:00–17:00 | Activité — indie/electro mid-tempo, hip-hop chill                     | Energetic, Excited, Relaxed, Melancholic      |
 | Dusk   | 17:00–22:00 | Transition — dream pop, trip hop, downtempo                           | Relaxed, Melancholic, Sad, Angry              |
-| Night            | 22:00–05:00 | Calm, Sad, Melancholic, Intense, Angry        |
+| Night  | 22:00–05:00 | Nuit — introspection, intense ou profond                              | Calm, Sad, Melancholic, Intense, Angry        |
 
-### 6.5 Smart sequencing — CLAP + FAISS (opt-in)
+### 6.5 Smart sequencing — CLAP + FAISS
 
-Quand `config.CLAP.enabled=True`, `analyze.py` calcule en plus un
+Activé en production (`config.CLAP.enabled=True`, library backfillée
+via `scripts/backfill_embeddings.py`). `analyze.py` calcule en plus un
 embedding 512-dim L2-normalisé via le modèle LAION-CLAP HTSAT. Les
 embeddings vivent dans `data/embeddings.npy` + `data/embeddings_index.json`.
 
 `scripts/smart_queue.py` construit un index FAISS en mémoire (cosine
 similarité = inner product sur vecteurs normalisés) et permet :
 
-- **Nearest neighbour** : top-k tracks les plus similaires à une seed
-- **Greedy walk** : séquence de longueur N partant d'une seed, chaque
+- **Nearest neighbour** (`similar`) : top-k tracks les plus similaires à une seed
+- **Greedy walk** (`walk`) : séquence de longueur N partant d'une seed, chaque
   pas sélectionne le voisin le plus proche pas encore utilisé,
   optionnellement restreint à un set de candidats (utile par daypart)
+- **Recherche en langage naturel** (`text`) : requête texte libre
+  (ex. "dreamy slow ambient piano") encodée par le text encoder CLAP,
+  matchée contre les embeddings audio
 
 C'est ce qui rendra émergentes les règles `tempo_max_variance`,
 `mood_min_separation` et `genre_min_separation` documentées dans
@@ -184,9 +188,6 @@ des BPM, moods et timbres proches.
 Voir `MAINTENANCE.md` section "CLAP smart sequencing" pour
 l'activation (installation des deps, backfill de la library, etc.).
 Activation impacte `+3-5 s/track` de temps CPU dans `analyze.py`.
-
-Migration historique des 8 anciens dayparts → 4 zones : voir
-`scripts/migrate_to_4_zones.py` (one-shot exécuté 2026-05-14).
 
 ### 7. Rotation A/B/C — système BBC 6 Music adapté
 
@@ -204,15 +205,15 @@ Chaque track porte un **rotation tier** dans `data/tracks.db` :
 Le re-tier pass tourne dans `enforce_tiered_rotation` à chaque cron : promotions et démotions appliquées via `assign_playlists` (REPLACE) — pas
 de zombie dans les playlists.
 
-### 8. Rotation 3-tiers âge + cooldown
+### 8. Rotation 4-tiers âge + cooldown
 
 `classify.enforce_tiered_rotation` sépare les tracks en 4 tiers basés
 sur l'âge :
 
-- **FRESH** (`<= fresh_days`, 10 j) — protection totale
-- **CURRENT** (`<= current_days`, 30 j) — supprimable si library pleine
+- **FRESH** (`<= fresh_days`, 14 j) — protection totale
+- **CURRENT** (`<= current_days`, 35 j) — supprimable si library pleine
   ET `play_count >= min_plays_before_delete`
-- **FADING** (`<= max_age_days`, 50 j) — plafonné à 20 % de la library,
+- **FADING** (`<= max_age_days`, 60 j) — plafonné à 20 % de la library,
   least-played évacuées en premier
 - **EXPIRED** (`> max_age_days`) — force delete
 
@@ -240,8 +241,14 @@ Voir `.env.example` pour la liste complète. Clés notables :
 - `AZURACAST_URL`, `AZURACAST_API_KEY`, `AZURACAST_STATION_ID` — requis
 - `LASTFM_API_KEY` — fortement recommandé (alimente discovery + filtre genre)
 - `DISCOGS_TOKEN` — optionnel, augmente le rate limit Discogs à 60 req/min
-- `NTFY_TOPIC` — notifications push sur succès/échec
+- `HTTP_TIMEOUT`, `MAX_RETRIES` — réglages HTTP (défauts : 30 s / 3)
+- `NTFY_TOPIC` — notifications push sur succès/échec (lu par `run.sh`)
 - `DEBUG`, `SSL_VERIFY` — flags de debug/sécurité
+
+Règle HTTPS (`scripts/settings.py::is_loopback_host`) : le HTTP en clair
+n'est accepté automatiquement que vers les hôtes loopback
+(`localhost`, `127.x.x.x`, `::1`) ; partout ailleurs HTTPS est requis,
+sauf `DEBUG=true`.
 
 ## Ajouter une source RSS sans toucher au code
 
@@ -281,19 +288,24 @@ radio-pipeline/
 ├── scripts/
 │   ├── discover.py          # Orchestrateur multi-source
 │   ├── discovery_sources.py # HypeMachine + RSS + Last.fm tags
-│   ├── migrate_to_4_zones.py # One-shot migration 8 dayparts → 4 zones (mai 2026)
-│   ├── download.py          # yt-dlp + ffprobe + ID3 + checksum
+│   ├── download.py          # yt-dlp multi-source + ffprobe + ID3 + cover iTunes + checksum
 │   ├── analyze.py           # Essentia-TF (arousal-valence + genre)
-│   ├── classify.py          # Filtre multi-signal + rotation 3-tiers
-│   ├── lastfm_client.py     # Backend Last.fm
+│   ├── classify.py          # Filtre multi-signal + rotation tiers
+│   ├── lastfm_client.py     # Backend tags Last.fm (filtre genre)
 │   ├── genre_client.py      # Agrégateur 3 sources + cache disque
 │   ├── http_client.py       # Retry + circuit breaker + SHA-256
 │   ├── settings.py          # Pydantic v2 settings
 │   ├── track_db.py          # SQLite TrackDB
+│   ├── audio_fingerprint.py # AcoustID/Chromaprint dedup
+│   ├── audio_embeddings.py  # Embeddings CLAP (audio + texte)
+│   ├── smart_queue.py       # FAISS : similar / walk / text
 │   ├── audit_integrity.py   # Vérif local files (SHA + ffprobe)
 │   ├── audit_server.py      # Vérif library AzuraCast
-│   ├── reanalyze*.py        # Réanalyse forcée (maintenance)
+│   ├── audit_separation.py  # Cohérence config.SEPARATION ↔ AzuraCast
+│   ├── reanalyze_server.py  # Réanalyse des tracks sans mood (via API)
 │   ├── redownload_corrupted.py
+│   ├── backfill_covers.py   # One-shot : covers iTunes sur la library
+│   ├── backfill_embeddings.py # One-shot : embeddings CLAP sur la library
 │   ├── setup_playlists.py   # Crée les 4 zones AzuraCast
 │   ├── logrotate.conf       # Config logrotate
 │   └── install_logrotate.sh # Installeur (sudo)
@@ -310,14 +322,16 @@ Voir [`MAINTENANCE.md`](MAINTENANCE.md) — couvre :
 - Cache `genre_cache.json`
 - Inventaire et fréquence recommandée de chaque script
 
-Tests pytest dans `tests/` (~50 tests, ~1.5 s) :
+Tests pytest dans `tests/` (120+ tests, ~4 s) :
 
 ```bash
 python3 -m pytest tests/ -q
 ```
 
-Cibles : parsers RSS, filtre genre multi-source, classification Russell
-circumplex, cohérence de la configuration.
+Cibles : parsers RSS, filtre genre multi-source, scoring multi-source,
+classification Russell circumplex, rotation tiers, embeddings CLAP /
+smart queue, client HTTP (`test_http_client.py`), TrackDB
+(`test_track_db.py`), cohérence de la configuration.
 
 ## Logs et observabilité
 
