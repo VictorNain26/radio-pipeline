@@ -21,6 +21,7 @@ import.log
 
 # Logs (rotated by logrotate, not for git)
 *.log
+*.log.*
 
 # Heavy ML models (downloaded by scripts/download_models.sh)
 models/

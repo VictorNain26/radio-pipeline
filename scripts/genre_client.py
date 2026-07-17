@@ -332,7 +332,7 @@ def create_genre_client(
 ) -> GenreClient:
     """Factory wiring the 3 backends + disk cache."""
     lastfm = (
-        LastFMClient(api_key=lastfm_api_key, blocked_genres=set())
+        LastFMClient(api_key=lastfm_api_key)
         if lastfm_api_key else None
     )
     mb = MusicBrainzClient() if enable_musicbrainz else None

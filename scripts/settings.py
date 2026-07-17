@@ -56,21 +56,7 @@ class Settings(BaseSettings):
         description="AzuraCast station ID",
     )
 
-    # Spotify API configuration (for reliable audio features)
-    spotify_client_id: str | None = Field(
-        default=None,
-        description="Spotify API Client ID",
-    )
-    spotify_client_secret: str | None = Field(
-        default=None,
-        description="Spotify API Client Secret",
-    )
-
     # Optional API keys for metadata enrichment
-    acoustid_api_key: str | None = Field(
-        default=None,
-        description="AcoustID API key for audio fingerprinting",
-    )
     lastfm_api_key: str | None = Field(
         default=None,
         description="Last.fm API key for genre lookup",
@@ -81,17 +67,6 @@ class Settings(BaseSettings):
     )
 
     # Pipeline settings
-    max_tracks_per_run: int = Field(
-        default=30,
-        ge=1,
-        le=100,
-        description="Maximum tracks to discover per run",
-    )
-    download_timeout: int = Field(
-        default=300,
-        ge=30,
-        description="Download timeout in seconds",
-    )
     http_timeout: int = Field(
         default=30,
         ge=5,
@@ -219,8 +194,6 @@ def print_config_status() -> None:
         key = settings.azuracast_api_key
         masked = f"{'*' * 8}...{key[-4:]}" if len(key) >= 4 else "***"
         print(f"  API Key: {masked}")
-        print(f"  Spotify: {'configured' if settings.spotify_client_id and settings.spotify_client_secret else 'not set'}")
-        print(f"  AcoustID: {'configured' if settings.acoustid_api_key else 'not set'}")
         print(f"  Last.fm: {'configured' if settings.lastfm_api_key else 'not set'}")
         print(f"  Discogs: {'configured' if settings.discogs_token else 'not set (using anonymous rate limit)'}")
         print(f"  SSL Verify: {settings.ssl_verify}")

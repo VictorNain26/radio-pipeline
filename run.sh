@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # AubeSonore Radio Pipeline
-# HypeMachine → yt-dlp → Essentia/MTG → AzuraCast
+# Multi-source discovery → yt-dlp → Essentia/MTG → AzuraCast
 #
 # Features:
 # - Lock file to prevent concurrent execution
@@ -182,8 +182,6 @@ check_dependencies() {
 }
 
 check_azuracast() {
-    local url="${AZURACAST_URL%/}"
-
     log_info "Checking AzuraCast connectivity..."
 
     # Use Python for reliable HTTPS health check
@@ -225,29 +223,29 @@ main() {
     echo ""
     echo "╔═══════════════════════════════════════════════════════════════╗"
     echo "║           AUBESONORE RADIO PIPELINE                           ║"
-    echo "║       HypeMachine → yt-dlp → Essentia/MTG → AzuraCast           ║"
+    echo "║    Multi-source → yt-dlp → Essentia/MTG → AzuraCast           ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
     echo ""
 
     log_info "Pipeline started"
+
+    # Load .env FIRST so ntfy notifications work for every failure below
+    # (NTFY_TOPIC used to be unset until this point, making early failures
+    # silently unnotified).
+    if [ ! -f ".env" ]; then
+        log_error ".env file not found"
+        exit 1
+    fi
+    set -a
+    # shellcheck source=/dev/null
+    source .env
+    set +a
 
     # Acquire exclusive lock
     acquire_lock
 
     # Check dependencies
     check_dependencies
-
-    # Check environment file
-    if [ ! -f ".env" ]; then
-        log_error ".env file not found"
-        exit 1
-    fi
-
-    # Export environment variables
-    set -a
-    # shellcheck source=/dev/null
-    source .env
-    set +a
 
     # Verify required keys
     : "${AZURACAST_API_KEY:?Error: AZURACAST_API_KEY not set}"
@@ -287,20 +285,32 @@ main() {
         if ! python3 scripts/download.py; then
             log_warn "Download step failed, continuing for rotation..."
         fi
+    fi
 
-        DOWNLOAD_COUNT=$(find downloads -name "*.mp3" 2>/dev/null | wc -l)
-        log_info "Downloaded $DOWNLOAD_COUNT files"
+    # New downloads this run — from stats JSON (single source of truth),
+    # not a directory listing that also counts retries kept by classify.
+    DOWNLOAD_COUNT=$(python3 -c "
+import json
+try:
+    print(json.load(open('data/last_download_stats.json')).get('downloaded', 0))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
 
-        # Step 3: Analyze (Essentia + optional CLAP)
-        if [ "$DOWNLOAD_COUNT" -gt 0 ]; then
-            echo ""
-            echo "┌─────────────────────────────────────────────────────────────────┐"
-            echo "│ STEP 3/4: ANALYZE (Essentia/MTG + CLAP)                        │"
-            echo "└─────────────────────────────────────────────────────────────────┘"
+    # Files awaiting analysis/upload — includes retries from failed runs,
+    # so this runs even when today's discovery produced nothing new.
+    FILES_TO_PROCESS=$(find downloads -name "*.mp3" 2>/dev/null | wc -l)
+    log_info "Downloaded $DOWNLOAD_COUNT new files ($FILES_TO_PROCESS to process)"
 
-            if ! python3 scripts/analyze.py; then
-                log_warn "Analyze step had issues, continuing..."
-            fi
+    # Step 3: Analyze (Essentia + optional CLAP)
+    if [ "$FILES_TO_PROCESS" -gt 0 ]; then
+        echo ""
+        echo "┌─────────────────────────────────────────────────────────────────┐"
+        echo "│ STEP 3/4: ANALYZE (Essentia/MTG + CLAP)                        │"
+        echo "└─────────────────────────────────────────────────────────────────┘"
+
+        if ! python3 scripts/analyze.py; then
+            log_warn "Analyze step had issues, continuing..."
         fi
     fi
 
@@ -320,15 +330,8 @@ main() {
     echo "║                    PIPELINE COMPLETE                          ║"
     echo "╚═══════════════════════════════════════════════════════════════╝"
 
-    # Upload count from last_download_stats.json (single source of truth).
-    UPLOAD_COUNT=$(python3 -c "
-import json,sys
-try:
-    d = json.load(open('data/last_download_stats.json'))
-    print(d.get('downloaded', 0))
-except Exception:
-    print(0)
-" 2>/dev/null || echo 0)
+    # Upload count as written by classify.py (single source of truth).
+    UPLOAD_COUNT=$(cat data/last_upload_count.txt 2>/dev/null || echo 0)
 
     write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
 
