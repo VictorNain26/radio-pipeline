@@ -52,11 +52,9 @@ def _build(tmp_path: Path, *,
            dc: dict[tuple[str, str], list[str]] | None = None,
            lf_track: dict[tuple[str, str], list[str]] | None = None,
            lf_artist: dict[str, list[str]] | None = None,
-           blocked: set[str] | None = None,
-           allowed: set[str] | None = None) -> GenreClient:
+           blocked: set[str] | None = None) -> GenreClient:
     return GenreClient(
         blocked_genres=blocked or {"metal", "death metal", "grindcore"},
-        allowed_genres=allowed or {"indie", "indie pop", "electronic", "hip hop", "ambient"},
         lastfm=_FakeLastFM(lf_track, lf_artist),
         musicbrainz=_FakeMB(mb or {}),
         discogs=_FakeDC(dc or {}),
@@ -71,20 +69,16 @@ def test_blocklist_hard_rejects_when_any_source_matches(tmp_path):
     assert "death metal" in (r.blocked_reason or "")
 
 
-def test_allowlist_soft_accepts_on_any_source(tmp_path):
-    # Only Discogs has tags; one of them is in allowlist
-    gc = _build(tmp_path, dc={("Beach House", "Space Song"): ["rock", "dream pop"]},
-                allowed={"dream pop"})
+def test_unblocked_tags_accepted(tmp_path):
+    gc = _build(tmp_path, dc={("Beach House", "Space Song"): ["rock", "dream pop"]})
     r = gc.check_genre("Beach House", "Space Song")
     assert r.is_blocked is False
-    assert r.has_allowlist_match is True
 
 
-def test_no_tags_returns_neither_blocked_nor_allowlist_match(tmp_path):
+def test_no_tags_is_not_blocked(tmp_path):
     gc = _build(tmp_path)
     r = gc.check_genre("Unknown", "Obscure Track")
     assert r.is_blocked is False
-    assert r.has_allowlist_match is False
     assert r.tags == []
 
 
@@ -97,7 +91,6 @@ def test_lastfm_artist_fallback_used_when_track_has_no_tags(tmp_path):
     r = gc.check_genre("Artist X", "Whatever")
     # Tags came from the artist-level fallback
     assert "ambient" in r.tags or "dream pop" in r.tags
-    assert r.has_allowlist_match is True
 
 
 def test_union_of_tags_no_duplicates(tmp_path):
@@ -118,7 +111,6 @@ def test_disk_cache_persists_across_runs(tmp_path):
     # First run populates the cache and flushes
     gc1 = GenreClient(
         blocked_genres=set(),
-        allowed_genres={"indie"},
         lastfm=_FakeLastFM(),
         musicbrainz=_FakeMB({("A", "B"): ["indie"]}),
         discogs=_FakeDC({}),
@@ -131,7 +123,6 @@ def test_disk_cache_persists_across_runs(tmp_path):
     # Second run with NO backends — must still hit cache
     gc2 = GenreClient(
         blocked_genres=set(),
-        allowed_genres={"indie"},
         lastfm=None,
         musicbrainz=_FakeMB({}),  # empty: would return []
         discogs=_FakeDC({}),

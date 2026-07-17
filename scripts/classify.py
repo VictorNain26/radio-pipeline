@@ -36,7 +36,6 @@ try:
         ROTATION,
         ROTATION_CATEGORIES,
         AUDIO_FILTERS,
-        AGGRESSIVE_FILTER,
         MULTI_SIGNAL_FILTER,
         TASTE_FILTER,
         get_dayparts_for_mood,
@@ -625,31 +624,15 @@ def process_track(
         filepath.unlink()
         return "rejected", []
 
-    # Multi-signal filter (new tracks with discogs-effnet analysis)
-    # For tracks with mood_aggressive tag (new pipeline), use multi-signal consensus.
-    # For legacy tracks without it, fallback to the old AV-based aggressive filter.
+    # Multi-signal filter: consensus of ML signals (mood_aggressive,
+    # V/A, genre ML, Last.fm tags) against aggressive tracks. Tracks
+    # without any of these signals fall through to the taste filter.
     has_multisignal = features.get("mood_aggressive", 0) > 0 or features.get("genre_top", "")
-    has_lastfm_tags = features.get("has_lastfm_tags", False)
 
     if has_multisignal:
         reject_ms, reason_ms = should_reject_multisignal(features)
         if reject_ms:
             logger.info("  Rejected (multi-signal): %s", reason_ms)
-            filepath.unlink()
-            return "rejected", []
-    elif AGGRESSIVE_FILTER.enabled and not has_lastfm_tags:
-        # Legacy fallback for tracks without discogs-effnet tags
-        is_aggressive = (
-            arousal > AGGRESSIVE_FILTER.arousal_threshold and
-            valence < AGGRESSIVE_FILTER.valence_threshold
-        )
-        is_blocked_mood = (
-            AGGRESSIVE_FILTER.block_intense_mood and
-            mood in ("Intense", "Angry")
-        )
-        if is_aggressive or is_blocked_mood:
-            reason = "Audio agressif détecté (V:%+.2f/A:%+.2f, mood:%s)" % (valence, arousal, mood)
-            logger.info("  Rejected: %s", reason)
             filepath.unlink()
             return "rejected", []
 
@@ -1037,9 +1020,6 @@ def _main_inner(
         if AUDIO_FILTERS.duration_max:
             filter_parts.append(f"max {format_duration(AUDIO_FILTERS.duration_max)}")
         logger.info("Duration filter: %s", ", ".join(filter_parts))
-
-    if AUDIO_FILTERS.min_confidence:
-        logger.info("Min confidence: %.0f%%", AUDIO_FILTERS.min_confidence * 100)
 
     # Initialize robust client with retry logic
     client = ClassifyClient(

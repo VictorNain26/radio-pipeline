@@ -47,7 +47,6 @@ class GenreResult:
     is_blocked: bool
     blocked_reason: str | None = None
     sources_hit: list[str] = field(default_factory=list)
-    has_allowlist_match: bool = False
 
 
 # -----------------------------------------------------------------------------
@@ -237,11 +236,10 @@ class GenreClient:
 
     Policy:
       1. blocklist hit on UNION(tags) → reject
-      2. allowlist hit on UNION(tags) → accept (passes filter)
-      3. no tags at all → accept (downstream Essentia AGGRESSIVE_FILTER takes over)
+      2. otherwise → accept (downstream multi-signal + taste filters
+         take over on the audio itself)
     """
     blocked_genres: set[str]
-    allowed_genres: set[str]
     lastfm: LastFMClient | None = None
     musicbrainz: MusicBrainzClient | None = None
     discogs: DiscogsClient | None = None
@@ -300,9 +298,6 @@ class GenreClient:
                 blocked_tag = t
                 break
 
-        # Soft allowlist
-        has_allow = any(t in self.allowed_genres for t in tags)
-
         return GenreResult(
             artist=artist,
             title=title,
@@ -313,7 +308,6 @@ class GenreClient:
                 f"Genre '{blocked_tag}' is blocklisted" if blocked_tag else None
             ),
             sources_hit=sources_hit,
-            has_allowlist_match=has_allow,
         )
 
     def flush_cache(self) -> None:
@@ -325,7 +319,6 @@ def create_genre_client(
     lastfm_api_key: str | None,
     discogs_token: str | None,
     blocked_genres: list[str],
-    allowed_genres: list[str],
     cache_path: Path | None = None,
     enable_musicbrainz: bool = True,
     enable_discogs: bool = True,
@@ -341,7 +334,6 @@ def create_genre_client(
 
     return GenreClient(
         blocked_genres=set(g.lower() for g in blocked_genres),
-        allowed_genres=set(g.lower() for g in allowed_genres),
         lastfm=lastfm,
         musicbrainz=mb,
         discogs=dc,

@@ -65,12 +65,6 @@ def test_should_reject_track_filters_by_duration():
     assert rejected and "long" in (reason or "")
 
 
-def test_should_reject_track_filters_by_low_confidence():
-    weak = {"mood": "Energetic", "duration": 180, "bpm": 120, "confidence": 0.05}
-    rejected, reason = should_reject_track(weak)
-    assert rejected and "confiance" in (reason or "")
-
-
 def test_should_reject_track_accepts_valid_track():
     ok = {"mood": "Energetic", "duration": 180, "bpm": 120, "confidence": 0.8}
     rejected, _ = should_reject_track(ok)

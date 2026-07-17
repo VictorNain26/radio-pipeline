@@ -177,14 +177,12 @@ class AudioFilters:
         duration_max: Durée maximum en secondes
         bpm_min: BPM minimum
         bpm_max: BPM maximum
-        min_confidence: Score de confiance minimum pour classification (0-1)
         reject_low_quality: Rejeter les tracks avec analyse de faible qualité
     """
     duration_min: int | None = 60       # 1 minute minimum
     duration_max: int | None = 420      # 7 minutes maximum
     bpm_min: int | None = None
     bpm_max: int | None = None
-    min_confidence: float = 0.3
     reject_low_quality: bool = True
 
 
@@ -266,30 +264,6 @@ class GenreFilterConfig:
         "harsh noise", "power electronics", "japanoise", "noise music",
     )
     require_tags: bool = False  # Si True, rejette les tracks sans tags
-
-
-@dataclass
-class AggressiveAudioFilter:
-    """
-    Filtre audio intelligent pour bloquer les tracks agressives (metal, hardcore, etc.)
-    quand Last.fm n'a pas de tags.
-
-    Best practices 2026:
-    - Utilise arousal + valence de l'analyse Essentia comme fallback
-    - Arousal élevé + valence négative = son agressif/metal
-    - S'applique uniquement si Last.fm n'a pas de tags (artistes obscurs)
-
-    Attributes:
-        enabled: Activer le filtre audio intelligent
-        arousal_threshold: Seuil arousal au-dessus duquel vérifier (0-1)
-        valence_threshold: Seuil valence en-dessous duquel bloquer (-1 à 1)
-        block_intense_mood: Bloquer aussi les tracks classées "Intense" ou "Angry"
-    """
-    enabled: bool = True
-    arousal_threshold: float = 0.65  # Arousal > 0.65 = énergique
-    valence_threshold: float = -0.2  # Valence < -0.2 = négatif/agressif
-    # Désactivé : le filtre multi-signal gère les tracks agressives
-    block_intense_mood: bool = False
 
 
 @dataclass(frozen=True)
@@ -487,7 +461,6 @@ AUDIO_FILTERS = AudioFilters(
     duration_max=420,   # 7 minutes maximum
     bpm_min=None,
     bpm_max=None,
-    min_confidence=0.3,
     reject_low_quality=True,
 )
 
@@ -649,88 +622,31 @@ DISCOVER_MAX_TRACKS: int = 60
 
 
 # =============================================================================
-# GENRE — Allowlist (multi-source : MusicBrainz + Discogs + Last.fm)
+# GENRE — politique du genre_client (multi-source : MB + Discogs + Last.fm)
 # =============================================================================
 #
-# Politique du genre_client (best practices 2026) :
 #   1. blocklist hit (UNION des 3 sources) → rejet immédiat
-#   2. allowlist hit (UNION des 3 sources) → accept (passe le filtre)
-#   3. aucun tag retourné → accept (downstream Essentia AGGRESSIVE_FILTER prend
-#      le relais sur l'audio)
+#   2. sinon → accept ; l'audio prend le relais en aval (multi-signal +
+#      filtre de goût TASTE_FILTER)
+#
+# L'ancienne ALLOWED_GENRES a été supprimée (2026-07) : son résultat
+# (has_allowlist_match) n'était consommé nulle part — couche morte.
 #
 # MusicBrainz fournit la taxonomie canonique (genre + tag).
 # Discogs domine sur électronique/hip-hop/jazz (genre + style).
 # Last.fm couvre l'obscur (crowd-sourced).
 # =============================================================================
 
-ALLOWED_GENRES: tuple[str, ...] = (
-    # ─── INDIE / ALTERNATIVE ──────────────────────────────────────
-    "indie", "indie rock", "indie pop", "indie folk", "indietronica",
-    "alternative", "alternative rock", "alt-rock",
-    "dream pop", "shoegaze", "slowcore", "sadcore",
-    "bedroom pop", "jangle pop", "twee pop",
-    "art pop", "art rock", "chamber pop", "baroque pop",
-    "post-rock", "math rock", "post-punk", "new wave", "no wave",
-    "experimental rock",
-    # ─── FOLK ─────────────────────────────────────────────────────
-    "folk", "freak folk", "psych folk", "indie folk",
-    "americana", "alt-country", "alternative country",
-    "contemporary folk", "neo-folk",
-    # ─── ELECTRONIC ───────────────────────────────────────────────
-    "electronic", "electronica", "idm", "intelligent dance music",
-    "downtempo", "chillout", "chill-out", "lounge",
-    "trip hop", "trip-hop",
-    "ambient pop", "ambient electronic", "ambient techno",
-    "synthpop", "synth-pop", "electropop", "electro pop",
-    "synthwave", "chillwave", "vaporwave", "glitch",
-    "future bass",
-    # House / techno (variantes mid-tempo, pas le hard)
-    "house", "deep house", "minimal house", "lo-fi house", "tech house",
-    "techno", "minimal techno", "dub techno", "ambient techno",
-    "uk garage", "garage", "future garage", "2-step",
-    "footwork", "juke",
-    "drum and bass", "dnb", "drum & bass", "liquid dnb", "liquid funk",
-    "broken beat", "breakbeat", "jungle",
-    "bass music",
-    # ─── AMBIENT / CINEMATIC ──────────────────────────────────────
-    "ambient", "dark ambient", "drone", "drone music",
-    "modern classical", "neoclassical", "post-classical",
-    "minimalism", "minimal music", "post-minimalism",
-    "soundscape", "field recordings", "field recording",
-    "new age",
-    # ─── HIP-HOP / RAP ────────────────────────────────────────────
-    "hip hop", "hip-hop", "rap",
-    "alternative hip hop", "alt hip hop", "alt-hip-hop",
-    "experimental hip hop", "conscious hip hop",
-    "jazz rap", "jazz hip hop", "abstract hip hop",
-    "lo-fi hip hop", "boom bap", "golden age hip hop",
-    "trap", "cloud rap",
-    # ─── SOUL / R&B / NEO SOUL ────────────────────────────────────
-    "neo soul", "neo-soul", "soul",
-    "r&b", "rnb", "rhythm and blues",
-    "contemporary r&b", "alternative r&b", "alt-r&b", "alt r&b",
-    "afrobeat", "afro soul", "afrobeats",
-    # ─── JAZZ-ADJACENT ────────────────────────────────────────────
-    "jazz", "nu jazz", "jazz fusion",
-    "smooth jazz", "spiritual jazz", "contemporary jazz",
-    "ethio-jazz",
-    # ─── POP / LO-FI / BEDROOM ────────────────────────────────────
-    "pop", "indie pop",
-    "lo-fi", "lofi", "bedroom",
-)
-
-
 # Filtre de genre (multi-source : MusicBrainz + Discogs + Last.fm)
 # Voir GenreFilterConfig pour la docstring détaillée et la liste bloquée
 # (les defaults de la classe sont la source de vérité).
 GENRE_FILTER = GenreFilterConfig()
 
-# Filtre audio intelligent (fallback quand Last.fm n'a pas de tags)
-# Bloque les tracks agressives détectées par Essentia (arousal élevé + valence négative)
-AGGRESSIVE_FILTER = AggressiveAudioFilter()
-
-# Filtre multi-signal (nouveaux morceaux uniquement)
-# Combine 4 signaux indépendants pour rejeter les tracks agressives
+# Filtre multi-signal (consensus de signaux ML contre l'agressif).
+# L'ancien AGGRESSIVE_FILTER (fallback arousal/valence pour tracks sans
+# analyse discogs-effnet) a été supprimé (2026-07) : tous les nouveaux
+# morceaux passent par analyze.py qui fournit les signaux — la branche
+# legacy était morte, et le filtre de goût couvre le résidu.
 MULTI_SIGNAL_FILTER = MultiSignalFilterConfig()
 
 
@@ -1048,11 +964,6 @@ def should_reject_track(features: dict[str, Any]) -> tuple[bool, str | None]:
 
     if AUDIO_FILTERS.bpm_max and bpm > AUDIO_FILTERS.bpm_max:
         return True, f"BPM trop haut ({bpm})"
-
-    # 4. Vérifier la confiance de classification
-    confidence = features.get("confidence", 1.0)
-    if AUDIO_FILTERS.min_confidence and confidence < AUDIO_FILTERS.min_confidence:
-        return True, f"confiance trop basse ({confidence:.2f})"
 
     # 5. Vérifier si le mood a des dayparts assignés
     if mood:

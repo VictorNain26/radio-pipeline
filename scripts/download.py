@@ -38,7 +38,6 @@ from settings import get_settings, validate_environment
 try:
     from config import (
         ACOUSTID_DEDUP,
-        ALLOWED_GENRES,
         AUDIO_FILTERS,
         GENRE_FILTER,
         LOUDNORM,
@@ -1271,7 +1270,6 @@ def main() -> int:
             lastfm_api_key=settings.lastfm_api_key,
             discogs_token=settings.discogs_token,
             blocked_genres=list(GENRE_FILTER.blocked_genres),
-            allowed_genres=list(ALLOWED_GENRES),
         )
         sources = [
             s for s, on in (
@@ -1281,9 +1279,8 @@ def main() -> int:
             ) if on
         ]
         logger.info(
-            "Genre filter: %d blocked / %d allowed | sources: %s",
+            "Genre filter: %d blocked | sources: %s",
             len(GENRE_FILTER.blocked_genres),
-            len(ALLOWED_GENRES),
             ", ".join(sources),
         )
 
