@@ -71,6 +71,8 @@ MAX_PARALLEL_DOWNLOADS = 3
 
 # Thread-safe lock for shared state
 _download_lock = Lock()
+# Output filenames claimed by in-flight downloads (guarded by _download_lock)
+_claimed_paths: set[str] = set()
 
 DownloadResult = Literal["downloaded", "skipped", "filtered", "blocked", "failed", "duplicate"]
 
@@ -836,10 +838,13 @@ def write_id3_tags(
         # Add cover if provided
         if cover_path and cover_path.exists():
             cover_data = cover_path.read_bytes()
+            # Sniff the actual format — Last.fm/iTunes sometimes serve PNG,
+            # and a wrong APIC mime breaks artwork on some players.
+            mime = 'image/png' if cover_data.startswith(b'\x89PNG') else 'image/jpeg'
             audio.delall('APIC')
             audio.add(APIC(
                 encoding=3,
-                mime='image/jpeg',
+                mime=mime,
                 type=3,
                 desc='Cover',
                 data=cover_data
@@ -996,10 +1001,19 @@ def download_track(
     safe_name = sanitize_filename(f"{artist} - {title}")
     final_path = DOWNLOAD_DIR / f"{safe_name}.mp3"
 
-    # Skip if already exists locally
-    if final_path.exists():
-        logger.info("  Already exists locally")
-        return DownloadOutcome('skipped', None)
+    # Claim the output name under the lock: two different tracks can
+    # sanitize to the same filename, and the exists() check alone is racy
+    # while another worker is still mid-download. Retries keep the name
+    # claimed on attempt 0.
+    if _retry_count == 0:
+        with _download_lock:
+            if final_path.exists():
+                logger.info("  Already exists locally")
+                return DownloadOutcome('skipped', None)
+            if str(final_path) in _claimed_paths:
+                digest = hashlib.sha1(track_key.encode("utf-8")).hexdigest()[:6]
+                final_path = DOWNLOAD_DIR / f"{safe_name} [{digest}].mp3"
+            _claimed_paths.add(str(final_path))
 
     # Phase 1: Probe SoundCloud + YouTube in parallel, pick best across sources
     match = find_best_audio_match(search, artist, title)

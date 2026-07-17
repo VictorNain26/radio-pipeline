@@ -9,6 +9,7 @@ Best practices 2026:
 
 import json
 import logging
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,8 @@ class LastFMClient:
     """
     api_key: str
     _cache: dict[str, list[str]] = field(default_factory=dict, init=False)
+    # The client is shared by the 3 download workers
+    _cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def _make_request(self, method: str, params: dict[str, str]) -> dict[str, Any] | None:
         """
@@ -67,11 +70,18 @@ class LastFMClient:
             logger.debug("Last.fm request failed: %s", e)
             return None
 
+    def _cache_get(self, key: str) -> list[str] | None:
+        with self._cache_lock:
+            return self._cache.get(key)
+
     def _cache_put(self, key: str, value: list[str]) -> None:
         """Store a value in the cache, clearing it if max size is exceeded."""
-        if len(self._cache) >= MAX_CACHE_SIZE:
-            self._cache.clear()
-        self._cache[key] = value
+        with self._cache_lock:
+            if len(self._cache) >= MAX_CACHE_SIZE:
+                # Drop the oldest half instead of nuking the whole cache
+                for k in list(self._cache)[: MAX_CACHE_SIZE // 2]:
+                    del self._cache[k]
+            self._cache[key] = value
 
     def _extract_tags(self, data: dict[str, Any] | None) -> list[str]:
         """Extract lowercase tag names from a Last.fm toptags response."""
@@ -94,8 +104,9 @@ class LastFMClient:
             List of tag names (lowercase).
         """
         cache_key = f"track:{artist.lower()}:{title.lower()}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         data = self._make_request("track.getTopTags", {
             "artist": artist,
@@ -116,8 +127,9 @@ class LastFMClient:
             List of tag names (lowercase).
         """
         cache_key = f"artist:{artist.lower()}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         data = self._make_request("artist.getTopTags", {
             "artist": artist,
