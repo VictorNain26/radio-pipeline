@@ -614,6 +614,20 @@ class AzuraCastClient(RobustHTTPClient):
             logger.error(f"Art update failed for file {file_id}: {e}")
             return False
 
+    def download_file_to(self, file_id: int | str, dest: Path, timeout: float = 120.0) -> bool:
+        """Download a station media file to a local path."""
+        try:
+            response = self.get(
+                f"/api/station/{self.station_id}/file/{file_id}/download",
+                timeout=timeout,
+            )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(response.content)
+            return True
+        except (ClientError, ServerError, HTTPConnectionError, OSError) as e:
+            logger.error(f"Download failed for file {file_id}: {e}")
+            return False
+
     def delete_file(self, file_id: int | str) -> bool:
         """
         Delete a file from station library.

@@ -86,7 +86,6 @@ def reanalyze_track(
         True if successful.
     """
     from analyze import analyze_audio
-    from reanalyze import download_file
 
     file_id = track["azuracast_file_id"]
     artist = track["artist"]
@@ -99,7 +98,7 @@ def reanalyze_track(
 
     # 1. Download
     temp_file = temp_dir / f"track_{file_id}.mp3"
-    if not download_file(client, file_info, temp_file):
+    if not client.download_file_to(file_id, temp_file):
         return False
 
     # 2. Analyze

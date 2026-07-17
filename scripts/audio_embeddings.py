@@ -237,6 +237,20 @@ class EmbeddingStore:
                 emb = None
         else:
             emb = None
+
+        # Coherence guard: a crash between the two _flush() renames can leave
+        # index and matrix out of sync. Silently proceeding would associate
+        # wrong keys with wrong vectors in smart_queue.
+        if emb is not None and len(track_keys) != emb.shape[0]:
+            logger.warning(
+                "Embedding store out of sync (%d keys vs %d vectors) — "
+                "resetting store; embeddings will be recomputed lazily",
+                len(track_keys), emb.shape[0],
+            )
+            return [], None
+        if emb is None and track_keys:
+            return [], None
+
         return track_keys, emb
 
     def _flush(self) -> None:

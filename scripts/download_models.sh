@@ -33,7 +33,13 @@ for filename in "${!MODELS[@]}"; do
         echo "  $filename (already exists)"
     else
         echo "  Downloading $filename..."
-        curl -sL "$BASE_URL/${MODELS[$filename]}" -o "$filepath"
+        # -f: a 404/500 must fail instead of writing the HTML error page
+        # into the .pb model file.
+        if ! curl -fsSL "$BASE_URL/${MODELS[$filename]}" -o "$filepath"; then
+            echo "  ERROR: download failed for $filename" >&2
+            rm -f "$filepath"
+            exit 1
+        fi
     fi
 done
 
