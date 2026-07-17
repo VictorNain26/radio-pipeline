@@ -7,6 +7,7 @@ to enable age-based tiered rotation and cooldown logic.
 
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,18 @@ def normalize_track_key(artist: str, title: str) -> str:
     return f"{artist} - {title}"
 
 
+
+def _synchronized(method):
+    """Serialize access to the shared sqlite3 connection across threads."""
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class TrackDB:
     """SQLite-backed track database for rotation tracking."""
 
@@ -35,6 +48,9 @@ class TrackDB:
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # The connection is shared across download worker threads;
+        # sqlite3.Connection is not safe for concurrent execute/commit.
+        self._lock = threading.RLock()
         self._create_tables()
 
     def __enter__(self) -> "TrackDB":
@@ -54,10 +70,10 @@ class TrackDB:
                 azuracast_file_id INTEGER,
                 play_count INTEGER DEFAULT 0,
                 mood TEXT,
-                -- Rotation category: HEAVY / MEDIUM / DISCOVERY (see
-                -- config.ROTATION_CATEGORIES). New tracks start at DISCOVERY;
-                -- get promoted by enforce_tiered_rotation as their play_count
-                -- and age grow. Promotion is one-way (no automatic demotion).
+                -- Rotation category: HEAVY / MEDIUM / LIGHT (see
+                -- config.ROTATION_CATEGORIES). New tracks start HEAVY
+                -- (grace period); enforce_tiered_rotation re-tiers them
+                -- up or down on every run based on age and play rate.
                 tier TEXT DEFAULT 'DISCOVERY'
             );
 
@@ -95,6 +111,7 @@ class TrackDB:
     # Audio fingerprint (Chromaprint) — see audio_fingerprint.py
     # ------------------------------------------------------------------
 
+    @_synchronized
     def record_fingerprint(
         self, track_key: str, fingerprint_hash: str, duration_sec: int
     ) -> None:
@@ -111,6 +128,7 @@ class TrackDB:
         )
         self.conn.commit()
 
+    @_synchronized
     def find_by_fingerprint(self, fingerprint_hash: str) -> dict[str, Any] | None:
         """Return the row that matches a Chromaprint hash, or None."""
         row = self.conn.execute(
@@ -124,11 +142,12 @@ class TrackDB:
         ).fetchone()
         return dict(row) if row else None
 
+    @_synchronized
     def record_upload(
         self, track_key: str, artist: str, title: str, file_id: int,
         mood: str | None = None, tier: str = "DISCOVERY",
     ) -> None:
-        """Record a track upload (or re-upload). New tracks start in DISCOVERY tier."""
+        """Record a track upload (or re-upload)."""
         now = time.time()
         self.conn.execute(
             """INSERT INTO tracks (track_key, artist, title, uploaded_at, deleted_at,
@@ -145,6 +164,7 @@ class TrackDB:
         )
         self.conn.commit()
 
+    @_synchronized
     def update_tier(self, track_key: str, tier: str) -> None:
         """Update the rotation tier of an existing track."""
         self.conn.execute(
@@ -153,12 +173,14 @@ class TrackDB:
         )
         self.conn.commit()
 
+    @_synchronized
     def get_tier(self, track_key: str) -> str | None:
         row = self.conn.execute(
             "SELECT tier FROM tracks WHERE track_key = ?", (track_key,)
         ).fetchone()
         return row["tier"] if row else None
 
+    @_synchronized
     def record_deletion(self, track_key: str) -> None:
         """Mark a track as deleted."""
         now = time.time()
@@ -169,6 +191,7 @@ class TrackDB:
         )
         self.conn.commit()
 
+    @_synchronized
     def sync_play_counts(self, history_entries: list[dict[str, Any]]) -> None:
         """Increment play counts from AzuraCast history entries."""
         for entry in history_entries:
@@ -193,6 +216,7 @@ class TrackDB:
         self.conn.commit()
         logger.info("Synced play counts from %d history entries", len(history_entries))
 
+    @_synchronized
     def get_last_sync_timestamp(self) -> float:
         """Return the last history sync timestamp, or 0.0 if never synced."""
         row = self.conn.execute(
@@ -205,6 +229,7 @@ class TrackDB:
                 pass
         return 0.0
 
+    @_synchronized
     def is_in_cooldown(self, track_key: str, cooldown_days: int) -> bool:
         """Check if a deleted track is still in cooldown period."""
         row = self.conn.execute(
@@ -215,6 +240,7 @@ class TrackDB:
             return False
         return (time.time() - row["deleted_at"]) < cooldown_days * 86400
 
+    @_synchronized
     def get_active_tracks(self) -> list[dict[str, Any]]:
         """Return all active (non-deleted, with file_id) tracks."""
         rows = self.conn.execute(
@@ -225,6 +251,7 @@ class TrackDB:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    @_synchronized
     def get_track_by_file_id(self, file_id: int) -> dict[str, Any] | None:
         """Look up a track by its AzuraCast file ID."""
         row = self.conn.execute(
@@ -264,6 +291,7 @@ class TrackDB:
 
         return stats
 
+    @_synchronized
     def update_mood(self, track_key: str, mood: str) -> None:
         """Update the mood tag for a track."""
         self.conn.execute(
@@ -271,6 +299,7 @@ class TrackDB:
         )
         self.conn.commit()
 
+    @_synchronized
     def register_untracked_file(
         self,
         track_key: str,
