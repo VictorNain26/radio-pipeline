@@ -830,17 +830,29 @@ class TasteFilterConfig:
     Score = mean cosine similarity with the k nearest profile vectors.
     Below `threshold` → reject before AzuraCast upload.
 
-    `log_only=True` keeps the filter in observation mode: verdicts are
-    logged (and counted in stats) but nothing is blocked. Arm it only
-    after the calibration audit shows clean separation.
+    Calibration 2026-07-17 (profile: 1305 vectors / 654 artists;
+    120 held-out personal tracks vs 7 blocked-genre downloads):
+      - threshold 0.62 rejects 0.8% of held-out taste (a spoken
+        interlude) while catching power metal (0.605), plus the 11
+        lowest-scoring tracks of the then-current radio library.
+      - Known limit: metal/hardcore near Victor's punk cluster (Jinjer,
+        Soul Glo, Idles…) scores 0.77-0.87 and is NOT separable by audio
+        alone — the genre-tag blocklist remains the first net for those;
+        this filter is the second net for untagged/obscure candidates.
+      - Raising the threshold to 0.68 would sacrifice Mogwai/Miles
+        Davis-grade positives: don't, without re-running
+        scripts/calibrate_taste_filter.py for evidence.
+
+    `log_only=True` switches to observation mode: verdicts are logged
+    but nothing is blocked (used during calibration).
 
     `min_profile_size` guards against a truncated/partial profile
     silently rejecting everything.
     """
     enabled: bool = True
-    log_only: bool = True
+    log_only: bool = False
     k: int = 5
-    threshold: float = 0.50   # placeholder — calibrated empirically
+    threshold: float = 0.62   # calibrated 2026-07-17, see above
     min_profile_size: int = 200
 
 

@@ -49,6 +49,17 @@ Trois composants greffés sur l'existant :
 - Last.fm indisponible → la source perso est sautée, les autres sources tournent (pattern existant).
 - SSD `/media/plex` non monté → `build_taste_profile.py` refuse de tourner ; la pipeline nocturne n'en dépend pas (le profil est copié dans `data/`).
 
+## Résultat de calibration (2026-07-17)
+
+Profil construit : **1 305 vecteurs / 654 artistes, 0 échec**. Audit sur
+120 positifs held-out, 941 tracks de la library radio, 7 négatifs réels
+(genres bloqués téléchargés pour l'occasion).
+
+- Le centrage par la moyenne **dégrade** la séparation (98 % d'overlap) → cosine brut conservé, k=5.
+- **Seuil retenu : 0.62** — rejette 0,8 % des positifs (un interlude parlé), attrape le power metal (0.605) et les 11 tracks les plus hors-couleur de la library actuelle.
+- **Limite documentée** : le metal/hardcore proche du cluster punk de la bibliothèque (Jinjer, Soul Glo, Idles…) score 0.77-0.87 et n'est pas séparable par l'audio seul. Première ligne de défense pour ces cas : la blocklist de genres par tags (inchangée). Le filtre de goût est le second filet, pour les candidats sans tags.
+- Filtre **armé** (`log_only=False`) après ces vérifications ; smoke test réel : track à 0.247 → reject, track médian (0.825) → ok.
+
 ## Tests
 
 - Unitaires : échantillonnage déterministe, scoring k-NN (cas limites : profil vide, k > N), rotation du curseur de seeds, parsing getSimilar.
