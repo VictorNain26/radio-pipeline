@@ -961,12 +961,15 @@ def download_track(
     cover_url = track.get('cover')
     search = track.get('search', f"{artist} - {title}")
 
-    # Check against AzuraCast library (primary duplicate detection)
+    # Check against AzuraCast library (primary duplicate detection).
+    # Skipped on retries: attempt 0 already claimed the key, re-checking
+    # here would short-circuit the corruption retry as 'skipped'.
     track_key = normalize_track_key(artist, title)
-    with _download_lock:
-        if track_key in existing_library:
-            return DownloadOutcome('skipped', None)
-        existing_library.add(track_key)
+    if _retry_count == 0:
+        with _download_lock:
+            if track_key in existing_library:
+                return DownloadOutcome('skipped', None)
+            existing_library.add(track_key)
 
     # Check cooldown (skip recently deleted tracks)
     if track_db and track_db.is_in_cooldown(track_key, ROTATION.cooldown_days):
@@ -1046,7 +1049,9 @@ def download_track(
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
         logger.warning("  yt-dlp download timed out (5min)")
-        cleanup_temp()
+        # Only clean this worker's temp dir — other workers are downloading
+        # into their own subdirs of TEMP_DIR right now.
+        shutil.rmtree(thread_temp, ignore_errors=True)
         return DownloadOutcome('failed', match_source)
 
     # Find the downloaded file
@@ -1055,7 +1060,14 @@ def download_track(
         temp_files = list(thread_temp.glob("temp_download.*"))
 
     if not temp_files:
-        logger.warning("  No file found after download")
+        if result.returncode != 0:
+            logger.warning(
+                "  yt-dlp failed (rc=%d): %s",
+                result.returncode,
+                (result.stderr or "").strip()[-300:],
+            )
+        else:
+            logger.warning("  No file found after download")
         return DownloadOutcome('failed', match_source)
 
     temp_file = temp_files[0]
