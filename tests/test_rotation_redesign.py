@@ -103,7 +103,7 @@ def test_gold_dayparts_shrink_like_light():
 def test_rank_by_taste_best_first_unknown_last():
     files = [Path("/x/a.mp3"), Path("/x/b.mp3"), Path("/x/c.mp3")]
     keys = {files[0]: "a - a", files[1]: "b - b", files[2]: None}
-    scores = {"a - a": ("ok", 0.70), "b - b": ("ok", 0.85)}
+    scores = {"a - a": 0.70, "b - b": 0.85}
 
     with patch("classify._track_key_of_file", side_effect=lambda f: keys[f]), \
          patch("classify.check_taste", side_effect=lambda k: scores[k]):
@@ -116,7 +116,7 @@ def test_rank_by_taste_best_first_unknown_last():
 
 def test_rank_by_taste_handles_skip_verdict():
     with patch("classify._track_key_of_file", return_value="x - y"), \
-         patch("classify.check_taste", return_value=("skip", None)):
+         patch("classify.check_taste", return_value=None):
         ranked = _rank_by_taste([Path("/x/a.mp3")])
     assert ranked[0][2] == -1.0
 

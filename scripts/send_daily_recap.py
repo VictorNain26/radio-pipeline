@@ -23,6 +23,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from config import ROTATION  # noqa: E402
 from settings import get_settings  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -59,16 +62,16 @@ def build_message() -> str:
         lines.append(f"⬇️ {dl} téléchargés"
                      + (f" ({', '.join(parts)})" if parts else ""))
     if classify:
-        lines.append(f"✅ {classify.get('uploaded', 0)} à l'antenne "
-                     f"(quota goût {classify.get('uploaded', 0)}/6)")
-        if classify.get("rejected"):
-            lines.append(f"🚫 {classify['rejected']} rejetés (filtres)")
+        lines.append(f"✅ {classify.get('uploaded', 0)}/"
+                     f"{ROTATION.max_uploads_per_night} ajoutés à la radio")
+        # One plain number for everything set aside, whatever the filter.
+        ecartes = classify.get("rejected", 0) + classify.get("quota", 0)
+        if ecartes:
+            lines.append(f"🚫 {ecartes} écartés (pas dans la couleur)")
         if classify.get("carryover"):
-            lines.append(f"💎 {classify['carryover']} pépites en attente (reconcourent demain)")
-        if classify.get("quota"):
-            lines.append(f"⏳ {classify['quota']} non retenus (cooldown)")
+            lines.append(f"💎 {classify['carryover']} bons candidats gardés pour demain")
         if classify.get("rotation_deleted"):
-            lines.append(f"🗑️ {classify['rotation_deleted']} sortis (rotation)")
+            lines.append(f"🗑️ {classify['rotation_deleted']} anciens retirés (fin de vie)")
 
     if len(lines) == 1:
         lines.append("Aucune activité cette nuit.")

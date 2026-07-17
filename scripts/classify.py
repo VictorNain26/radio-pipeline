@@ -198,7 +198,6 @@ class TrackFeatures(TypedDict):
     valence: float
     arousal: float
     # Flag pour filtrage audio intelligent (True si Last.fm avait des tags)
-    has_lastfm_tags: bool
     # Multi-signal filtering fields
     mood_aggressive: float
     genre_top: str
@@ -412,7 +411,6 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
         duration = 0
         valence = 0.0
         arousal = 0.0
-        has_lastfm_tags = False
         mood_aggressive = 0.0
         genre_top = ""
         genre_top_prob = 0.0
@@ -436,8 +434,6 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
                     valence = float(value)
                 elif desc == "AROUSAL":
                     arousal = float(value)
-                elif desc == "HAS_LASTFM_TAGS":
-                    has_lastfm_tags = value.lower() == "true"
                 elif desc == "MOOD_AGGRESSIVE":
                     mood_aggressive = float(value)
                 elif desc == "GENRE_TOP":
@@ -446,9 +442,6 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
                     genre_top_prob = float(value)
                 elif desc == "LASTFM_TAGS":
                     lastfm_tags = value
-                    # If we have actual lastfm tags string, set the boolean too
-                    if value.strip():
-                        has_lastfm_tags = True
 
             except (ValueError, IndexError):
                 continue
@@ -463,7 +456,6 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
             "duration": duration,
             "valence": valence,
             "arousal": arousal,
-            "has_lastfm_tags": has_lastfm_tags,
             "mood_aggressive": mood_aggressive,
             "genre_top": genre_top,
             "genre_top_prob": genre_top_prob,
@@ -559,36 +551,31 @@ def _get_taste_profile() -> Any | None:
     return _TASTE_CACHE["profile"]
 
 
-def check_taste(track_key: str) -> tuple[str, float | None]:
+def check_taste(track_key: str) -> float | None:
     """
     Score a track against the personal taste profile.
 
-    Returns (verdict, score):
-      verdict "reject" — score below threshold (caller decides whether
-                          to enforce, per TASTE_FILTER.log_only)
-      verdict "ok"     — score at/above threshold
-      verdict "skip"   — filter disabled, profile missing, or no
-                          embedding for this track (never blocks)
+    Returns the taste score, or None when the check cannot run (filter
+    disabled, profile missing, no embedding) — None never blocks.
+    Callers compare against TASTE_FILTER.threshold.
     """
     if not TASTE_FILTER.enabled:
-        return "skip", None
+        return None
     profile = _get_taste_profile()
     if profile is None:
-        return "skip", None
+        return None
     try:
         from audio_embeddings import EmbeddingStore
         store = _TASTE_CACHE.setdefault(
             "store", EmbeddingStore(Path(__file__).parent.parent / "data"))
         if not store.has(track_key):
             logger.info("  [taste] no embedding for %s — skipping check", track_key)
-            return "skip", None
+            return None
         embedding = store.get(track_key)
-        score = profile.score(embedding, k=TASTE_FILTER.k)
+        return profile.score(embedding, k=TASTE_FILTER.k)
     except Exception as e:
         logger.warning("  [taste] scoring failed: %s", e)
-        return "skip", None
-    verdict = "ok" if score >= TASTE_FILTER.threshold else "reject"
-    return verdict, score
+        return None
 
 
 def _track_key_of_file(filepath: Path) -> str | None:
@@ -636,7 +623,7 @@ def _rank_by_taste(files: list[Path]) -> list[tuple[Path, str | None, float]]:
         track_key = _track_key_of_file(filepath)
         score = -1.0
         if track_key:
-            _, taste = check_taste(track_key)
+            taste = check_taste(track_key)
             if taste is not None:
                 score = taste
         ranked.append((filepath, track_key, score))
@@ -735,12 +722,14 @@ def process_track(
 
     # Personal taste filter — the candidate must sound like Victor's
     # library. In log_only mode the verdict is logged but not enforced.
-    taste_verdict, taste_score = check_taste(normalize_track_key(artist, title))
-    if taste_verdict != "skip" and taste_score is not None:
+    taste_score = check_taste(normalize_track_key(artist, title))
+    if taste_score is not None:
+        on_color = taste_score >= TASTE_FILTER.threshold
         logger.info("  [taste] score=%.3f threshold=%.3f verdict=%s%s",
-                    taste_score, TASTE_FILTER.threshold, taste_verdict,
+                    taste_score, TASTE_FILTER.threshold,
+                    "ok" if on_color else "reject",
                     " (log-only)" if TASTE_FILTER.log_only else "")
-        if taste_verdict == "reject" and not TASTE_FILTER.log_only:
+        if not on_color and not TASTE_FILTER.log_only:
             logger.info("  Rejected: trop éloigné du profil de goût (%.3f < %.3f)",
                         taste_score, TASTE_FILTER.threshold)
             filepath.unlink()
@@ -937,8 +926,7 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
     expired_ranked = sorted(
         tiers["EXPIRED"], key=lambda e: e["play_count"], reverse=True)
     for entry in expired_ranked:
-        _, taste_score = (
-            check_taste(entry["track_key"]) if entry["track_key"] else ("skip", None))
+        taste_score = check_taste(entry["track_key"]) if entry["track_key"] else None
         if (
             gold_count < gold_cap
             and qualifies_for_gold(

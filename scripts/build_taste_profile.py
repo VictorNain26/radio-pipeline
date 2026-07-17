@@ -19,7 +19,6 @@ in data/ and is only rebuilt on demand.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from datetime import datetime, timezone
@@ -33,6 +32,7 @@ from audio_embeddings import compute_embedding  # noqa: E402
 from taste_profile import (  # noqa: E402
     PROFILE_INDEX,
     PROFILE_NPY,
+    load_taste_profile,
     sample_library,
     save_taste_profile,
 )
@@ -46,20 +46,18 @@ DEFAULT_MUSIC_ROOT = Path("/media/plex/Musique")
 
 
 def _load_existing(data_dir: Path) -> dict[str, np.ndarray]:
-    """Map path -> embedding from a previous build (for incrementality)."""
-    npy_path = data_dir / PROFILE_NPY
-    idx_path = data_dir / PROFILE_INDEX
-    if not npy_path.exists() or not idx_path.exists():
+    """Map path -> embedding from a previous build (for incrementality).
+
+    Reuses load_taste_profile so the corruption/out-of-sync validation
+    lives in exactly one place.
+    """
+    profile = load_taste_profile(data_dir)
+    if profile is None:
         return {}
-    try:
-        embeddings = np.load(npy_path)
-        idx = json.loads(idx_path.read_text(encoding="utf-8"))
-        entries = idx.get("entries", [])
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {}
-    if embeddings.ndim != 2 or embeddings.shape[0] != len(entries):
-        return {}
-    return {e["path"]: embeddings[i] for i, e in enumerate(entries) if e.get("path")}
+    return {
+        path: profile.embeddings[i]
+        for i, path in enumerate(profile.entry_paths) if path
+    }
 
 
 def main() -> int:
