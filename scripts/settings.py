@@ -13,14 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-# Try pydantic v2, fallback to v1 if needed
-try:
-    from pydantic import Field, field_validator, model_validator
-    from pydantic_settings import BaseSettings, SettingsConfigDict
-    PYDANTIC_V2 = True
-except ImportError:
-    from pydantic import BaseSettings, Field, validator, root_validator  # type: ignore
-    PYDANTIC_V2 = False
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -120,71 +114,54 @@ class Settings(BaseSettings):
         description="Enable debug logging",
     )
 
-    if PYDANTIC_V2:
-        model_config = SettingsConfigDict(
-            env_file=str(PROJECT_ROOT / ".env"),
-            env_file_encoding="utf-8",
-            case_sensitive=False,
-            extra="ignore",
-        )
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
-        @field_validator("azuracast_url")
-        @classmethod
-        def validate_url(cls, v: str) -> str:
-            """Validate AzuraCast URL format and security."""
-            v = v.rstrip("/")
-            parsed = urlparse(v)
+    @field_validator("azuracast_url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """Validate AzuraCast URL format and security."""
+        v = v.rstrip("/")
+        parsed = urlparse(v)
 
-            if not parsed.scheme:
-                raise ValueError("URL must include scheme (https://)")
+        if not parsed.scheme:
+            raise ValueError("URL must include scheme (https://)")
 
-            if parsed.scheme not in ("http", "https"):
-                raise ValueError(f"Invalid URL scheme: {parsed.scheme}")
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Invalid URL scheme: {parsed.scheme}")
 
-            if not parsed.netloc:
-                raise ValueError("URL must include hostname")
+        if not parsed.netloc:
+            raise ValueError("URL must include hostname")
 
-            # HTTP is only acceptable when traffic never leaves the machine
-            if parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
-                logger.warning("Using HTTP toward a non-local host is insecure.")
+        # HTTP is only acceptable when traffic never leaves the machine
+        if parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
+            logger.warning("Using HTTP toward a non-local host is insecure.")
 
-            return v
+        return v
 
-        @model_validator(mode="after")
-        def validate_security(self) -> "Settings":
-            """Validate security-related settings."""
-            parsed = urlparse(self.azuracast_url)
+    @model_validator(mode="after")
+    def validate_security(self) -> "Settings":
+        """Validate security-related settings."""
+        parsed = urlparse(self.azuracast_url)
 
-            # Require HTTPS in production, except toward loopback (no network exposure)
-            if not self.debug and parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
-                raise ValueError(
-                    "HTTP toward a remote host is not allowed in production. "
-                    "Use HTTPS, or DEBUG=1 for testing."
-                )
+        # Require HTTPS in production, except toward loopback (no network exposure)
+        if not self.debug and parsed.scheme == "http" and not is_loopback_host(parsed.hostname):
+            raise ValueError(
+                "HTTP toward a remote host is not allowed in production. "
+                "Use HTTPS, or DEBUG=1 for testing."
+            )
 
-            # Warn about disabled SSL verification
-            if not self.ssl_verify:
-                logger.warning(
-                    "SSL verification is disabled. This is insecure and should only be used for local testing."
-                )
+        # Warn about disabled SSL verification
+        if not self.ssl_verify:
+            logger.warning(
+                "SSL verification is disabled. This is insecure and should only be used for local testing."
+            )
 
-            return self
-    else:
-        # Pydantic v1 compatibility
-        class Config:
-            env_file = str(PROJECT_ROOT / ".env")
-            env_file_encoding = "utf-8"
-            case_sensitive = False
-            extra = "ignore"
-
-        @validator("azuracast_url")
-        def validate_url(cls, v: str) -> str:
-            v = v.rstrip("/")
-            parsed = urlparse(v)
-            if not parsed.scheme or not parsed.netloc:
-                raise ValueError("Invalid URL format")
-            return v
-
+        return self
 
 @lru_cache()
 def get_settings() -> Settings:
