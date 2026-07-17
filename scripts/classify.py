@@ -219,23 +219,6 @@ class ClassifyClient(BaseAzuraCastClient):
             logger.error("Failed to fetch files: %s", e)
             raise
 
-    def delete_file(self, file_id: int) -> bool:
-        """
-        Delete a file from AzuraCast.
-
-        Args:
-            file_id: File ID to delete.
-
-        Returns:
-            True if successful, False otherwise.
-        """
-        try:
-            response = self.delete(f"/api/station/{self.station_id}/file/{file_id}")
-            return response.status_code in [200, 204]
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning("Failed to delete file %s: %s", file_id, e)
-            return False
-
     def upload_file(self, filepath: Path) -> int | None:
         """
         Upload file to AzuraCast with retry logic and integrity verification.
@@ -272,34 +255,35 @@ class ClassifyClient(BaseAzuraCastClient):
 
             logger.info("  Uploaded")
 
-            # Wait for processing
-            time.sleep(1)
-
-            # Find the uploaded file
+            # AzuraCast returns the created media object — use its id directly
+            # instead of guessing which library file we just uploaded.
+            uploaded_file: dict[str, Any] | None = None
             try:
-                data = self.get_station_files()
-            except (ClientError, ServerError, HTTPConnectionError):
-                return None
-
-            if not data:
-                return None
-
-            # Sort by upload time, newest first
-            data.sort(key=lambda x: x.get("uploaded_at", 0), reverse=True)
-
-            # Match by filename
-            fname_lower = filename.lower().replace(" ", "_").replace("-", "_")
-            uploaded_file = None
-            for f in data[:5]:
-                path_lower = f["path"].lower()
-                if fname_lower[:10] in path_lower or path_lower[:10] in fname_lower:
-                    uploaded_file = f
-                    break
+                payload = response.json()
+                if isinstance(payload, dict) and payload.get("id"):
+                    uploaded_file = payload
+            except ValueError:
+                pass
 
             if not uploaded_file:
-                uploaded_file = data[0] if data else None
+                # Fallback for AzuraCast versions with an empty upload response:
+                # exact basename match against the library, never "most recent".
+                time.sleep(1)
+                try:
+                    data = self.get_station_files()
+                except (ClientError, ServerError, HTTPConnectionError):
+                    return None
+                fname_lower = filename.lower()
+                matches = [
+                    f for f in data
+                    if f.get("path", "").lower().rsplit("/", 1)[-1] == fname_lower
+                ]
+                if len(matches) == 1:
+                    uploaded_file = matches[0]
 
             if not uploaded_file:
+                logger.error("  Upload succeeded but file could not be identified — "
+                             "skipping integrity check and playlist assignment")
                 return None
 
             # Verify upload integrity (best practice 2026)
@@ -531,9 +515,12 @@ def process_track(
     filename = filepath.name
     logger.info("\n%s", filename)
 
-    # Check duplicate
-    normalized = filename.lower().replace(" ", "_")
-    if any(normalized in e or e in normalized for e in existing):
+    # Check duplicate — exact basename match only. Bidirectional substring
+    # matching used to let short names match unrelated paths, deleting
+    # never-uploaded tracks.
+    name_lower = filename.lower()
+    candidates = {name_lower, name_lower.replace(" ", "_")}
+    if any(e.rsplit("/", 1)[-1] in candidates for e in existing):
         logger.info("  Skipped: already exists")
         filepath.unlink()
         return "skipped", []
@@ -627,8 +614,18 @@ def process_track(
     # Upload
     file_id = client.upload_file(filepath)
     if not file_id:
-        filepath.unlink()  # Clean up failed upload
+        # Keep the local file: it will be retried on the next run
+        # (AzuraCast outages must not permanently lose the batch).
+        logger.warning("  Upload failed — keeping local file for retry")
         return "failed", []
+
+    # Record in persistent TrackDB as soon as the file exists server-side,
+    # so the DB stays consistent even if playlist assignment fails below.
+    if track_db:
+        track_key = normalize_track_key(artist, title)
+        track_db.record_upload(
+            track_key, artist, title, file_id, mood, tier=initial_tier,
+        )
 
     # Assign to all applicable playlists
     playlist_ids = [playlists[name] for name in assigned_playlists]
@@ -639,17 +636,14 @@ def process_track(
         else:
             logger.info("  → Assigned to %s playlists", len(assigned_playlists))
 
-        # Record in persistent TrackDB
-        if track_db and file_id:
-            track_key = normalize_track_key(artist, title)
-            track_db.record_upload(
-                track_key, artist, title, file_id, mood, tier=initial_tier,
-            )
-
         filepath.unlink()
         return "uploaded", assigned_playlists
     else:
-        logger.warning("  Warning: playlist assignment failed")
+        # File is on the server and in the DB; the re-tier pass reassigns
+        # playlists on the next run, so don't keep the local copy.
+        logger.warning("  Playlist assignment failed (uploaded as id=%s, "
+                       "will be reassigned by next rotation pass)", file_id)
+        filepath.unlink()
         return "failed", []
 
 
@@ -1060,11 +1054,17 @@ def _main_inner(
     upload_count_file.parent.mkdir(parents=True, exist_ok=True)
     upload_count_file.write_text(str(results['uploaded']), encoding="utf-8")
 
-    # Cleanup: clear tracks-to-download.json after processing
+    # Cleanup: clear tracks-to-download.json only on a fully successful pass.
+    # On failures the local MP3s are kept and retried next run; clearing the
+    # batch here would have made an AzuraCast outage permanently lose it.
     tracks_file = Path(__file__).parent.parent / "tracks-to-download.json"
     if tracks_file.exists():
-        tracks_file.write_text("[]", encoding="utf-8")
-        logger.info("\nCleanup: tracks-to-download.json cleared")
+        if results["failed"] == 0:
+            tracks_file.write_text("[]", encoding="utf-8")
+            logger.info("\nCleanup: tracks-to-download.json cleared")
+        else:
+            logger.info("\nCleanup: keeping tracks-to-download.json (%d failures)",
+                        results["failed"])
 
     # Cleanup: remove downloads directory if empty
     if music_dir.exists() and not any(music_dir.iterdir()):
