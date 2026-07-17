@@ -494,6 +494,19 @@ def process_file(filepath: str) -> bool:
         logger.error("  ERROR: File not found")
         return False
 
+    # Carryover files (quota leftovers re-competing tonight) were fully
+    # analyzed on a previous night — their MOOD tag is already written.
+    # Re-running Essentia would waste ~10-15 s/file for identical output.
+    try:
+        from mutagen.id3 import ID3
+        existing = ID3(filepath)
+        if any(t.desc == "MOOD" and str(t) for t in existing.getall("TXXX")):
+            logger.info("  Already analyzed (MOOD tag present) — skipping")
+            _ANALYZE_STATS["already_analyzed"] = _ANALYZE_STATS.get("already_analyzed", 0) + 1
+            return True
+    except Exception:
+        pass  # unreadable tags → analyze normally
+
     # Read metadata
     artist, title = read_existing_tags(filepath)
     if not artist or artist == "Unknown":

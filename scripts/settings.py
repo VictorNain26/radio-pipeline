@@ -66,6 +66,16 @@ class Settings(BaseSettings):
         description="Discogs Personal Access Token (raises rate limit to 60 req/min)",
     )
 
+    # WhatsApp daily recap via CallMeBot (optional — recap skipped if unset)
+    callmebot_apikey: str | None = Field(
+        default=None,
+        description="CallMeBot API key for the WhatsApp daily recap",
+    )
+    whatsapp_phone: str | None = Field(
+        default=None,
+        description="WhatsApp phone number (+33...) for the daily recap",
+    )
+
     # Pipeline settings
     http_timeout: int = Field(
         default=30,

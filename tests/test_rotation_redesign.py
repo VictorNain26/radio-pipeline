@@ -125,3 +125,35 @@ def test_quota_config_sane():
     # 6/night ≈ 42/week: each add can still get 15-20 weekly heavy plays.
     assert 1 <= ROTATION.max_uploads_per_night <= 10
     assert 0.0 < ROTATION.gold_max_pct <= 50.0
+
+
+# ---------------------------------------------------------------------------
+# Carryover (gem safety net)
+# ---------------------------------------------------------------------------
+
+def test_carryover_keeps_on_color_leftovers(tmp_path):
+    from classify import _should_carry_over
+    from config import TASTE_FILTER
+    f = tmp_path / "gem.mp3"
+    f.write_bytes(b"x")  # fresh mtime
+    good = TASTE_FILTER.threshold + 0.1
+    bad = TASTE_FILTER.threshold - 0.1
+    assert _should_carry_over(f, good, already_carried=0) is True
+    # Off-color leftovers go to cooldown instead
+    assert _should_carry_over(f, bad, already_carried=0) is False
+    # Pool full → no more carryover
+    assert _should_carry_over(f, good, already_carried=ROTATION.carryover_max_files) is False
+    # Missing file → no carryover
+    assert _should_carry_over(tmp_path / "gone.mp3", good, already_carried=0) is False
+
+
+def test_carryover_ages_out(tmp_path):
+    import os
+    import time as _time
+    from classify import _should_carry_over
+    from config import TASTE_FILTER
+    f = tmp_path / "old.mp3"
+    f.write_bytes(b"x")
+    old = _time.time() - (ROTATION.carryover_max_days + 1) * 86400
+    os.utime(f, (old, old))
+    assert _should_carry_over(f, TASTE_FILTER.threshold + 0.1, already_carried=0) is False

@@ -225,6 +225,14 @@ class RotationConfig:
     # non-retenus partent en cooldown.
     max_uploads_per_night: int = 6
 
+    # Filet anti-pépite : un candidat non retenu par le quota mais dans la
+    # couleur (taste >= TASTE_FILTER.threshold) reste dans le dossier de
+    # téléchargement et reconcourt la nuit suivante contre la nouvelle
+    # fournée, au lieu de partir en cooldown. Plafonné (meilleurs d'abord)
+    # et limité dans le temps pour ne pas accumuler.
+    carryover_max_files: int = 24
+    carryover_max_days: int = 7
+
     # --- Tier GOLD : catalogue permanent (2026-07) -----------------------
     # À l'expiration (max_age_days), un morceau prouvé (rate >= expected ×
     # heavy_above_average_ratio) ET dans la couleur (taste >= gold_min_taste)

@@ -335,6 +335,9 @@ except Exception:
 
     write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
 
+    # Recap quotidien WhatsApp (CallMeBot) — best-effort, jamais bloquant.
+    python3 scripts/send_daily_recap.py || log_warn "Recap WhatsApp failed (non-blocking)"
+
     # Silent-fallback regression alerts.
     # These counters were added 2026-05-14 after a 37/37 silent loudnorm
     # failure that uploaded un-normalised audio to the radio. Any non-zero

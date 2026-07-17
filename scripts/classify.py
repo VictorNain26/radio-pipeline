@@ -605,6 +605,26 @@ def _track_key_of_file(filepath: Path) -> str | None:
     return normalize_track_key(artist, title)
 
 
+def _should_carry_over(
+    filepath: Path, taste_score: float, already_carried: int,
+) -> bool:
+    """
+    Gem safety net: a quota leftover stays on disk for tomorrow's ranking
+    when it is on-color (taste >= production threshold), young enough
+    (file mtime < carryover_max_days), and the carryover pool has room.
+    Iteration is best-score-first, so the pool keeps the best leftovers.
+    """
+    if already_carried >= ROTATION.carryover_max_files:
+        return False
+    if taste_score < TASTE_FILTER.threshold:
+        return False
+    try:
+        age_days = (time.time() - filepath.stat().st_mtime) / 86400
+    except OSError:
+        return False
+    return age_days < ROTATION.carryover_max_days
+
+
 def _rank_by_taste(files: list[Path]) -> list[tuple[Path, str | None, float]]:
     """
     Order the night's batch by taste score, best first, for the upload
@@ -1196,7 +1216,7 @@ def _main_inner(
 
     # Enforce tiered rotation ALWAYS (even with 0 new files)
     try:
-        enforce_tiered_rotation(client, track_db, len(files))
+        rotation_deleted = enforce_tiered_rotation(client, track_db, len(files))
     except (ClientError, ServerError, HTTPConnectionError) as e:
         logger.warning("Rotation check failed: %s", e)
         # Continue anyway - rotation is not critical
@@ -1223,16 +1243,21 @@ def _main_inner(
     playlist_counts: dict[str, int] = {}
 
     # Nightly curation: rank the batch by taste score (best first) so the
-    # upload quota keeps the tracks closest to Victor's colour. The rest
-    # goes to cooldown — airtime is the scarce resource: beyond
-    # max_uploads_per_night adds, a discovery can no longer get its
-    # 15-20 weekly heavy-rotation plays.
+    # upload quota keeps the tracks closest to Victor's colour. Leftovers
+    # that are still on-color stay on disk and re-compete tomorrow (gem
+    # safety net); the rest goes to cooldown — airtime is the scarce
+    # resource: beyond max_uploads_per_night adds, a discovery can no
+    # longer get its 15-20 weekly heavy-rotation plays.
     quota = ROTATION.max_uploads_per_night
     ranked = _rank_by_taste(files)
+    results["carryover"] = 0
 
     # Process files (best-scoring first)
     for filepath, track_key, taste_score in ranked:
         if quota and results["uploaded"] >= quota:
+            if _should_carry_over(filepath, taste_score, results["carryover"]):
+                results["carryover"] += 1  # stays in place for next night
+                continue
             if track_key:
                 track_db.record_deletion(track_key)  # cooldown: no re-download
             filepath.unlink()
@@ -1255,6 +1280,18 @@ def _main_inner(
     logger.info("  Failed: %s", results['failed'])
     if results["quota"]:
         logger.info("  Quota curation (cooldown, non retenus): %s", results["quota"])
+    if results["carryover"]:
+        logger.info("  Carryover (pépites en attente pour demain): %s", results["carryover"])
+
+    # Persist classify stats for the daily recap (same pattern as
+    # last_discover/download/analyze_stats.json).
+    try:
+        classify_stats = dict(results)
+        classify_stats["rotation_deleted"] = rotation_deleted
+        (Path(__file__).parent.parent / "data" / "last_classify_stats.json").write_text(
+            json.dumps(classify_stats), encoding="utf-8")
+    except OSError as e:
+        logger.warning("Could not write classify stats: %s", e)
 
     if results['uploaded'] > 0 and playlist_counts:
         logger.info("\n=== Playlist Distribution ===")
