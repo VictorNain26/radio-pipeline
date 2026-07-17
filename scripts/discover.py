@@ -39,6 +39,7 @@ from discovery_sources import (  # noqa: E402
     Track,
 )
 from settings import get_settings, validate_environment  # noqa: E402
+from track_db import normalize_track_key  # noqa: E402
 
 try:
     from config import (  # noqa: E402
@@ -63,8 +64,9 @@ MANUAL_PICKS_FILE = PIPELINE_DIR / "data" / "manual_picks.json"
 HYPEM_COUNT = 50
 
 
-def _normalize_key(artist: str, title: str) -> str:
-    return f"{artist.strip().lower()}|{title.strip().lower()}"
+# Canonical normalization shared with download/track_db so the discovery
+# dedup and the library dedup agree on what "the same track" means.
+_normalize_key = normalize_track_key
 
 
 def _build_sources() -> list[DiscoverySource]:
@@ -135,10 +137,14 @@ def _save(tracks: list[Track]) -> bool:
                 "search": t["search"],
                 "source": t.get("source", ""),
             })
-        OUTPUT_FILE.write_text(
+        # Atomic write: a crash mid-write must not leave a truncated JSON
+        # (load_tracks would silently return [] and lose the batch).
+        tmp_file = OUTPUT_FILE.with_suffix(".json.tmp")
+        tmp_file.write_text(
             json.dumps(slim, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+        tmp_file.replace(OUTPUT_FILE)
         return True
     except OSError as e:
         logger.error("Failed to write %s: %s", OUTPUT_FILE, e)

@@ -178,6 +178,11 @@ def _make_track(source: str, artist: str, title: str, cover: str | None = None) 
     }
 
 
+def _redact_url(url: str) -> str:
+    """Strip credential-bearing query values (api_key=...) before logging."""
+    return re.sub(r"(api_key=)[^&]+", r"\1***", url)
+
+
 def _http_get_json(url: str, headers: dict[str, str] | None = None) -> Any | None:
     h = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if headers:
@@ -187,7 +192,18 @@ def _http_get_json(url: str, headers: dict[str, str] | None = None) -> Any | Non
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, TimeoutError) as e:
-        logger.warning("HTTP GET failed for %s: %s", url, e)
+        logger.warning("HTTP GET failed for %s: %s", _redact_url(url), e)
+        return None
+
+
+def _http_get_bytes(url: str) -> bytes | None:
+    """Fetch raw bytes with an enforced timeout (feedparser has none of its own)."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            return resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        logger.warning("HTTP GET failed for %s: %s", _redact_url(url), e)
         return None
 
 
@@ -271,13 +287,16 @@ class RSSSource(DiscoverySource):
                 continue
 
             logger.info("  RSS %s ...", feed_cfg.label or feed_cfg.url)
+            # Fetch ourselves with a timeout — feedparser.parse(url) applies
+            # none, so a silent feed used to block discovery indefinitely.
+            raw = _http_get_bytes(feed_cfg.url)
+            if raw is None:
+                logger.warning("  RSS fetch failed (%s)", feed_cfg.label)
+                continue
             try:
-                parsed = feedparser.parse(
-                    feed_cfg.url,
-                    request_headers={"User-Agent": USER_AGENT},
-                )
+                parsed = feedparser.parse(raw)
             except Exception as e:  # feedparser is very tolerant; just in case
-                logger.warning("  RSS fetch failed (%s): %s", feed_cfg.label, e)
+                logger.warning("  RSS parse failed (%s): %s", feed_cfg.label, e)
                 continue
 
             if parsed.get("bozo") and not parsed.get("entries"):
