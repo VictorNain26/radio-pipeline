@@ -988,7 +988,11 @@ def download_track(
         has_lastfm_tags = bool(genre_result.tags)
         lastfm_tags_str = ", ".join(genre_result.tags) if genre_result.tags else ""
         if genre_result.is_blocked:
-            logger.info("  Blocked: %s", genre_result.blocked_reason)
+            # Track name in the message: workers log in parallel, so without
+            # it a block line lands under another track's header (a blocked
+            # Smirk once read as a blocked Cramps in the night log).
+            logger.info("  Blocked [%s - %s]: %s",
+                        artist, title, genre_result.blocked_reason)
             return DownloadOutcome('blocked', None)
         if genre_result.top_tag:
             logger.debug("  Genre: %s", genre_result.top_tag)

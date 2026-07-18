@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -83,8 +84,17 @@ def send_whatsapp(text: str, phone: str, apikey: str) -> bool:
         {"phone": phone, "apikey": apikey, "text": text})
     try:
         with urllib.request.urlopen(url, timeout=30) as r:
-            logger.info("Recap WhatsApp envoyé (%d car.) → HTTP %s", len(text), r.status)
-            return r.status == 200
+            body = r.read().decode(errors="replace")
+            if r.status == 200:
+                logger.info("Recap WhatsApp envoyé (%d car.)", len(text))
+                return True
+            # CallMeBot signale ses pannes en 207 avec l'explication dans
+            # le HTML (ex. "Service is down (410)") — la logger, sinon
+            # l'échec est indistinguable d'un problème de clé.
+            plain = " ".join(re.sub("<[^>]+>", " ", body).split())
+            logger.warning("Envoi WhatsApp refusé : HTTP %s — %s",
+                           r.status, plain[:300])
+            return False
     except Exception as e:
         logger.warning("Envoi WhatsApp échoué : %s", e)
         return False

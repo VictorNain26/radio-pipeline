@@ -129,6 +129,20 @@ def parse_filename(filepath: str) -> tuple[str, str]:
     return "Unknown", name.strip()
 
 
+def resolve_identity(filepath: str) -> tuple[str, str]:
+    """
+    A track's (artist, title), resolved the single way the pipeline does
+    it: prefer ID3 tags, fall back to the "Artist - Title" filename when
+    the artist tag is absent. Both the full-analysis path and the
+    already-analyzed/carryover path use this, so an embedding keyed here
+    matches the one keyed there.
+    """
+    artist, title = read_existing_tags(filepath)
+    if not artist or artist == "Unknown":
+        return parse_filename(filepath)
+    return artist, title
+
+
 def get_energy_level(arousal: float) -> str:
     """
     Determine energy level from arousal.
@@ -501,19 +515,21 @@ def process_file(filepath: str) -> bool:
         from mutagen.id3 import ID3
         existing = ID3(filepath)
         if any(t.desc == "MOOD" and str(t) for t in existing.getall("TXXX")):
-            logger.info("  Already analyzed (MOOD tag present) — skipping")
+            logger.info("  Already analyzed (MOOD tag present) — skipping Essentia")
             _ANALYZE_STATS["already_analyzed"] = _ANALYZE_STATS.get("already_analyzed", 0) + 1
+            # The embedding may have been pruned while the file waited in
+            # carryover/retry — make sure it exists before classify ranks
+            # tonight's batch by taste.
+            artist, title = resolve_identity(filepath)
+            if artist and title:
+                _ensure_clap_embedding(filepath, artist, title)
             return True
     except Exception:
         pass  # unreadable tags → analyze normally
 
-    # Read metadata
-    artist, title = read_existing_tags(filepath)
-    if not artist or artist == "Unknown":
-        artist, title = parse_filename(filepath)
-        logger.info("  Metadata: %s - %s (from filename)", artist, title)
-    else:
-        logger.info("  Metadata: %s - %s", artist, title)
+    # Read metadata (ID3 tags, falling back to the filename)
+    artist, title = resolve_identity(filepath)
+    logger.info("  Metadata: %s - %s", artist, title)
 
     # Analyze audio
     logger.info("  Analyzing (MTG arousal-valence ensemble)...")
@@ -561,36 +577,46 @@ def process_file(filepath: str) -> bool:
     if not write_tags(filepath, artist, title, features):
         return False
 
-    # CLAP embedding (opt-in via config.CLAP.enabled).
-    # Stored separately in data/embeddings.{npy,index.json} for later use
-    # by scripts/smart_queue.py — no impact on the rest of the pipeline.
-    if CLAP_CFG.enabled:
-        try:
-            from audio_embeddings import EmbeddingStore, compute_embedding
-            from track_db import normalize_track_key
-
-            track_key = normalize_track_key(artist, title)
-            # Reuse one store for the whole run (loading it re-reads the
-            # full matrix + index from disk).
-            store = _get_model("_embedding_store",
-                               lambda: EmbeddingStore(PIPELINE_DIR / "data"))
-            if store.has(track_key):
-                logger.info("  CLAP: cached (already indexed)")
-                _ANALYZE_STATS["clap_cached"] += 1
-            else:
-                emb = compute_embedding(Path(filepath))
-                if emb is not None:
-                    store.add(track_key, emb)
-                    logger.info("  CLAP: embedding stored (%d-dim)", emb.shape[0])
-                    _ANALYZE_STATS["clap_succeeded"] += 1
-                else:
-                    logger.warning("  CLAP: embedding failed (non-fatal)")
-                    _ANALYZE_STATS["clap_failed"] += 1
-        except ImportError as e:
-            logger.warning("  CLAP integration unavailable (%s); set CLAP.enabled=False to silence", e)
-            _ANALYZE_STATS["clap_failed"] += 1
+    _ensure_clap_embedding(filepath, artist, title)
 
     return True
+
+
+def _ensure_clap_embedding(filepath: str, artist: str, title: str) -> None:
+    """
+    CLAP embedding (opt-in via config.CLAP.enabled).
+    Stored separately in data/embeddings.{npy,index.json} for later use
+    by scripts/smart_queue.py — no impact on the rest of the pipeline.
+    Idempotent: recomputes only when the key is absent from the store,
+    so it also repairs embeddings lost between two runs (e.g. pruned
+    while the file sat in carryover/retry).
+    """
+    if not CLAP_CFG.enabled:
+        return
+    try:
+        from audio_embeddings import EmbeddingStore, compute_embedding
+        from track_db import normalize_track_key
+
+        track_key = normalize_track_key(artist, title)
+        # Reuse one store for the whole run (loading it re-reads the
+        # full matrix + index from disk).
+        store = _get_model("_embedding_store",
+                           lambda: EmbeddingStore(PIPELINE_DIR / "data"))
+        if store.has(track_key):
+            logger.info("  CLAP: cached (already indexed)")
+            _ANALYZE_STATS["clap_cached"] += 1
+        else:
+            emb = compute_embedding(Path(filepath))
+            if emb is not None:
+                store.add(track_key, emb)
+                logger.info("  CLAP: embedding stored (%d-dim)", emb.shape[0])
+                _ANALYZE_STATS["clap_succeeded"] += 1
+            else:
+                logger.warning("  CLAP: embedding failed (non-fatal)")
+                _ANALYZE_STATS["clap_failed"] += 1
+    except ImportError as e:
+        logger.warning("  CLAP integration unavailable (%s); set CLAP.enabled=False to silence", e)
+        _ANALYZE_STATS["clap_failed"] += 1
 
 
 def main() -> int:

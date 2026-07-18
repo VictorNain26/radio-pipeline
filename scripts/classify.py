@@ -11,9 +11,11 @@ Features v2.0:
 - Robust HTTP client with retry logic and circuit breaker
 """
 
+import json
 import logging
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -186,6 +188,17 @@ logger = logging.getLogger(__name__)
 UPLOAD_TIMEOUT = 180
 
 
+def _normalize_filename(name: str) -> str:
+    """
+    Canonical form for comparing a local filename with a library path
+    basename: AzuraCast rewrites names on upload (lowercase, spaces to
+    underscores, possibly accent transliteration), so only the
+    alphanumeric skeleton is stable across versions.
+    """
+    decomposed = unicodedata.normalize("NFKD", name.lower())
+    return "".join(c for c in decomposed if c.isalnum() and c.isascii())
+
+
 class TrackFeatures(TypedDict):
     """Track features extracted from ID3 tags (v2.0 with circumplex model)."""
     artist: str
@@ -229,19 +242,32 @@ class ClassifyClient(BaseAzuraCastClient):
             logger.error("Failed to fetch playlists: %s", e)
             raise
 
-    def get_existing_paths(self) -> set[str]:
+    def get_existing_track_keys(self) -> set[str]:
         """
-        Get set of existing file paths.
+        Get the set of track keys (normalized artist - title) already in
+        the library.
+
+        Keyed on metadata, not the file path: AzuraCast sanitizes stored
+        filenames (lowercase, underscores) and preserves non-Latin scripts
+        verbatim, so a path-based skeleton can both miss real duplicates
+        and collide across distinct non-Latin titles. Artist/title survive
+        upload untouched and are the same identity download.py dedups on.
 
         Returns:
-            Set of lowercase file paths.
+            Set of normalized track keys (files without artist/title are
+            skipped — they cannot be matched by identity anyway).
 
         Raises:
             HTTPConnectionError: If AzuraCast is unreachable.
         """
         try:
             data = self.get_station_files()
-            return {f["path"].lower() for f in data}
+            keys = set()
+            for f in data:
+                artist, title = f.get("artist") or "", f.get("title") or ""
+                if artist and title:
+                    keys.add(normalize_track_key(artist, title))
+            return keys
         except (ClientError, ServerError, HTTPConnectionError) as e:
             logger.error("Failed to fetch existing files: %s", e)
             raise
@@ -310,16 +336,23 @@ class ClassifyClient(BaseAzuraCastClient):
 
             if not uploaded_file:
                 # Fallback for AzuraCast versions with an empty upload response:
-                # exact basename match against the library, never "most recent".
+                # normalized basename match against the library, never "most
+                # recent". Normalized because AzuraCast sanitizes filenames on
+                # upload (e.g. "St. Vincent - Marry Me.mp3" is stored as
+                # "st._vincent_-_marry_me.mp3" since the 2026-07 update), so an
+                # exact comparison never matches; stripping everything but
+                # alphanumerics survives any space/underscore/case policy.
+                # Ambiguity (0 or >1 matches) still fails safe.
                 time.sleep(1)
                 try:
                     data = self.get_station_files()
                 except (ClientError, ServerError, HTTPConnectionError):
                     return None
-                fname_lower = filename.lower()
+                wanted = _normalize_filename(filename)
                 matches = [
                     f for f in data
-                    if f.get("path", "").lower().rsplit("/", 1)[-1] == fname_lower
+                    if _normalize_filename(
+                        f.get("path", "").rsplit("/", 1)[-1]) == wanted
                 ]
                 if len(matches) == 1:
                     uploaded_file = matches[0]
@@ -648,7 +681,8 @@ def process_track(
         filepath: Path to track.
         client: AzuraCast client.
         playlists: Available playlists (daypart name -> ID).
-        existing: Set of existing file paths.
+        existing: Set of track keys already in the library (normalized
+            artist - title), from client.get_existing_track_keys().
         track_db: Optional persistent track database.
 
     Returns:
@@ -658,12 +692,12 @@ def process_track(
     filename = filepath.name
     logger.info("\n%s", filename)
 
-    # Check duplicate — exact basename match only. Bidirectional substring
-    # matching used to let short names match unrelated paths, deleting
-    # never-uploaded tracks.
-    name_lower = filename.lower()
-    candidates = {name_lower, name_lower.replace(" ", "_")}
-    if any(e.rsplit("/", 1)[-1] in candidates for e in existing):
+    # Check duplicate by identity (artist - title), not filename: it is the
+    # signal the server preserves faithfully across its own sanitization,
+    # and the same one download.py dedups on. A file with unreadable tags
+    # (key is None) falls through to the mood check below, which rejects it.
+    track_key = _track_key_of_file(filepath)
+    if track_key and track_key in existing:
         logger.info("  Skipped: already exists")
         filepath.unlink()
         return "skipped", []
@@ -789,7 +823,12 @@ def process_track(
         return "failed", []
 
 
-def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_tracks_count: int) -> int:
+def enforce_tiered_rotation(
+    client: ClassifyClient,
+    track_db: TrackDB,
+    new_tracks_count: int,
+    pending_keys: set[str] | None = None,
+) -> int:
     """
     Enforce 3-tier track rotation for discovery webradio.
 
@@ -803,6 +842,9 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
         client: AzuraCast client.
         track_db: Persistent track database.
         new_tracks_count: Number of new tracks to be added.
+        pending_keys: Track keys of tonight's batch (and carryovers) still
+            on disk — not yet in track_db, but their fresh CLAP embeddings
+            must survive the prune below.
 
     Returns:
         Number of tracks deleted.
@@ -1082,6 +1124,7 @@ def enforce_tiered_rotation(client: ClassifyClient, track_db: TrackDB, new_track
         from audio_embeddings import EmbeddingStore
 
         valid_keys = {t["track_key"] for t in track_db.get_active_tracks()}
+        valid_keys |= pending_keys or set()
         removed = EmbeddingStore(Path(__file__).parent.parent / "data").prune(valid_keys)
         if removed:
             logger.info("Embedding store: pruned %d stale entries", removed)
@@ -1192,9 +1235,9 @@ def _main_inner(
         logger.warning("Missing playlists: %s", len(missing))
         logger.warning("Run setup_playlists.py to create missing playlists")
 
-    # Get existing files (with retry logic)
+    # Get existing track keys (with retry logic)
     try:
-        existing = client.get_existing_paths()
+        existing = client.get_existing_track_keys()
     except (ClientError, ServerError, HTTPConnectionError) as e:
         logger.error("Cannot fetch existing files: %s", e)
         logger.error("Aborting to prevent duplicates.")
@@ -1204,14 +1247,16 @@ def _main_inner(
 
     # Enforce tiered rotation ALWAYS (even with 0 new files)
     try:
-        rotation_deleted = enforce_tiered_rotation(client, track_db, len(files))
+        pending_keys = {k for k in (_track_key_of_file(f) for f in files) if k}
+        rotation_deleted = enforce_tiered_rotation(
+            client, track_db, len(files), pending_keys)
     except (ClientError, ServerError, HTTPConnectionError) as e:
         logger.warning("Rotation check failed: %s", e)
         # Continue anyway - rotation is not critical
 
-    # Refresh existing paths after rotation
+    # Refresh existing track keys after rotation
     try:
-        existing = client.get_existing_paths()
+        existing = client.get_existing_track_keys()
     except (ClientError, ServerError, HTTPConnectionError):
         pass  # Use previous set if refresh fails
 
