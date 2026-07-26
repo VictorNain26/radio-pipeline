@@ -101,7 +101,8 @@ def test_taste_rejection_records_verdict_in_process_track(
         monkeypatch, track_file, db, _features(), taste_score=0.10,
     )
 
-    assert status == "rejected"
+    # Statut distinct : le récap annonce « hors couleur » ce seul motif-là.
+    assert status == "rejected_taste"
     v = db.get_verdict("artiste - titre")
     assert v["verdict"] == "rejected_taste"
     assert v["score"] == pytest.approx(0.10)

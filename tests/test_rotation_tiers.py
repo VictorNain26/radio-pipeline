@@ -228,6 +228,7 @@ def test_rotation_clears_ghost_rows(tmp_path, monkeypatch):
     """
     import audio_embeddings
     import classify
+    import library_state
     from classify import enforce_tiered_rotation
     from track_db import TrackDB
 
@@ -254,7 +255,12 @@ def test_rotation_clears_ghost_rows(tmp_path, monkeypatch):
     # sans rapport avec ce qu'on teste : le rapport de réconciliation, et le
     # prune du store CLAP. Ce dernier est destructif — il ne garderait que les
     # clés de la base jouet et réécrirait embeddings.npy. On neutralise.
-    monkeypatch.setattr(classify, "_write_reconcile_report", lambda report: None)
+    monkeypatch.setattr(classify, "RECONCILE_REPORT_PATH",
+                        tmp_path / "last_reconcile.json")
+    # Station jouet à deux lignes : le plancher de vraisemblance de la
+    # réconciliation (50 fichiers) refuserait le scénario.
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_FILES", 0)
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_RATIO", 0.0)
 
     class _NoopStore:
         def __init__(self, data_dir):

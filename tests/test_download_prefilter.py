@@ -155,7 +155,14 @@ def test_prefilter_is_stable_within_a_source(db):
     assert [t["title"] for t in survivors] == [str(i) for i in range(5)]
 
 
-def test_prefilter_records_verdict_for_blocked_genre(db):
+def test_blocked_genre_is_counted_but_never_recorded_as_a_verdict(db):
+    """Un genre déduit de métadonnées floues ne vaut pas un bannissement à vie.
+
+    Le morceau est écarté pour cette nuit (compteur + log), pas jugé : rien
+    n'entre au registre, car une collision d'homonymes dans MusicBrainz /
+    Discogs / Last.fm bannirait un morceau légitime pour toujours, sans que
+    personne ne le voie.
+    """
     from download import prefilter_candidates
 
     class _Blocking:
@@ -174,4 +181,4 @@ def test_prefilter_records_verdict_for_blocked_genre(db):
 
     assert survivors == []
     assert counts["blocked_genre"] == 1
-    assert db.get_verdict("metal - band")["verdict"] == "blocked_genre"
+    assert db.get_verdict("metal - band") is None

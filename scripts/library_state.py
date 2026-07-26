@@ -23,10 +23,16 @@ est une alerte. Il ne déclenche jamais de suppression : le disque ne
 décide de rien. Un dossier absent, non monté ou illisible rend le contrôle
 indisponible, jamais le run.
 
+Parce qu'elle désactive tout ce qu'AzuraCast ne lui montre pas, la
+réconciliation refuse de tourner sur une liste invraisemblable : voir
+RECONCILE_MIN_FILES / RECONCILE_MIN_RATIO et LibraryStateError.
+
 Ce module ne fait aucun appel réseau : l'appelant lui passe la liste de
-fichiers déjà récupérée.
+fichiers déjà récupérée. Il persiste en revanche le rapport de la nuit
+(`report_path`), en cumulant les deux passes du run — voir _persist_report.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -38,11 +44,36 @@ from track_db import TrackDB, normalize_track_key
 logger = logging.getLogger(__name__)
 
 
+class LibraryStateError(Exception):
+    """Réconciliation refusée : l'état source est invraisemblable."""
+
+
+# Garde-fous sur la liste reçue d'AzuraCast. reconcile() désactive TOUTE ligne
+# active dont le file_id manque à cette liste : un 200 tronqué ou vide (glitch
+# d'API, proxy, mise à jour en cours) désactiverait la librairie entière, et
+# enforce_tiered_rotation purgerait dans la foulée le store CLAP contre un
+# valid_keys vide — 40 à 55 minutes de vecteurs perdus, irrécupérables sans
+# les fichiers audio.
+#
+# Le compromis est asymétrique, d'où les seuils : une suppression massive
+# volontaire est rare et se rattrape (relancer en desserrant le seuil) ; un
+# aléa réseau est fréquent et ce qu'il détruit ne se rattrape pas.
+RECONCILE_MIN_FILES = 50
+RECONCILE_MIN_RATIO = 0.5
+
+# Fenêtre pendant laquelle deux réconciliations sont réputées appartenir à la
+# même nuit (download.py au début, classify.py plus tard). Voir _persist_report.
+RECONCILE_REPORT_MERGE_WINDOW_S = 6 * 3600
+
+
 @dataclass
 class ReconcileReport:
     """Ce que la réconciliation a constaté et corrigé."""
 
     az_files: int = 0
+    # Sous-ensemble .mp3 de az_files, seule grandeur comparable au disque.
+    # None = l'API n'expose pas les chemins : comparaison impossible.
+    az_mp3_files: int | None = None
     db_active_before: int = 0
     ghosts_cleared: int = 0
     untracked_registered: int = 0
@@ -81,10 +112,70 @@ def count_media_files(media_dir: Path | None) -> int | None:
         return None
 
 
+def _count_az_mp3(files: list[dict[str, Any]]) -> int | None:
+    """
+    Nombre de .mp3 parmi les fichiers vus par l'API, ou None si indécidable.
+
+    Comparer le total API au nombre de .mp3 sur disque ferait passer le
+    moindre upload non-mp3 (jingle wav, ogg) pour une désynchro permanente.
+    On compare ce qui est comparable. Si aucun fichier n'expose de chemin,
+    le contrôle est indisponible — jamais faussement alarmant.
+    """
+    paths = [str(f.get("path") or f.get("filename") or "") for f in files]
+    if not any(paths):
+        return None
+    return sum(1 for p in paths if p.lower().endswith(".mp3"))
+
+
+def _persist_report(report: ReconcileReport, path: Path) -> None:
+    """
+    Écrire (ou fusionner) le rapport de la nuit, pour le récap quotidien.
+
+    Une nuit réconcilie deux fois : download.py au démarrage, puis classify.py
+    avant la rotation. La première passe corrige tout ; la seconde ne voit
+    plus rien à corriger. Écraser donnerait un rapport à zéro et l'alerte
+    « N fantômes corrigés » ne partirait jamais. On somme donc les corrections
+    sur la fenêtre d'un run.
+
+    Appartenance au même run : la mtime du fichier précédent. Un run est une
+    chaîne d'une à deux heures lancée une fois par jour ; deux runs distincts
+    sont à 24 h d'écart, très au-delà de la fenêtre. Et une relance manuelle
+    dans la fenêtre n'invente rien : reconcile est idempotente, la seconde
+    passe ajoute 0 à chaque compteur.
+
+    Les grandeurs d'état (fichiers vus, disque, lignes actives) ne se somment
+    pas : le dernier écrivain fait foi, c'est la photo la plus récente.
+
+    Jamais fatale : un récap muet vaut mieux qu'une nuit interrompue.
+    """
+    payload = {
+        "az_files": report.az_files,
+        "az_mp3_files": report.az_mp3_files,
+        "db_active_before": report.db_active_before,
+        "ghosts_cleared": report.ghosts_cleared,
+        "untracked_registered": report.untracked_registered,
+        "keys_repaired": report.keys_repaired,
+        "disk_files": report.disk_files,
+        "disk_drift": report.disk_drift,
+    }
+    try:
+        if path.exists() and (time.time() - path.stat().st_mtime) < RECONCILE_REPORT_MERGE_WINDOW_S:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict):
+                for cumulative in ("ghosts_cleared", "untracked_registered",
+                                   "keys_repaired"):
+                    payload[cumulative] += int(previous.get(cumulative) or 0)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("Écriture de %s impossible : %s", path, e)
+
+
 def reconcile(
     files: list[dict[str, Any]],
     track_db: TrackDB,
     media_dir: Path | None = None,
+    report_path: Path | None = None,
 ) -> ReconcileReport:
     """
     Aligner la base sur la liste de fichiers AzuraCast.
@@ -93,18 +184,48 @@ def reconcile(
         files: Fichiers tels que renvoyés par l'API AzuraCast.
         track_db: Base persistante à réconcilier.
         media_dir: Dossier média, pour le contrôle de cohérence en lecture seule.
+        report_path: Où persister le rapport pour le récap. None = ne rien
+            écrire (défaut : aucun appel ne touche le disque par accident,
+            les tests notamment).
 
     Returns:
         Rapport chiffré, dont `library_keys` : les clés normalisées
         réellement présentes à l'antenne, pour déduplication en amont.
+
+    Raises:
+        LibraryStateError: La liste reçue est inexploitable ou trop courte
+            pour être crue. Rien n'a été modifié.
     """
+    if not isinstance(files, list) or any(not isinstance(f, dict) for f in files):
+        # Un 200 portant {"error": ...} ferait len() sur des clés et f.get()
+        # sur une chaîne : mieux vaut refuser que réconcilier contre du bruit.
+        raise LibraryStateError(
+            f"réponse AzuraCast inexploitable : {type(files).__name__} "
+            "au lieu d'une liste d'objets — réconciliation abandonnée"
+        )
+
     report = ReconcileReport(az_files=len(files))
 
     active = track_db.get_active_tracks()
     report.db_active_before = len(active)
+
+    if report.db_active_before and (
+        len(files) < RECONCILE_MIN_FILES
+        or len(files) < RECONCILE_MIN_RATIO * report.db_active_before
+    ):
+        raise LibraryStateError(
+            f"liste AzuraCast suspecte : {len(files)} fichiers pour "
+            f"{report.db_active_before} lignes actives — réconciliation abandonnée"
+        )
+
     by_file_id = {t["azuracast_file_id"]: t for t in active}
 
     seen_ids: set[int] = set()
+    # Clés que la boucle des fichiers a (ré)activées. L'instantané by_file_id
+    # date d'AVANT : si AzuraCast a réattribué l'id d'un morceau, il y reste
+    # sous son ancien id et la boucle des fantômes désactiverait la ligne
+    # qu'on vient de réparer — même clé, décision inverse.
+    claimed_keys: set[str] = set()
 
     for f in files:
         file_id = f.get("id")
@@ -165,6 +286,7 @@ def reconcile(
                 file_id,
             )
             report.untracked_registered += 1
+            claimed_keys.add(key)
         elif known["track_key"] != key:
             # AzuraCast a réécrit les métadonnées : on suit la clé plutôt
             # que de laisser un doublon s'installer.
@@ -174,9 +296,10 @@ def reconcile(
                     known["track_key"], key, file_id,
                 )
                 report.keys_repaired += 1
+                claimed_keys.add(key)
 
     for file_id, track in by_file_id.items():
-        if file_id in seen_ids:
+        if file_id in seen_ids or track["track_key"] in claimed_keys:
             continue
         # Le fichier a disparu d'AzuraCast (suppression manuelle, incident
         # de mise à jour) : la ligne ne doit plus compter dans la rotation.
@@ -187,13 +310,14 @@ def reconcile(
         )
         report.ghosts_cleared += 1
 
+    report.az_mp3_files = _count_az_mp3(files)
     report.disk_files = count_media_files(media_dir)
-    if report.disk_files is not None:
-        report.disk_drift = abs(report.disk_files - report.az_files)
+    if report.disk_files is not None and report.az_mp3_files is not None:
+        report.disk_drift = abs(report.disk_files - report.az_mp3_files)
         if report.disk_drift:
             logger.warning(
-                "Désynchro dossier/API : %d fichiers sur disque, %d vus par l'API",
-                report.disk_files, report.az_files,
+                "Désynchro dossier/API : %d .mp3 sur disque, %d .mp3 vus par l'API",
+                report.disk_files, report.az_mp3_files,
             )
 
     logger.info(
@@ -202,4 +326,7 @@ def reconcile(
         report.az_files, report.ghosts_cleared,
         report.untracked_registered, report.keys_repaired,
     )
+
+    if report_path is not None:
+        _persist_report(report, report_path)
     return report

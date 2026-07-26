@@ -1,10 +1,19 @@
 """Réconciliation base SQLite ↔ AzuraCast ↔ dossier média."""
 
+import json
+import os
+import time
 from pathlib import Path
 
 import pytest
 
-from library_state import ReconcileReport, count_media_files, reconcile
+import library_state
+from library_state import (
+    LibraryStateError,
+    ReconcileReport,
+    count_media_files,
+    reconcile,
+)
 from track_db import TrackDB
 
 
@@ -15,8 +24,31 @@ def db(tmp_path):
     d.close()
 
 
-def _file(file_id, artist, title, uploaded_at=1_700_000_000.0):
-    return {"id": file_id, "artist": artist, "title": title, "uploaded_at": uploaded_at}
+@pytest.fixture(autouse=True)
+def seuils_desarmes(monkeypatch):
+    """Les scénarios de ce module tiennent en quelques titres.
+
+    Le plancher de vraisemblance (50 fichiers) les refuserait tous. Les
+    tests qui visent le garde-fou lui-même le réarment par `_armer`.
+    """
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_FILES", 0)
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_RATIO", 0.0)
+
+
+def _armer(monkeypatch):
+    """Remettre les seuils de production."""
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_FILES", 50)
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_RATIO", 0.5)
+
+
+def _file(file_id, artist, title, uploaded_at=1_700_000_000.0, path=None):
+    return {
+        "id": file_id,
+        "artist": artist,
+        "title": title,
+        "uploaded_at": uploaded_at,
+        "path": path if path is not None else f"{artist} - {title}.mp3",
+    }
 
 
 def test_ghost_row_is_cleared(db):
@@ -134,6 +166,102 @@ def test_disk_in_sync_reports_zero_drift(tmp_path, db):
     assert report.disk_drift == 0
 
 
+def test_non_mp3_uploads_do_not_create_phantom_drift(tmp_path, db):
+    """Un jingle .wav à l'antenne n'est pas un .mp3 manquant sur disque."""
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "un.mp3").write_bytes(b"x")
+
+    report = reconcile(
+        [
+            _file(1, "A", "B"),
+            _file(2, "Jingle", "Station", path="jingles/station.wav"),
+        ],
+        db,
+        media_dir=media,
+    )
+
+    assert report.az_files == 2
+    assert report.az_mp3_files == 1
+    assert report.disk_drift == 0
+
+
+def test_drift_check_is_unavailable_when_api_hides_paths(tmp_path, db):
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "un.mp3").write_bytes(b"x")
+
+    report = reconcile([{"id": 1, "artist": "A", "title": "B"}], db, media_dir=media)
+
+    assert report.az_mp3_files is None
+    assert report.disk_drift is None
+
+
+# ---------------------------------------------------------------------------
+# Rapport de la nuit : les corrections des deux passes doivent s'additionner
+# ---------------------------------------------------------------------------
+
+def test_report_is_written_when_a_path_is_given(tmp_path, db):
+    path = tmp_path / "last_reconcile.json"
+    db.record_upload("fantome - x", "Fantome", "X", file_id=99)
+
+    reconcile([_file(1, "A", "B")], db, report_path=path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["ghosts_cleared"] == 1
+    assert payload["az_files"] == 1
+
+
+def test_no_report_is_written_without_a_path(tmp_path, db):
+    reconcile([_file(1, "A", "B")], db)
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_second_pass_of_the_night_adds_up_instead_of_erasing(tmp_path, db):
+    """download.py corrige, classify.py ne voit plus rien : l'alerte doit survivre."""
+    path = tmp_path / "last_reconcile.json"
+    db.record_upload("fantome - x", "Fantome", "X", file_id=99)
+    db.record_upload("vivant - y", "Vivant", "Y", file_id=1)
+
+    reconcile([_file(1, "Vivant", "Y")], db, report_path=path)
+    # Seconde passe, même nuit : idempotente, elle ne corrige plus rien.
+    reconcile([_file(1, "Vivant", "Y")], db, report_path=path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["ghosts_cleared"] == 1
+
+
+def test_a_report_older_than_the_window_starts_a_new_run(tmp_path, db):
+    path = tmp_path / "last_reconcile.json"
+    path.write_text(json.dumps({"ghosts_cleared": 7}), encoding="utf-8")
+    vieux = time.time() - library_state.RECONCILE_REPORT_MERGE_WINDOW_S - 60
+    os.utime(path, (vieux, vieux))
+
+    reconcile([_file(1, "A", "B")], db, report_path=path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["ghosts_cleared"] == 0
+
+
+def test_an_unreadable_previous_report_never_aborts_the_run(tmp_path, db):
+    path = tmp_path / "last_reconcile.json"
+    path.write_text("{ pas du json", encoding="utf-8")
+
+    report = reconcile([_file(1, "A", "B")], db, report_path=path)
+
+    assert report.untracked_registered == 1
+
+
+def test_an_unwritable_report_path_never_aborts_the_run(tmp_path, db):
+    # Un dossier là où on attend un fichier : l'écriture échoue à coup sûr.
+    path = tmp_path / "last_reconcile.json"
+    path.mkdir()
+
+    report = reconcile([_file(1, "A", "B")], db, report_path=path)
+
+    assert report.untracked_registered == 1
+
+
 def test_count_media_files_handles_none():
     assert count_media_files(None) is None
 
@@ -142,6 +270,110 @@ def test_report_defaults_are_zero():
     r = ReconcileReport()
     assert r.ghosts_cleared == 0
     assert r.library_keys == set()
+
+
+# ---------------------------------------------------------------------------
+# Un file_id réattribué ne doit pas défaire la réparation qui vient d'être faite
+# ---------------------------------------------------------------------------
+
+def test_reassigned_file_id_is_adopted_and_not_undone_as_a_ghost(db):
+    """AzuraCast a réattribué l'id du morceau (retrait + ré-ajout, rescan média).
+
+    La première boucle adopte le nouvel id sur la ligne existante ; la
+    seconde boucle itère un instantané pris AVANT et y voit encore l'ancien
+    id. Sans garde, elle appelle record_deletion sur LA MÊME clé et annule
+    l'adoption : la ligne devient inactive, `valid_keys` la perd, et le
+    prune du store CLAP détruit définitivement son embedding.
+    """
+    db.record_upload("artiste - titre", "Artiste", "Titre", file_id=10)
+
+    report = reconcile([_file(11, "Artiste", "Titre")], db)
+
+    assert report.ghosts_cleared == 0
+    active = db.get_active_tracks()
+    assert len(active) == 1
+    assert active[0]["track_key"] == "artiste - titre"
+    assert active[0]["azuracast_file_id"] == 11
+
+
+def test_reassigned_file_id_still_clears_a_real_ghost(db):
+    """La garde ne doit pas rendre les vrais fantômes intouchables."""
+    db.record_upload("artiste - titre", "Artiste", "Titre", file_id=10)
+    db.record_upload("parti - ailleurs", "Parti", "Ailleurs", file_id=20)
+
+    report = reconcile([_file(11, "Artiste", "Titre")], db)
+
+    assert report.ghosts_cleared == 1
+    assert {t["track_key"] for t in db.get_active_tracks()} == {"artiste - titre"}
+
+
+# ---------------------------------------------------------------------------
+# Garde-fou : une liste AzuraCast invraisemblable n'efface pas la librairie
+# ---------------------------------------------------------------------------
+
+def _fill(db, n):
+    for i in range(n):
+        db.record_upload(f"a{i} - b", f"A{i}", "B", file_id=i + 1)
+
+
+def test_empty_file_list_aborts_instead_of_deactivating_everything(db, monkeypatch):
+    """Un 200 vide (glitch d'API) ne doit pas vider la base."""
+    _armer(monkeypatch)
+    _fill(db, 200)
+
+    with pytest.raises(LibraryStateError):
+        reconcile([], db)
+
+    assert len(db.get_active_tracks()) == 200
+
+
+def test_file_list_below_the_floor_aborts(db, monkeypatch):
+    _armer(monkeypatch)
+    _fill(db, 200)
+
+    with pytest.raises(LibraryStateError):
+        reconcile([_file(i + 1, f"A{i}", "B") for i in range(40)], db)
+
+    assert len(db.get_active_tracks()) == 200
+
+
+def test_file_list_below_the_ratio_aborts(db, monkeypatch):
+    """80 fichiers pour 200 lignes actives : au-dessus du plancher, sous le ratio."""
+    _armer(monkeypatch)
+    _fill(db, 200)
+
+    with pytest.raises(LibraryStateError):
+        reconcile([_file(i + 1, f"A{i}", "B") for i in range(80)], db)
+
+    assert len(db.get_active_tracks()) == 200
+
+
+def test_a_normal_reconciliation_is_unaffected_by_the_guard(db, monkeypatch):
+    _armer(monkeypatch)
+    _fill(db, 200)
+
+    report = reconcile([_file(i + 1, f"A{i}", "B") for i in range(199)], db)
+
+    assert report.ghosts_cleared == 1
+    assert len(db.get_active_tracks()) == 199
+
+
+def test_guard_does_not_block_a_fresh_database(db, monkeypatch):
+    """Base vide : rien à protéger, l'amorçage doit passer."""
+    _armer(monkeypatch)
+    report = reconcile([_file(1, "A", "B")], db)
+    assert report.untracked_registered == 1
+
+
+def test_non_list_payload_is_rejected(db):
+    """Un 200 portant {"error": ...} ferait len() sur des clés et f.get() sur str."""
+    with pytest.raises(LibraryStateError):
+        reconcile({"error": "boom"}, db)
+
+
+def test_payload_of_non_dicts_is_rejected(db):
+    with pytest.raises(LibraryStateError):
+        reconcile(["boom"], db)
 
 
 def test_healthy_is_false_when_something_was_corrected():

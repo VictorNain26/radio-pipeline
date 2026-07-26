@@ -216,7 +216,9 @@ class TrackDB:
         """Repair a track key when AzuraCast metadata drifts.
 
         Updates the track_key in tracks, audio_fingerprints, and verdicts tables.
-        If new_key already exists, the collision is deleted before the move.
+        If new_key is held by a row that is no longer live (no AzuraCast
+        file_id), that row is deleted to free the key. If it is held by a
+        LIVE row, nothing is repaired: see below.
 
         Args:
             old_key: The current (drifted) track key
@@ -232,7 +234,27 @@ class TrackDB:
         ).fetchone() is None:
             return False
 
-        # Remove any collision at the new key (old file_ids)
+        # Deux fichiers AzuraCast distincts peuvent normaliser vers la même
+        # clé. Écraser la ligne vivante détruirait ses passages, son tier,
+        # son mood et son empreinte, et laisserait ce fichier bien vivant
+        # sans ligne — invisible pour reconcile, dont l'id est pourtant vu
+        # par l'API. Au run suivant il adopterait la ligne de l'autre par
+        # ON CONFLICT, et les deux se la disputeraient indéfiniment.
+        # On préfère ne rien réparer et le dire : un doublon visible vaut
+        # mieux qu'une donnée détruite en silence.
+        collision = self.conn.execute(
+            "SELECT azuracast_file_id FROM tracks WHERE track_key = ?", (new_key,)
+        ).fetchone()
+        if collision is not None and collision["azuracast_file_id"] is not None:
+            logger.warning(
+                "Réparation de clé refusée : %r viserait %r, déjà tenue par "
+                "un fichier vivant (file_id=%s). Les deux morceaux portent la "
+                "même clé normalisée — à arbitrer à la main.",
+                old_key, new_key, collision["azuracast_file_id"],
+            )
+            return False
+
+        # Libérer la clé cible : la ligne qui l'occupe n'est plus à l'antenne.
         self.conn.execute("DELETE FROM tracks WHERE track_key = ?", (new_key,))
         self.conn.execute(
             "UPDATE tracks SET track_key = ? WHERE track_key = ?", (new_key, old_key)

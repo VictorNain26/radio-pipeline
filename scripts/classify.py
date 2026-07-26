@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from http_client import AzuraCastClient as BaseAzuraCastClient, ClientError, HTTPConnectionError, ServerError, compute_file_hashes
 from settings import get_settings, validate_environment
 from track_db import TrackDB, normalize_track_key
-from library_state import ReconcileReport, reconcile
+from library_state import LibraryStateError, reconcile
 
 try:
     from config import (
@@ -201,6 +201,9 @@ logger = logging.getLogger(__name__)
 
 # Constants
 UPLOAD_TIMEOUT = 180
+# Rapport de réconciliation de la nuit, cumulé entre download.py et classify.py
+# et lu par send_daily_recap.py.
+RECONCILE_REPORT_PATH = Path(__file__).parent.parent / "data" / "last_reconcile.json"
 
 
 def _normalize_filename(name: str) -> str:
@@ -691,7 +694,11 @@ def process_track(
 
     Returns:
         Tuple of (status, playlists_assigned).
-        Status: "uploaded", "rejected", "skipped", or "failed".
+        Status: "uploaded", "rejected_taste", "rejected", "skipped", or
+        "failed". Le rejet de goût a son propre statut : c'est le seul qui
+        juge la couleur du morceau, et le récap l'annonce sous ce libellé.
+        Les autres ("rejected") jugent la configuration du moment ou un
+        signal technique — les additionner mentirait sur ce qu'ils mesurent.
     """
     filename = filepath.name
     logger.info("\n%s", filename)
@@ -786,7 +793,7 @@ def process_track(
                 taste_score,
             )
             filepath.unlink()
-            return "rejected", []
+            return "rejected_taste", []
 
     # Assign to daypart playlists. NEW tracks land in HEAVY tier because
     # they're in the grace period (age=0) — full exposure so listeners can
@@ -839,25 +846,6 @@ def process_track(
         return "failed", []
 
 
-def _write_reconcile_report(report: ReconcileReport) -> None:
-    """Persister le rapport de réconciliation pour le récap quotidien."""
-    path = Path(__file__).parent.parent / "data" / "last_reconcile.json"
-    payload = {
-        "az_files": report.az_files,
-        "db_active_before": report.db_active_before,
-        "ghosts_cleared": report.ghosts_cleared,
-        "untracked_registered": report.untracked_registered,
-        "keys_repaired": report.keys_repaired,
-        "disk_files": report.disk_files,
-        "disk_drift": report.disk_drift,
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except OSError as e:
-        logger.warning("Écriture de %s impossible : %s", path, e)
-
-
 def enforce_tiered_rotation(
     client: ClassifyClient,
     track_db: TrackDB,
@@ -900,8 +888,12 @@ def enforce_tiered_rotation(
     files = client.get_all_files()
     settings = get_settings()
     media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
-    report = reconcile(files, track_db, media_dir=media_dir)
-    _write_reconcile_report(report)
+    # reconcile persiste elle-même le rapport, en cumulant sur celui qu'a
+    # déjà écrit download.py plus tôt dans la nuit : cette passe-ci ne trouve
+    # plus rien à corriger, et l'écraser rendrait l'alerte du récap muette.
+    report = reconcile(
+        files, track_db, media_dir=media_dir, report_path=RECONCILE_REPORT_PATH,
+    )
 
     # --- Phase 1: Sync play counts ---
     last_sync = track_db.get_last_sync_timestamp()
@@ -1319,6 +1311,12 @@ def _main_inner(
     logger.info("Existing files: %s", len(existing))
 
     # Enforce tiered rotation ALWAYS (even with 0 new files)
+    # Initialisé avant le try : une rotation en échec laissait la variable
+    # non liée, et la persistance des stats plus bas levait un
+    # UnboundLocalError hors du seul OSError qu'elle rattrape. classify
+    # sortait alors en erreur, run.sh coupait la nuit, et le récap — donc
+    # la seule preuve que tout s'est bien passé — n'était jamais envoyé.
+    rotation_deleted = 0
     try:
         pending_keys = {k for k in (_track_key_of_file(f) for f in files) if k}
         rotation_deleted = enforce_tiered_rotation(
@@ -1326,6 +1324,11 @@ def _main_inner(
     except (ClientError, ServerError, HTTPConnectionError) as e:
         logger.warning("Rotation check failed: %s", e)
         # Continue anyway - rotation is not critical
+    except LibraryStateError as e:
+        # La liste AzuraCast n'est pas crédible : rien n'a été touché en base.
+        # On saute la rotation (et le prune CLAP qu'elle déclenche), mais les
+        # uploads de la nuit doivent aboutir — ils ne dépendent pas d'elle.
+        logger.warning("Rotation sautée, état de librairie douteux : %s", e)
 
     # Refresh existing track keys after rotation
     try:
@@ -1341,6 +1344,13 @@ def _main_inner(
     # Initialize stats
     results: dict[str, int] = {
         "uploaded": 0,
+        # Deux motifs de rejet, jamais confondus : `rejected_taste` juge la
+        # couleur du morceau (c'est lui, et lui seul, que le récap annonce
+        # « hors couleur »), `rejected_other` couvre le mood désactivé, le
+        # BPM hors bornes, l'absence de créneau, la durée et le filtre
+        # multi-signal. `rejected` reste leur somme, pour compatibilité.
+        "rejected_taste": 0,
+        "rejected_other": 0,
         "rejected": 0,
         "skipped": 0,
         "failed": 0,
@@ -1374,16 +1384,22 @@ def _main_inner(
         status, assigned_playlists = process_track(
             filepath, client, playlists, existing, track_db
         )
-        results[status] += 1
+        results["rejected_other" if status == "rejected" else status] += 1
 
         # Count assignments per playlist
         for pl in assigned_playlists:
             playlist_counts[pl] = playlist_counts.get(pl, 0) + 1
 
+    # `rejected` n'est plus incrémenté nulle part : c'est la somme des deux
+    # motifs, conservée pour tout lecteur historique du fichier de stats.
+    results["rejected"] = results["rejected_taste"] + results["rejected_other"]
+
     # Print results
     logger.info("\n=== Results ===")
     logger.info("  Uploaded: %s", results['uploaded'])
-    logger.info("  Rejected: %s", results['rejected'])
+    logger.info("  Rejected: %s (hors couleur %s, autres motifs %s)",
+                results['rejected'], results['rejected_taste'],
+                results['rejected_other'])
     logger.info("  Skipped: %s", results['skipped'])
     logger.info("  Failed: %s", results['failed'])
     if results["quota"]:

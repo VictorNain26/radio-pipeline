@@ -235,22 +235,46 @@ def test_repair_track_key_empty_keys(db):
     assert db.repair_track_key("a - b", "") is False
 
 
-def test_repair_track_key_with_collision(db):
-    """When new key exists, the old collision is deleted first."""
+def test_repair_track_key_with_dead_collision(db):
+    """La clé cible est occupée par une ligne morte : on la libère."""
     db.record_upload("ancien - titre", "Ancien", "Titre", file_id=7)
     db.record_fingerprint("ancien - titre", "HASH1", 200)
 
     db.record_upload("nouveau - titre", "Nouveau", "Titre", file_id=99)
     db.record_fingerprint("nouveau - titre", "HASH2", 180)
+    db.record_deletion("nouveau - titre")  # plus de file_id : ligne d'archive
 
-    # Repair: old track moves to new key, collision is deleted
     assert db.repair_track_key("ancien - titre", "nouveau - titre") is True
 
-    # After repair, only one row at "nouveau - titre" with file_id=7
     rows = db.conn.execute(
         "SELECT track_key, azuracast_file_id FROM tracks WHERE track_key = 'nouveau - titre'"
     ).fetchall()
     assert len(rows) == 1
     assert rows[0]["azuracast_file_id"] == 7
+
+
+def test_repair_track_key_refuses_to_destroy_a_live_collision(db):
+    """Deux fichiers AzuraCast distincts normalisent vers la même clé.
+
+    Écraser la ligne vivante détruirait ses passages, son tier et son
+    empreinte, et laisserait un fichier bien vivant sans ligne — invisible
+    pour reconcile, puisque son id est bien vu par l'API. Les deux lignes
+    s'échangeraient ensuite la même clé à chaque run.
+    """
+    db.record_upload("ancien - titre", "Ancien", "Titre", file_id=7)
+    db.record_upload("nouveau - titre", "Nouveau", "Titre", file_id=99)
+    db.conn.execute(
+        "UPDATE tracks SET play_count = 42, tier = 'GOLD' WHERE track_key = 'nouveau - titre'"
+    )
+    db.conn.commit()
+
+    assert db.repair_track_key("ancien - titre", "nouveau - titre") is False
+
+    # Rien n'a bougé : les deux lignes sont intactes.
+    vivante = db.get_track_by_file_id(99)
+    assert vivante["track_key"] == "nouveau - titre"
+    assert vivante["play_count"] == 42
+    assert vivante["tier"] == "GOLD"
+    assert db.get_track_by_file_id(7)["track_key"] == "ancien - titre"
 
 

@@ -41,10 +41,19 @@ MAX_MESSAGE_CHARS = 900
 
 
 def _read(name: str) -> dict:
+    """
+    Lire un fichier de stats, ou rien.
+
+    Dernier chemin restant vers une sortie non nulle du récap : un fichier
+    tronqué en plein caractère lève UnicodeDecodeError (un ValueError, pas
+    un JSONDecodeError), et un JSON valide mais non-objet ("null", une
+    liste) traverserait la lecture pour casser plus loin sur `.get`.
+    """
     try:
-        return json.loads((DATA_DIR / name).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads((DATA_DIR / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def truncate(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
@@ -95,9 +104,13 @@ def _alerts(stats: dict[str, dict]) -> list[str]:
     if rec.get("keys_repaired"):
         out.append(f"⚠️ {rec['keys_repaired']} clés réparées (métadonnées modifiées)")
     if rec.get("disk_drift"):
+        # az_mp3_files, pas az_files : le disque n'est compté qu'en .mp3.
+        vus = rec.get("az_mp3_files")
+        if vus is None:
+            vus = rec.get("az_files")
         out.append(
-            f"⚠️ Dossier désynchronisé : {rec.get('disk_files')} fichiers "
-            f"sur disque vs {rec.get('az_files')} vus par l'API"
+            f"⚠️ Dossier désynchronisé : {rec.get('disk_files')} .mp3 "
+            f"sur disque vs {vus} vus par l'API"
         )
     if dl.get("loudnorm_failed"):
         out.append(f"⚠️ {dl['loudnorm_failed']} titres non normalisés (loudnorm)")
@@ -124,23 +137,23 @@ def build_message(stats: dict[str, dict]) -> str:
 
     lines = [f"🎵 AubeSonore — {datetime.now().strftime('%d/%m')}", "─" * 16]
 
-    a_un_parent = bool(rec.get("az_files"))
-    if a_un_parent:
-        lines.append(f"📻 Radio : {rec['az_files']} titres")
-    if tiers:
-        parts = []
-        for label, key in (("GOLD", "GOLD"), ("heavy", "HEAVY"),
-                           ("medium", "MEDIUM"), ("light", "LIGHT")):
-            if tiers.get(key):
-                parts.append(f"{tiers[key]} {label}")
-        if parts:
-            # Indenter sans parent (rapport de réconciliation absent, ou
-            # az_files à 0) donne un fragment orphelin sous la barre, qui se
-            # lit comme un bug d'affichage. Sans parent, la ligne se tient
-            # seule. On ne synthétise pas de total depuis les tiers : ce
-            # serait un compte en base présenté sous le libellé d'un compte
-            # vu par l'API, donc un chiffre qui ne dit pas ce qu'il mesure.
-            lines.append(("   " if a_un_parent else "📻 ") + " · ".join(parts))
+    # Le total et sa répartition sortent de la MÊME requête, au même instant.
+    # az_files datait de la réconciliation de classify, donc d'avant les
+    # uploads et les suppressions de rotation de la nuit, tandis que les tiers
+    # sont comptés en base à l'heure du récap : le parent et ses enfants
+    # différaient de `uploaded − rotation_deleted` chaque nuit.
+    # az_files ne sert plus que de repli quand la base est indisponible — il
+    # n'y a alors aucune répartition en dessous pour le contredire.
+    total = sum(tiers.values()) if tiers else (rec.get("az_files") or 0)
+    if total:
+        lines.append(f"📻 Radio : {total} titres")
+    parts = []
+    for label, key in (("GOLD", "GOLD"), ("heavy", "HEAVY"),
+                       ("medium", "MEDIUM"), ("light", "LIGHT")):
+        if tiers.get(key):
+            parts.append(f"{tiers[key]} {label}")
+    if parts:
+        lines.append("   " + " · ".join(parts))
 
     if classify:
         lines.append("")
@@ -148,20 +161,35 @@ def build_message(stats: dict[str, dict]) -> str:
                      f"🗑 {classify.get('rotation_deleted', 0)} retirés")
         if classify.get("carryover"):
             lines.append(f"💎 {classify['carryover']} en attente pour demain")
-        # Deux motifs distincts, jamais additionnés : le quota juge le
-        # calendrier, le filtre de goût juge le morceau.
+        # Trois motifs distincts, jamais additionnés : le quota juge le
+        # calendrier, le filtre de goût juge la couleur du morceau, et le
+        # reste (mood désactivé, BPM, durée, signal multi-source) juge les
+        # réglages du moment. « hors couleur » ne recouvre que le deuxième.
         if classify.get("quota"):
             lines.append(f"🔇 {classify['quota']} évincés (quota plein, pas un rejet)")
-        if classify.get("rejected"):
-            lines.append(f"🚫 {classify['rejected']} hors couleur")
+        if classify.get("rejected_taste"):
+            lines.append(f"🚫 {classify['rejected_taste']} hors couleur")
+        if classify.get("rejected_other"):
+            lines.append(f"⚙️ {classify['rejected_other']} écartés "
+                         f"(réglages, durée, signal)")
 
     if discover or download:
         lines.append("")
         lines.append(f"🔍 {discover.get('deduped_total', 0)} candidats → "
                      f"{download.get('downloaded', 0)} téléchargés")
         if download.get("prefiltered"):
+            # Les six motifs réels de la phase à froid. La durée n'en est
+            # pas : ce filtre-là tourne à chaud, sur le fichier téléchargé.
             lines.append(f"   {download['prefiltered']} écartés avant DL "
-                         f"(déjà vus, genre, durée)")
+                         f"(à l'antenne, doublon du lot, cooldown, "
+                         f"déjà jugé, genre, sans métadonnées)")
+        # Le budget vaut 0 quand downloads/ est déjà plein : sans cette
+        # ligne, plusieurs nuits à « 0 téléchargés » se lisent comme un
+        # pipeline en panne. `== 0` et non `not` : une clé absente d'un
+        # vieux fichier de stats vaut None, et ne doit rien afficher.
+        if download.get("budget") == 0 and download.get("carryover_on_disk"):
+            lines.append(f"💤 Stock suffisant : {download['carryover_on_disk']} "
+                         f"en attente, aucun téléchargement")
 
     alerts = _alerts(stats)
     if alerts:
@@ -233,7 +261,12 @@ def main() -> int:
         return 0
 
     if not settings.callmebot_apikey or not settings.whatsapp_phone:
-        logger.info("CallMeBot non configuré — envoi WhatsApp sauté")
+        # Le repli ntfy existe pour qu'un récap ne disparaisse jamais en
+        # silence. Sortir avant lui le rendait inatteignable dans le cas
+        # même qu'il devait couvrir : WhatsApp indisponible.
+        logger.info("CallMeBot non configuré — bascule sur ntfy")
+        if send_ntfy(message):
+            logger.info("Récap envoyé via ntfy")
         return 0
 
     if not send_whatsapp(message, settings.whatsapp_phone, settings.callmebot_apikey):

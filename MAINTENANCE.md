@@ -203,11 +203,10 @@ Réconcilier à la main.
 
 > ⚠️ **Cette commande écrit dans `data/tracks.db`.** `reconcile()` désactive
 > *toute* ligne active dont le `file_id` est absent de la liste renvoyée par
-> l'API — il n'a ni plancher, ni garde de ratio, ni dry-run. Si AzuraCast
-> répond 200 avec une liste tronquée ou vide (instance dégradée,
-> `AZURACAST_STATION_ID` erroné, station renommée), la bibliothèque entière
-> est désactivée d'un coup. Or c'est précisément en situation d'incident,
-> quand l'API n'est pas fiable, qu'on est tenté de lancer ce bloc.
+> l'API. Si AzuraCast répond 200 avec une liste tronquée ou vide (instance
+> dégradée, `AZURACAST_STATION_ID` erroné, station renommée), c'est la
+> bibliothèque entière qui part. Or c'est précisément en situation
+> d'incident, quand l'API n'est pas fiable, qu'on est tenté de lancer ce bloc.
 >
 > Les lignes restent réadoptables, mais la perte n'est pas entièrement
 > réversible : le prochain `classify.py` purge le store CLAP contre les
@@ -215,10 +214,20 @@ Réconcilier à la main.
 > détruits et ne se recalculent qu'à 3-5 s/morceau, modèle et fichiers
 > sources en main.
 >
-> D'où les deux gardes ci-dessous, qui reproduisent celles du chemin de
-> production (`download.py`) : `health_check()` avant tout, puis un plancher
-> sur la taille de la liste. **Ne pas les retirer**, et ajuster le seuil si la
-> bibliothèque change d'ordre de grandeur.
+> D'où le garde-fou **intégré à `reconcile()`** depuis juillet 2026, et donc
+> actif aussi bien ici que sur le chemin de nuit : en dessous de
+> `RECONCILE_MIN_FILES` (50) fichiers, ou de `RECONCILE_MIN_RATIO` (0,5) fois
+> le nombre de lignes actives, il lève `LibraryStateError` **avant toute
+> écriture**. `download.py` en fait un `exit 1` ; `classify.py` saute la
+> rotation et laisse les uploads se faire.
+>
+> Une suppression massive volontaire est donc refusée elle aussi : c'est
+> voulu (rare, et rattrapable en desserrant `RECONCILE_MIN_RATIO` le temps
+> d'un run). Un aléa réseau, lui, est fréquent et ce qu'il détruit ne se
+> rattrape pas.
+>
+> Le `health_check()` et le `assert` ci-dessous restent utiles : ils
+> échouent plus tôt et plus lisiblement. **Ne pas les retirer.**
 
 ```bash
 python3 -c "
