@@ -559,8 +559,35 @@ class RotationCategoryConfig:
     medium_daypart_count: int = 2
     light_daypart_count: int = 1
 
+    # --- Playlists pondérées Discovery/Library (2026-07) -----------------
+    # Chaque daypart existe en deux variantes AzuraCast partageant le même
+    # schedule horaire :
+    #   "<Zone>-Discovery" (poids fort)  ← FRESH + HEAVY prouvés
+    #   "<Zone>"           (poids faible) ← MEDIUM / LIGHT / GOLD
+    # C'est le modèle Currents/Gold des radios tradi : à l'intérieur d'une
+    # playlist AzuraCast tous les titres sont équiprobables, donc la seule
+    # façon d'avoir un tier "heavy" qui tourne réellement plus vite est de
+    # le mettre dans une playlist séparée plus pondérée. Ratio 6:2 → un
+    # titre Discovery passe ~3× plus souvent qu'un titre Library (modulo
+    # la taille relative des deux pools).
+    discovery_suffix: str = "-Discovery"
+    discovery_weight: int = 6
+    library_weight: int = 2
+
 
 ROTATION_CATEGORIES = RotationCategoryConfig()
+
+
+def playlist_name_for_tier(daypart: "DaypartSegment", tier: str) -> str:
+    """
+    Nom de la playlist AzuraCast pour (zone, tier de rotation).
+
+    HEAVY (grace period + hits prouvés) → variante "-Discovery" (poids fort).
+    MEDIUM / LIGHT / GOLD / legacy DISCOVERY → playlist de base (poids faible).
+    """
+    if tier == "HEAVY":
+        return f"{daypart.value}{ROTATION_CATEGORIES.discovery_suffix}"
+    return daypart.value
 
 # =============================================================================
 # DISCOVERY — Sources de découverte multi-RSS + Last.fm
@@ -1001,8 +1028,15 @@ def should_reject_track(features: dict[str, Any]) -> tuple[bool, str | None]:
 
 
 def get_all_playlist_names() -> list[str]:
-    """Génère les noms des zones playlists actuellement actives."""
-    return [daypart.value for daypart in get_enabled_dayparts()]
+    """
+    Noms des playlists actives : pour chaque zone, la variante Library
+    (nom de base) et la variante Discovery (pondérée).
+    """
+    names: list[str] = []
+    for daypart in get_enabled_dayparts():
+        names.append(daypart.value)
+        names.append(f"{daypart.value}{ROTATION_CATEGORIES.discovery_suffix}")
+    return names
 
 
 def format_duration(seconds: int) -> str:

@@ -157,3 +157,61 @@ def test_disabled_config_returns_all_dayparts():
         assert tier_filter_dayparts(dps, "MEDIUM") == dps
     finally:
         cfg.ROTATION_CATEGORIES.enabled = original
+
+
+# --- Discovery/Library weighted playlist variants (2026-07) ---
+
+
+class TestPlaylistNameForTier:
+    """HEAVY (grace + proven) plays from the high-weight Discovery variant;
+    MEDIUM/LIGHT/GOLD play from the low-weight Library (base) playlist."""
+
+    def test_heavy_maps_to_discovery_variant(self):
+        from config import playlist_name_for_tier
+        assert playlist_name_for_tier(DaypartSegment.DAWN, "HEAVY") == "Dawn-Discovery"
+
+    def test_non_heavy_tiers_map_to_base_playlist(self):
+        from config import playlist_name_for_tier
+        for tier in ("MEDIUM", "LIGHT", "GOLD", "DISCOVERY"):
+            assert playlist_name_for_tier(DaypartSegment.NIGHT, tier) == "Night"
+
+    def test_all_playlist_names_includes_both_variants(self):
+        from config import get_all_playlist_names, get_enabled_dayparts
+        names = get_all_playlist_names()
+        for dp in get_enabled_dayparts():
+            assert dp.value in names
+            assert f"{dp.value}-Discovery" in names
+        assert len(names) == 2 * len(get_enabled_dayparts())
+
+    def test_discovery_weight_higher_than_library(self):
+        assert ROTATION_CATEGORIES.discovery_weight > ROTATION_CATEGORIES.library_weight
+
+
+class TestTargetPlaylistNames:
+    """target_playlist_names is the single source of truth for
+    mood+tier → AzuraCast playlist names (upload, re-tier, GOLD,
+    zero-play remediation, reanalysis all delegate to it)."""
+
+    def test_heavy_gets_discovery_variants_of_all_mood_dayparts(self):
+        from classify import target_playlist_names
+        from config import get_dayparts_for_mood
+        names = target_playlist_names("Calm", "HEAVY")
+        expected = [f"{dp.value}-Discovery" for dp in get_dayparts_for_mood("Calm")]
+        assert names == expected
+
+    def test_medium_gets_base_playlists_capped_at_medium_count(self):
+        from classify import target_playlist_names
+        names = target_playlist_names("Calm", "MEDIUM")
+        assert len(names) <= ROTATION_CATEGORIES.medium_daypart_count
+        assert all("-Discovery" not in n for n in names)
+
+    def test_legacy_discovery_tier_behaves_like_light(self):
+        from classify import target_playlist_names
+        assert target_playlist_names("Calm", "DISCOVERY") == \
+               target_playlist_names("Calm", "LIGHT")
+
+    def test_gold_behaves_like_light_on_base_playlists(self):
+        from classify import target_playlist_names
+        names = target_playlist_names("Sad", "GOLD")
+        assert len(names) <= ROTATION_CATEGORIES.light_daypart_count
+        assert all("-Discovery" not in n for n in names)

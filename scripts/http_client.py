@@ -363,12 +363,10 @@ class AzuraCastClient(RobustHTTPClient):
         base_url: str,
         api_key: str,
         station_id: int = 1,
-        verify_upload_integrity: bool = True,
         **kwargs: Any,
     ):
         super().__init__(base_url, api_key, **kwargs)
         self.station_id = station_id
-        self.verify_upload_integrity = verify_upload_integrity
 
     def get_station_files(self) -> list[dict[str, Any]]:
         """Get all files in station library."""
@@ -380,165 +378,35 @@ class AzuraCastClient(RobustHTTPClient):
         response = self.get(f"/api/station/{self.station_id}/playlists")
         return response.json()
 
-    def upload_file(
-        self,
-        filepath: str,
-        playlist_id: int | None = None,
-    ) -> dict[str, Any] | None:
+    def get_playlists_map(self) -> dict[str, int]:
         """
-        Upload a file to station with integrity verification.
+        Get playlist name to ID mapping.
 
-        Best practices 2026:
-        - Computes MD5/SHA-256 before upload
-        - Verifies server-side hash matches (if available)
-        - Logs integrity status for audit trail
-
-        Returns file metadata on success, None on failure.
+        Raises:
+            HTTPConnectionError: If AzuraCast is unreachable.
         """
-        path = Path(filepath)
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {filepath}")
-
-        # Compute hashes before upload for integrity verification
-        local_md5, local_sha256 = compute_file_hashes(path)
-        local_size = path.stat().st_size
-        logger.debug(f"Local file: size={local_size}, MD5={local_md5}, SHA256={local_sha256[:16]}...")
-
         try:
-            with open(filepath, "rb") as f:
-                files = {"file": (path.name, f, "audio/mpeg")}
-                response = self.post(
-                    f"/api/station/{self.station_id}/files",
-                    files=files,
-                )
-
-            if response.status_code in (200, 201):
-                file_data = response.json()
-
-                # Verify upload integrity (best practice 2026)
-                if self.verify_upload_integrity:
-                    integrity_ok = self._verify_upload_integrity(
-                        file_data, local_md5, local_sha256, local_size
-                    )
-                    if not integrity_ok:
-                        logger.error("Upload integrity verification FAILED - file may be corrupted")
-                        # Optionally delete the corrupted upload
-                        if file_id := file_data.get("id"):
-                            self.delete_file(file_id)
-                        return None
-
-                # Add to playlist if specified
-                if playlist_id and "id" in file_data:
-                    self._add_to_playlist(file_data["id"], playlist_id)
-
-                return file_data
-
-            logger.error(f"Upload failed: HTTP {response.status_code}")
-            return None
-
+            return {p["name"]: p["id"] for p in self.get_playlists()}
         except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.error(f"Upload failed: {e}")
-            return None
+            logger.error(f"Failed to fetch playlists: {e}")
+            raise
 
-    def _verify_upload_integrity(
-        self,
-        file_data: dict[str, Any],
-        local_md5: str,
-        local_sha256: str,
-        local_size: int,
-    ) -> bool:
+    def assign_playlists(self, file_id: int, playlist_ids: list[int]) -> bool:
         """
-        Verify uploaded file integrity by comparing hashes.
-
-        AzuraCast returns 'unique_id' which is often the MD5 hash.
-
-        Args:
-            file_data: Response from upload API.
-            local_md5: Pre-computed local MD5.
-            local_sha256: Pre-computed local SHA-256.
-            local_size: Local file size in bytes.
+        Assign file to exactly these playlists (REPLACE semantics).
 
         Returns:
-            True if integrity verified, False otherwise.
+            True if successful.
         """
-        # Check size if available
-        remote_size = file_data.get("size")
-        if remote_size and int(remote_size) != local_size:
-            logger.error(f"Size mismatch: local={local_size}, remote={remote_size}")
-            return False
-
-        # AzuraCast uses unique_id which may be MD5-based
-        unique_id = file_data.get("unique_id", "")
-
-        # Check if unique_id matches MD5 (AzuraCast behavior)
-        if unique_id and len(unique_id) == 32:
-            if unique_id.lower() != local_md5.lower():
-                logger.error(f"MD5 mismatch: local={local_md5}, remote={unique_id}")
-                return False
-            logger.debug(f"Integrity verified: MD5={local_md5}")
-
-        # Check explicit hash fields if present
-        remote_md5 = file_data.get("md5") or file_data.get("hash_md5")
-        if remote_md5 and remote_md5.lower() != local_md5.lower():
-            logger.error(f"MD5 hash mismatch: local={local_md5}, remote={remote_md5}")
-            return False
-
-        remote_sha256 = file_data.get("sha256") or file_data.get("hash_sha256")
-        if remote_sha256 and remote_sha256.lower() != local_sha256.lower():
-            logger.error(f"SHA-256 hash mismatch")
-            return False
-
-        logger.info(f"Upload integrity OK (size={local_size})")
-        return True
-
-    def _add_to_playlist(self, file_id: int, playlist_id: int) -> bool:
-        """Add file to playlist."""
         try:
-            response = self.post(
-                f"/api/station/{self.station_id}/playlists/{playlist_id}/files",
-                json={"file_id": file_id},
+            response = self.put(
+                f"/api/station/{self.station_id}/file/{file_id}",
+                json={"playlists": playlist_ids},
             )
-            return response.status_code in (200, 201)
-        except HTTPError:
+            return response.status_code == 200
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning(f"Failed to assign playlists: {e}")
             return False
-
-    def get_station_history(self, limit: int = 500) -> list[dict[str, Any]]:
-        """
-        Get station play history.
-
-        Returns list of recently played tracks with timestamps.
-        Used to calculate play counts for rotation decisions.
-
-        Args:
-            limit: Maximum entries to retrieve (AzuraCast max ~500).
-
-        Returns:
-            List of history entries with song_id, played_at, etc.
-        """
-        response = self.get(
-            f"/api/station/{self.station_id}/history",
-            params={"limit": limit},
-        )
-        return response.json()
-
-    def get_play_counts(self) -> dict[str, int]:
-        """
-        Calculate play counts for all tracks from history.
-
-        Returns:
-            Dict mapping unique_id -> play_count.
-        """
-        history = self.get_station_history()
-        play_counts: dict[str, int] = {}
-
-        for entry in history:
-            # AzuraCast history uses song.unique_id
-            song = entry.get("song", {})
-            unique_id = song.get("unique_id") or song.get("id")
-            if unique_id:
-                play_counts[str(unique_id)] = play_counts.get(str(unique_id), 0) + 1
-
-        return play_counts
 
     @staticmethod
     def _parse_played_at(value: Any) -> float:

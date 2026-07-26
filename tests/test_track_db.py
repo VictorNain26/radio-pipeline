@@ -105,3 +105,15 @@ def test_concurrent_access_is_safe(db):
         t.join()
     assert not errors
     assert len(db.get_active_tracks()) == 300
+
+
+def test_normalize_track_key_unifies_unicode_quotes():
+    """U+2019 curly apostrophes (ID3 tags) and ASCII ' (AzuraCast metadata)
+    must produce the same key, else play-count sync silently misses tracks
+    (Abdullah Abdelkader stuck at 0 plays for 37 days, 2026-07-19)."""
+    from track_db import normalize_track_key
+    assert normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It’s Your Time)") == \
+           normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It's Your Time)")
+    assert normalize_track_key("Kool and Together", "Sittin’ On A Red Hot Stove") == \
+           "kool and together - sittin on a red hot stove"
+    assert normalize_track_key("X", "“Quoted” ‘Title´") == normalize_track_key("X", '"Quoted" Title')

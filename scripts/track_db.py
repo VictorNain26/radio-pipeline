@@ -19,7 +19,10 @@ def normalize_track_key(artist: str, title: str) -> str:
     """Create normalized key for track comparison (mirrors download.normalize_track_key)."""
     artist = artist.lower().strip()
     title = title.lower().strip()
-    for char in ['(', ')', '[', ']', '"', "'"]:
+    # Unicode quotes/apostrophes must strip like their ASCII forms: ID3 tags
+    # often carry ’ where AzuraCast metadata has ' — divergent keys break
+    # play-count sync (tracks stuck at 0 plays forever).
+    for char in ['(', ')', '[', ']', '"', "'", '’', '‘', '“', '”', '´', '`']:
         artist = artist.replace(char, '')
         title = title.replace(char, '')
     artist = ' '.join(artist.split())

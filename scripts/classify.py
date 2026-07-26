@@ -44,6 +44,7 @@ try:
         get_enabled_dayparts,
         get_current_day_type,
         get_all_playlist_names,
+        playlist_name_for_tier,
         should_reject_track,
         is_mood_enabled,
         format_duration,
@@ -176,6 +177,19 @@ def tier_filter_dayparts(
     # LIGHT (or legacy DISCOVERY)
     return list(mood_dayparts)[: ROTATION_CATEGORIES.light_daypart_count]
 
+
+def target_playlist_names(mood: "MoodCategory | str", tier: str) -> list[str]:
+    """
+    Expected AzuraCast playlist names for a track, from its mood and
+    rotation tier.
+
+    Single source of truth shared by upload, re-tier, GOLD graduation,
+    zero-play remediation and reanalysis: the tier picks how many dayparts
+    (tier_filter_dayparts) and which weight variant (playlist_name_for_tier).
+    """
+    dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), tier)
+    return [playlist_name_for_tier(dp, tier) for dp in dayparts]
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -224,23 +238,6 @@ class ClassifyClient(BaseAzuraCastClient):
 
     Inherits robust HTTP handling from BaseAzuraCastClient.
     """
-
-    def get_playlists_map(self) -> dict[str, int]:
-        """
-        Get playlist name to ID mapping.
-
-        Returns:
-            Dictionary of playlist names to IDs.
-
-        Raises:
-            HTTPConnectionError: If AzuraCast is unreachable.
-        """
-        try:
-            data = self.get_playlists()
-            return {p["name"]: p["id"] for p in data}
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.error("Failed to fetch playlists: %s", e)
-            raise
 
     def get_existing_track_keys(self) -> set[str]:
         """
@@ -387,27 +384,6 @@ class ClassifyClient(BaseAzuraCastClient):
         except OSError as e:
             logger.warning("  File read error: %s", e)
             return None
-
-    def assign_playlists(self, file_id: int, playlist_ids: list[int]) -> bool:
-        """
-        Assign file to multiple playlists.
-
-        Args:
-            file_id: File ID.
-            playlist_ids: List of playlist IDs.
-
-        Returns:
-            True if successful.
-        """
-        try:
-            response = self.put(
-                f"/api/station/{self.station_id}/file/{file_id}",
-                json={"playlists": playlist_ids},
-            )
-            return response.status_code == 200
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning("Failed to assign playlists: %s", e)
-            return False
 
 
 def get_features_from_tags(filepath: str) -> TrackFeatures | None:
@@ -774,13 +750,10 @@ def process_track(
     # actually discover them. They'll be re-tiered after grace_period_days
     # by enforce_tiered_rotation's re-tier pass.
     initial_tier = compute_rotation_tier(play_count=0, age_days=0.0)  # → HEAVY
-    mood_dayparts = get_dayparts_for_mood(mood)
-    tier_dayparts = tier_filter_dayparts(mood_dayparts, initial_tier)
-    assigned_playlists: list[str] = []
-    for segment in tier_dayparts:
-        playlist_name = segment.value
-        if playlist_name in playlists and playlist_name not in assigned_playlists:
-            assigned_playlists.append(playlist_name)
+    assigned_playlists = [
+        name for name in dict.fromkeys(target_playlist_names(mood, initial_tier))
+        if name in playlists
+    ]
 
     if not assigned_playlists:
         logger.warning("  Failed: no playlists found for mood '%s'", mood)
@@ -938,17 +911,44 @@ def enforce_tiered_rotation(
     logger.info("  Expected plays/day: %.2f (measured; config fallback %.2f)",
                 expected_rate, ROTATION_CATEGORIES.expected_plays_per_day)
 
-    # --- Monitor: warn about active tracks with 0 plays after 7+ days ---
+    # Playlist name→id map, shared by the zero-play remediation below and
+    # the GOLD graduation shrink. Non-fatal on failure: both consumers
+    # degrade to their previous warn-only behaviour.
+    playlist_map: dict[str, int] = {}
+    try:
+        playlist_map = client.get_playlists_map()
+    except (ClientError, ServerError, HTTPConnectionError) as e:
+        logger.warning("  Playlist map unavailable (remediation/GOLD shrink skipped): %s", e)
+
+    # --- Monitor: active tracks with 0 plays after 7+ days ---
+    # A track AutoDJ can never pick has two known causes: it lost its
+    # playlist assignment (remediable here), or its play counts don't sync
+    # (metadata key drift — fixed at the normalize_track_key level).
     zero_play_old = [
         e for e in (tiers["CURRENT"] + tiers["FADING"])
         if e["play_count"] == 0 and e["age_days"] > 7
     ]
     if zero_play_old:
-        logger.warning("  ⚠ %s tracks actives > 7j avec 0 plays (possible problème AzuraCast scheduling):", len(zero_play_old))
+        logger.warning("  ⚠ %s tracks actives > 7j avec 0 plays:", len(zero_play_old))
         for e in zero_play_old[:10]:
             logger.warning("    - %s - %s (%.0fj)", e["artist"], e["title"], e["age_days"])
         if len(zero_play_old) > 10:
             logger.warning("    ... et %s autres", len(zero_play_old) - 10)
+
+        # Remediation: re-assert the expected assignment for tracks that
+        # have no playlist at all — those can never be scheduled by AutoDJ.
+        if playlist_map:
+            for e in zero_play_old:
+                if e["playlist_names"] or not e["mood"]:
+                    continue
+                ids = [
+                    playlist_map[name]
+                    for name in target_playlist_names(e["mood"], e["tier_stored"])
+                    if name in playlist_map
+                ]
+                if ids and client.assign_playlists(e["file_id"], ids):
+                    logger.info("    Réassigné (aucune playlist): %s - %s",
+                                e["artist"], e["title"])
 
     deleted_count = 0
 
@@ -958,12 +958,6 @@ def enforce_tiered_rotation(
     gold_cap = int(current_count * ROTATION.gold_max_pct / 100)
     gold_count = len(tiers["GOLD"])
     graduated = 0
-    gold_map: dict[str, int] = {}
-    if tiers["EXPIRED"]:
-        try:
-            gold_map = client.get_playlists_map()
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning("  Playlist map unavailable for GOLD shrink: %s", e)
     # Best candidates graduate first while the cap has room.
     expired_ranked = sorted(
         tiers["EXPIRED"], key=lambda e: e["play_count"], reverse=True)
@@ -984,9 +978,12 @@ def enforce_tiered_rotation(
             )
             # Soft rotation: shrink to LIGHT-style daypart membership.
             mood = entry["mood"]
-            if mood and gold_map:
-                target = tier_filter_dayparts(get_dayparts_for_mood(mood), "GOLD")
-                ids = [gold_map[dp.value] for dp in target if dp.value in gold_map]
+            if mood and playlist_map:
+                ids = [
+                    playlist_map[n]
+                    for n in target_playlist_names(mood, "GOLD")
+                    if n in playlist_map
+                ]
                 if ids:
                     client.assign_playlists(entry["file_id"], ids)
             continue
@@ -1013,7 +1010,12 @@ def enforce_tiered_rotation(
                 deleted_count += 1
 
     # --- Phase 5: Cap total if library + new > max_tracks ---
-    remaining = current_count - deleted_count + new_tracks_count
+    # new_tracks_count is the *staged* file count, but at most
+    # max_uploads_per_night of them are actually uploaded (quota curation);
+    # capping on the staged count over-deleted on carryover-heavy nights,
+    # leaving the library floating at 680-690 instead of max_tracks.
+    expected_additions = min(new_tracks_count, ROTATION.max_uploads_per_night)
+    remaining = current_count - deleted_count + expected_additions
     overflow = max(0, remaining - max_tracks)
 
     if overflow > 0:
@@ -1065,8 +1067,7 @@ def enforce_tiered_rotation(
                 new_tier = compute_rotation_tier(
                     entry["play_count"], entry["age_days"], expected=expected_rate)
 
-                target_dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), new_tier)
-                target_names = {dp.value for dp in target_dayparts}
+                target_names = set(target_playlist_names(mood, new_tier))
                 current_names = entry["playlist_names"]
 
                 # Only push the membership update if the set actually differs.
