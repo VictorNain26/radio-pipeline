@@ -988,6 +988,145 @@ git commit -m "feat(classify): tout rejet est inscrit au registre des verdicts"
 
 ---
 
+### Task 4b : `analyze.py` inscrit le verdict de parole
+
+Découvert pendant la Task 4 : le tableau des verdicts promettait
+`rejected_speech`, mais ce rejet ne vit pas dans `classify.py`. Il est dans
+`analyze.py`, qui supprime le fichier avant que `classify.py` ne le voie — et
+`analyze.py` n'ouvre aucune base. Un podcast capté par un flux RSS ne laisse
+donc **aucune trace** : ni verdict, ni cooldown. Il sera re-téléchargé à
+chaque redécouverte, indéfiniment.
+
+C'est précisément la boucle que ce plan existe pour fermer, sur la catégorie
+la plus susceptible de revenir d'un flux. Sans cette tâche, la Task 5 ne peut
+pas tenir sa promesse.
+
+**Files:**
+- Modify: `scripts/analyze.py:543-560` (le filtre de parole)
+- Test: `tests/test_analyze_speech_verdict.py` (créé)
+
+**Interfaces:**
+- Consumes : `TrackDB.record_verdict` (Task 1), `analyze.resolve_identity`.
+- Produits : après un rejet pour parole, `track_db.get_verdict(clé)` renvoie
+  `rejected_speech`.
+
+- [ ] **Step 1 : Écrire le test qui échoue**
+
+Créer `tests/test_analyze_speech_verdict.py` :
+
+```python
+"""Un rejet pour parole doit laisser une trace, sinon le podcast revient."""
+
+from track_db import TrackDB, normalize_track_key
+
+
+def test_speech_rejection_is_recorded(tmp_path):
+    from analyze import record_speech_rejection
+
+    db = TrackDB(tmp_path / "t.db")
+    record_speech_rejection(db, "Le Podcast", "Épisode 12", 0.91)
+
+    key = normalize_track_key("Le Podcast", "Épisode 12")
+    v = db.get_verdict(key)
+    assert v["verdict"] == "rejected_speech"
+    assert v["score"] == 0.91
+    db.close()
+
+
+def test_speech_verdict_is_permanent(tmp_path):
+    from analyze import record_speech_rejection
+
+    db = TrackDB(tmp_path / "t.db")
+    record_speech_rejection(db, "Le Podcast", "Épisode 12", 0.91)
+
+    key = normalize_track_key("Le Podcast", "Épisode 12")
+    # ttl à 0 : seuls les verdicts périssables tomberaient.
+    assert db.has_active_verdict(key, 0) is True
+    db.close()
+
+
+def test_missing_identity_records_nothing(tmp_path):
+    from analyze import record_speech_rejection
+
+    db = TrackDB(tmp_path / "t.db")
+    record_speech_rejection(db, "", "", 0.91)
+    assert db.get_verdict(" - ") is None
+    db.close()
+
+
+def test_no_db_is_a_noop(tmp_path):
+    from analyze import record_speech_rejection
+
+    # Ne doit pas lever : analyze.py doit rester utilisable sans base.
+    record_speech_rejection(None, "Le Podcast", "Épisode 12", 0.91)
+```
+
+- [ ] **Step 2 : Lancer et vérifier l'échec**
+
+Run : `python3 -m pytest tests/test_analyze_speech_verdict.py -q`
+Expected : FAIL — `ImportError: cannot import name 'record_speech_rejection'`
+
+- [ ] **Step 3 : Implémenter le point d'entrée**
+
+Dans `scripts/analyze.py`, avant `process_file` :
+
+```python
+def record_speech_rejection(
+    track_db: "TrackDB | None", artist: str, title: str, voice_probability: float
+) -> None:
+    """
+    Inscrire un rejet pour parole au registre des verdicts.
+
+    Sans cette trace, un podcast capté par un flux RSS est re-téléchargé
+    à chaque redécouverte : le fichier est supprimé ici, et rien d'autre
+    dans le pipeline ne se souvient de l'avoir jugé.
+
+    Sans identité exploitable, il n'y a rien à mémoriser — le morceau
+    repassera par le téléchargement, ce qui est le comportement voulu :
+    on ne condamne pas ce qu'on n'a pas su identifier.
+    """
+    if track_db is None or not (artist and title):
+        return
+    from track_db import normalize_track_key
+
+    track_db.record_verdict(
+        normalize_track_key(artist, title),
+        "rejected_speech",
+        reason=f"{voice_probability:.0%} de voix",
+        score=voice_probability,
+    )
+```
+
+- [ ] **Step 4 : Câbler le filtre de parole**
+
+Dans le bloc du filtre de parole de `process_file`, juste avant
+`Path(filepath).unlink()` :
+
+```python
+        artist, title = resolve_identity(filepath)
+        record_speech_rejection(track_db, artist, title, features.voice_probability)
+```
+
+`process_file` doit recevoir la base. Ouvrir une seule `TrackDB` dans `main()`
+(`PIPELINE_DIR / "data" / "tracks.db"`), la fermer dans un `finally`, et la
+passer à `process_file` en paramètre facultatif `track_db: "TrackDB | None" = None`
+pour que la fonction reste appelable sans base.
+
+- [ ] **Step 5 : Lancer les tests**
+
+Run : `python3 -m pytest tests/test_analyze_speech_verdict.py -q` puis
+`python3 -m pytest tests/ -q`
+Expected : PASS
+
+- [ ] **Step 6 : Commit**
+
+```bash
+git add scripts/analyze.py tests/test_analyze_speech_verdict.py
+git commit -m "feat(analyze): le rejet pour parole est inscrit au registre"
+```
+
+---
+
 ### Task 5 : `download.py` en deux phases
 
 **Files:**
