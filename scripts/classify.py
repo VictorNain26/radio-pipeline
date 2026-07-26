@@ -602,6 +602,33 @@ def _track_key_of_file(filepath: Path) -> str | None:
     return normalize_track_key(artist, title)
 
 
+def _is_duration_out_of_bounds(duration: int) -> bool:
+    """Tell a duration rejection apart from the other should_reject_track motives."""
+    return bool(
+        (AUDIO_FILTERS.duration_min and duration < AUDIO_FILTERS.duration_min)
+        or (AUDIO_FILTERS.duration_max and duration > AUDIO_FILTERS.duration_max)
+    )
+
+
+def record_rejection(
+    track_db: TrackDB | None,
+    track_key: str | None,
+    verdict: str,
+    reason: str,
+    score: float | None = None,
+) -> None:
+    """
+    Inscrire un rejet au registre pour ne jamais retélécharger ce morceau.
+
+    Sans clé (métadonnées illisibles) il n'y a rien à mémoriser : le
+    morceau repassera par le téléchargement, ce qui est le comportement
+    voulu — on ne condamne pas ce qu'on n'a pas su identifier.
+    """
+    if track_db is None or not track_key:
+        return
+    track_db.record_verdict(track_key, verdict, reason=reason, score=score)
+
+
 def _should_carry_over(
     filepath: Path, taste_score: float, already_carried: int,
 ) -> bool:
@@ -716,6 +743,13 @@ def process_track(
     reject, reason = should_reject_track(reject_features)
     if reject:
         logger.info("  Rejected: %s", reason)
+        # Seule la durée est une propriété du morceau lui-même : elle seule
+        # vaut un verdict. Les autres motifs de should_reject_track (mood
+        # désactivé, BPM hors bornes, aucun créneau pour ce mood) jugent la
+        # configuration du moment ; un verdict permanent bannirait à tort un
+        # morceau qui redeviendrait éligible au prochain réglage.
+        if _is_duration_out_of_bounds(duration):
+            record_rejection(track_db, track_key, "filtered_duration", reason)
         filepath.unlink()
         return "rejected", []
 
@@ -728,6 +762,9 @@ def process_track(
         reject_ms, reason_ms = should_reject_multisignal(features)
         if reject_ms:
             logger.info("  Rejected (multi-signal): %s", reason_ms)
+            record_rejection(
+                track_db, track_key, "rejected_multisignal", reason_ms,
+            )
             filepath.unlink()
             return "rejected", []
 
@@ -743,6 +780,11 @@ def process_track(
         if not on_color and not TASTE_FILTER.log_only:
             logger.info("  Rejected: trop éloigné du profil de goût (%.3f < %.3f)",
                         taste_score, TASTE_FILTER.threshold)
+            record_rejection(
+                track_db, track_key, "rejected_taste",
+                f"{taste_score:.2f} < {TASTE_FILTER.threshold:.2f}",
+                taste_score,
+            )
             filepath.unlink()
             return "rejected", []
 
@@ -1323,6 +1365,8 @@ def _main_inner(
                 results["carryover"] += 1  # stays in place for next night
                 continue
             if track_key:
+                # Pas de verdict ici : l'éviction par quota juge le calendrier,
+                # pas le morceau. Le cooldown suffit à éviter le rebond.
                 track_db.record_deletion(track_key)  # cooldown: no re-download
             filepath.unlink()
             results["quota"] += 1
