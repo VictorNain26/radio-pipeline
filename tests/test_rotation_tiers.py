@@ -215,3 +215,19 @@ class TestTargetPlaylistNames:
         names = target_playlist_names("Sad", "GOLD")
         assert len(names) <= ROTATION_CATEGORIES.light_daypart_count
         assert all("-Discovery" not in n for n in names)
+
+
+def test_rotation_clears_ghost_rows(tmp_path, monkeypatch):
+    """Une ligne active dont le fichier a disparu d'AzuraCast est retirée."""
+    from library_state import reconcile
+    from track_db import TrackDB
+
+    db = TrackDB(tmp_path / "tracks.db")
+    db.record_upload("fantome - x", "Fantome", "X", file_id=999)
+    db.record_upload("vivant - y", "Vivant", "Y", file_id=1)
+
+    report = reconcile([{"id": 1, "artist": "Vivant", "title": "Y"}], db)
+
+    assert report.ghosts_cleared == 1
+    assert [t["track_key"] for t in db.get_active_tracks()] == ["vivant - y"]
+    db.close()

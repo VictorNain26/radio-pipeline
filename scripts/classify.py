@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from http_client import AzuraCastClient as BaseAzuraCastClient, ClientError, HTTPConnectionError, ServerError, compute_file_hashes
 from settings import get_settings, validate_environment
 from track_db import TrackDB, normalize_track_key
+from library_state import ReconcileReport, reconcile
 
 try:
     from config import (
@@ -796,6 +797,25 @@ def process_track(
         return "failed", []
 
 
+def _write_reconcile_report(report: "ReconcileReport") -> None:
+    """Persister le rapport de réconciliation pour le récap quotidien."""
+    path = Path(__file__).parent.parent / "data" / "last_reconcile.json"
+    payload = {
+        "az_files": report.az_files,
+        "db_active_before": report.db_active_before,
+        "ghosts_cleared": report.ghosts_cleared,
+        "untracked_registered": report.untracked_registered,
+        "keys_repaired": report.keys_repaired,
+        "disk_files": report.disk_files,
+        "disk_drift": report.disk_drift,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError:
+        logger.warning("Écriture de last_reconcile.json impossible")
+
+
 def enforce_tiered_rotation(
     client: ClassifyClient,
     track_db: TrackDB,
@@ -835,8 +855,15 @@ def enforce_tiered_rotation(
     if history:
         track_db.sync_play_counts(history)
 
-    # --- Phase 2: Classify tracks into tiers ---
+    # --- Phase 2 : réconcilier puis classer par tier ---
+    # AzuraCast fait autorité. La réconciliation retire les fantômes,
+    # enregistre les fichiers inconnus et répare les clés ayant dérivé,
+    # avant tout calcul de tier — sinon les compteurs mentent.
     files = client.get_all_files()
+    settings = get_settings()
+    media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
+    report = reconcile(files, track_db, media_dir=media_dir)
+    _write_reconcile_report(report)
     current_count = len(files)
     now = time.time()
 
@@ -863,15 +890,14 @@ def enforce_tiered_rotation(
             mood = db_track.get("mood")
             tier_stored = db_track.get("tier") or "DISCOVERY"
         else:
-            # Auto-register untracked files using AzuraCast's uploaded_at
+            # reconcile() vient d'enregistrer tout fichier inconnu : ne peut
+            # rester ici que le cas des fichiers sans métadonnées, qu'on
+            # ne peut pas cléer. Ils traversent la rotation en DISCOVERY.
             uploaded_at = f.get("uploaded_at") or f.get("mtime") or now
             play_count = 0
             track_key = normalize_track_key(artist, title) if artist and title else ""
             mood = None
             tier_stored = "DISCOVERY"
-            # Persist into TrackDB so future runs have accurate data
-            if track_key and file_id:
-                track_db.register_untracked_file(track_key, artist, title, uploaded_at, file_id)
 
         age_days = (now - uploaded_at) / 86400
 
