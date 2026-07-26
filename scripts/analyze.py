@@ -491,12 +491,41 @@ def write_tags(filepath: str, artist: str, title: str, features: AudioFeatures) 
         return False
 
 
-def process_file(filepath: str) -> bool:
+def record_speech_rejection(
+    track_db: "TrackDB | None", artist: str, title: str, voice_probability: float
+) -> None:
+    """
+    Record a speech rejection in the verdict registry.
+
+    Without this trace, a podcast caught by an RSS feed is re-downloaded on
+    every rediscovery: the file is deleted here, and nothing else in the
+    pipeline remembers having judged it.
+
+    Without a usable identity there is nothing to remember — the track will
+    go through downloading again, which is the intended behaviour: we do not
+    condemn what we failed to identify.
+    """
+    if track_db is None or not (artist and title):
+        return
+    from track_db import normalize_track_key
+
+    track_db.record_verdict(
+        normalize_track_key(artist, title),
+        "rejected_speech",
+        reason=f"{voice_probability:.0%} de voix",
+        score=voice_probability,
+    )
+
+
+def process_file(filepath: str, track_db: "TrackDB | None" = None) -> bool:
     """
     Process a single audio file.
 
     Args:
         filepath: Path to audio file.
+        track_db: Optional verdict registry. When absent, rejections are
+            still applied but leave no trace — analyze.py stays usable
+            without a database.
 
     Returns:
         True if successful.
@@ -552,6 +581,10 @@ def process_file(filepath: str) -> bool:
             features.voice_probability * 100,
             SPEECH_FILTER.max_voice_probability * 100,
         )
+        # Trace the verdict before the file disappears: identity is already
+        # resolved above, and deleting is all the pipeline would otherwise
+        # remember of this track.
+        record_speech_rejection(track_db, artist, title, features.voice_probability)
         try:
             Path(filepath).unlink()
         except OSError as e:
@@ -648,11 +681,29 @@ def main() -> int:
     logger.info("Models: DEAM + emoMusic + MuSe (~88% accuracy)")
     logger.info("Moods: Energetic, Excited, Intense, Angry, Melancholic, Sad, Calm, Relaxed")
 
+    # Verdict registry, opened once for the run and closed in the finally
+    # below. A registry failure must not sink an analysis run that would
+    # otherwise succeed, so the pipeline carries on without the trace.
+    import sqlite3
+
+    from track_db import TrackDB
+
+    track_db: "TrackDB | None"
+    try:
+        track_db = TrackDB(PIPELINE_DIR / "data" / "tracks.db")
+    except (sqlite3.Error, OSError) as e:
+        logger.warning("Verdict registry unavailable (%s); rejections will leave no trace", e)
+        track_db = None
+
     success_count = 0
-    for filepath in sorted(files):
-        if process_file(str(filepath)):
-            success_count += 1
-            _ANALYZE_STATS["analyzed_ok"] += 1
+    try:
+        for filepath in sorted(files):
+            if process_file(str(filepath), track_db):
+                success_count += 1
+                _ANALYZE_STATS["analyzed_ok"] += 1
+    finally:
+        if track_db is not None:
+            track_db.close()
 
     logger.info("\n=== Done (%d/%d successful) ===", success_count, len(files))
     if _ANALYZE_STATS["rejected_speech"]:
