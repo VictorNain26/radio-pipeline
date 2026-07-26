@@ -124,7 +124,8 @@ def build_message(stats: dict[str, dict]) -> str:
 
     lines = [f"🎵 AubeSonore — {datetime.now().strftime('%d/%m')}", "─" * 16]
 
-    if rec.get("az_files"):
+    a_un_parent = bool(rec.get("az_files"))
+    if a_un_parent:
         lines.append(f"📻 Radio : {rec['az_files']} titres")
     if tiers:
         parts = []
@@ -133,7 +134,13 @@ def build_message(stats: dict[str, dict]) -> str:
             if tiers.get(key):
                 parts.append(f"{tiers[key]} {label}")
         if parts:
-            lines.append("   " + " · ".join(parts))
+            # Indenter sans parent (rapport de réconciliation absent, ou
+            # az_files à 0) donne un fragment orphelin sous la barre, qui se
+            # lit comme un bug d'affichage. Sans parent, la ligne se tient
+            # seule. On ne synthétise pas de total depuis les tiers : ce
+            # serait un compte en base présenté sous le libellé d'un compte
+            # vu par l'API, donc un chiffre qui ne dit pas ce qu'il mesure.
+            lines.append(("   " if a_un_parent else "📻 ") + " · ".join(parts))
 
     if classify:
         lines.append("")
@@ -216,7 +223,15 @@ def main() -> int:
     except OSError:
         logger.warning("Écriture de last_recap.txt impossible")
 
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except Exception as e:
+        # La contrainte du récap est absolue : il ne fait jamais échouer
+        # la nuit. Un .env absent ou invalide ne doit pas transformer un
+        # message manqué en code de sortie non nul.
+        logger.warning("Réglages illisibles — envoi sauté : %s", e)
+        return 0
+
     if not settings.callmebot_apikey or not settings.whatsapp_phone:
         logger.info("CallMeBot non configuré — envoi WhatsApp sauté")
         return 0
