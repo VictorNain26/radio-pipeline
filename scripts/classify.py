@@ -797,7 +797,7 @@ def process_track(
         return "failed", []
 
 
-def _write_reconcile_report(report: "ReconcileReport") -> None:
+def _write_reconcile_report(report: ReconcileReport) -> None:
     """Persister le rapport de réconciliation pour le récap quotidien."""
     path = Path(__file__).parent.parent / "data" / "last_reconcile.json"
     payload = {
@@ -812,8 +812,8 @@ def _write_reconcile_report(report: "ReconcileReport") -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except OSError:
-        logger.warning("Écriture de last_reconcile.json impossible")
+    except OSError as e:
+        logger.warning("Écriture de %s impossible : %s", path, e)
 
 
 def enforce_tiered_rotation(
@@ -849,21 +849,25 @@ def enforce_tiered_rotation(
     fading_max_pct = ROTATION.fading_max_pct
     min_plays = ROTATION.min_plays_before_delete
 
+    # --- Phase 0 : réconcilier avant toute lecture d'état ---
+    # AzuraCast fait autorité. On retire les fantômes, on enregistre les
+    # fichiers inconnus et on répare les clés ayant dérivé AVANT la synchro
+    # des passages : sync_play_counts matche l'historique par clé, et une
+    # clé encore fausse fait perdre ces passages définitivement (le curseur
+    # last_history_sync avance qu'une ligne ait matché ou non).
+    files = client.get_all_files()
+    settings = get_settings()
+    media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
+    report = reconcile(files, track_db, media_dir=media_dir)
+    _write_reconcile_report(report)
+
     # --- Phase 1: Sync play counts ---
     last_sync = track_db.get_last_sync_timestamp()
     history = client.get_history_since(last_sync)  # returns [] on API error
     if history:
         track_db.sync_play_counts(history)
 
-    # --- Phase 2 : réconcilier puis classer par tier ---
-    # AzuraCast fait autorité. La réconciliation retire les fantômes,
-    # enregistre les fichiers inconnus et répare les clés ayant dérivé,
-    # avant tout calcul de tier — sinon les compteurs mentent.
-    files = client.get_all_files()
-    settings = get_settings()
-    media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
-    report = reconcile(files, track_db, media_dir=media_dir)
-    _write_reconcile_report(report)
+    # --- Phase 2: Classify tracks into tiers ---
     current_count = len(files)
     now = time.time()
 

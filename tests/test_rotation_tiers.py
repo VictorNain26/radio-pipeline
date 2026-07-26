@@ -8,6 +8,8 @@ Verifies the actual semantics of the BBC A/B/C-style rotation:
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from classify import compute_rotation_tier, tier_filter_dayparts, TIER_RANK  # type: ignore[import-not-found]
@@ -217,17 +219,57 @@ class TestTargetPlaylistNames:
         assert all("-Discovery" not in n for n in names)
 
 
+
 def test_rotation_clears_ghost_rows(tmp_path, monkeypatch):
-    """Une ligne active dont le fichier a disparu d'AzuraCast est retirée."""
-    from library_state import reconcile
+    """Une ligne active absente d'AzuraCast ne survit pas à la rotation.
+
+    Verrouille le câblage de reconcile() DANS enforce_tiered_rotation :
+    sans l'appel, ce test échoue.
+    """
+    import audio_embeddings
+    import classify
+    from classify import enforce_tiered_rotation
     from track_db import TrackDB
 
-    db = TrackDB(tmp_path / "tracks.db")
+    class _FakeClient:
+        """Station minimale : un seul fichier vivant, aucun historique."""
+
+        def get_all_files(self):
+            return [{"id": 1, "artist": "Vivant", "title": "Y",
+                     "uploaded_at": time.time()}]
+
+        def get_history_since(self, since):
+            return []
+
+        def get_playlists_map(self):
+            return {}
+
+        def assign_playlists(self, file_id, playlist_ids):
+            return True
+
+        def delete_file(self, file_id):
+            return True
+
+    # enforce_tiered_rotation vise le data/ du dépôt pour deux effets de bord
+    # sans rapport avec ce qu'on teste : le rapport de réconciliation, et le
+    # prune du store CLAP. Ce dernier est destructif — il ne garderait que les
+    # clés de la base jouet et réécrirait embeddings.npy. On neutralise.
+    monkeypatch.setattr(classify, "_write_reconcile_report", lambda report: None)
+
+    class _NoopStore:
+        def __init__(self, data_dir):
+            pass
+
+        def prune(self, valid_keys):
+            return 0
+
+    monkeypatch.setattr(audio_embeddings, "EmbeddingStore", _NoopStore)
+
+    db = TrackDB(tmp_path / "t.db")
     db.record_upload("fantome - x", "Fantome", "X", file_id=999)
     db.record_upload("vivant - y", "Vivant", "Y", file_id=1)
 
-    report = reconcile([{"id": 1, "artist": "Vivant", "title": "Y"}], db)
+    enforce_tiered_rotation(_FakeClient(), db, new_tracks_count=0)
 
-    assert report.ghosts_cleared == 1
     assert [t["track_key"] for t in db.get_active_tracks()] == ["vivant - y"]
     db.close()
