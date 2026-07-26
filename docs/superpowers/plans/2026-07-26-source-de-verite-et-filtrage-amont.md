@@ -695,22 +695,55 @@ git commit -m "feat(library_state): réconciliation base/AzuraCast/disque"
 
 Ajouter à `tests/test_rotation_tiers.py` :
 
+Le test doit appeler `enforce_tiered_rotation` elle-même, pas `reconcile`
+directement : un test qui n'exerce que `reconcile` duplique la couverture de
+la Task 2 et laisserait tout le côté `classify.py` de ce refactor sans aucun
+test — on pourrait supprimer l'appel à `reconcile` sans qu'une seule
+assertion ne tombe.
+
 ```python
-def test_rotation_clears_ghost_rows(tmp_path, monkeypatch):
-    """Une ligne active absente d'AzuraCast ne survit pas à la rotation."""
-    from library_state import reconcile
+def test_rotation_clears_ghost_rows(tmp_path):
+    """Une ligne active absente d'AzuraCast ne survit pas à la rotation.
+
+    Verrouille le câblage de reconcile() DANS enforce_tiered_rotation :
+    sans l'appel, ce test échoue.
+    """
+    from classify import enforce_tiered_rotation
     from track_db import TrackDB
+
+    class _FakeClient:
+        """Station minimale : un seul fichier vivant, aucun historique."""
+
+        def get_all_files(self):
+            return [{"id": 1, "artist": "Vivant", "title": "Y",
+                     "uploaded_at": time.time()}]
+
+        def get_history_since(self, since):
+            return []
+
+        def get_playlists_map(self):
+            return {}
+
+        def assign_playlists(self, file_id, playlist_ids):
+            return True
+
+        def delete_file(self, file_id):
+            return True
 
     db = TrackDB(tmp_path / "t.db")
     db.record_upload("fantome - x", "Fantome", "X", file_id=999)
     db.record_upload("vivant - y", "Vivant", "Y", file_id=1)
 
-    report = reconcile([{"id": 1, "artist": "Vivant", "title": "Y"}], db)
+    enforce_tiered_rotation(_FakeClient(), db, new_tracks_count=0)
 
-    assert report.ghosts_cleared == 1
     assert [t["track_key"] for t in db.get_active_tracks()] == ["vivant - y"]
     db.close()
 ```
+
+Ajouter `import time` en tête du fichier de test s'il n'y est pas déjà.
+Si la signature réelle de `enforce_tiered_rotation` diffère (paramètres
+supplémentaires, valeurs par défaut), adapte l'appel — l'important est
+qu'il traverse la fonction réelle.
 
 - [ ] **Step 2 : Lancer le test**
 
@@ -727,18 +760,38 @@ from library_state import ReconcileReport, reconcile
 
 `json`, `Path`, `get_settings` et `TrackDB` sont déjà importés dans ce fichier — rien d'autre à ajouter.
 
-Remplacer, dans `enforce_tiered_rotation`, la ligne `files = client.get_all_files()` et son commentaire de phase par :
+La réconciliation doit précéder **toute** lecture de l'état, y compris la
+synchronisation des passages. `sync_play_counts` fait correspondre l'historique
+AzuraCast aux lignes par clé normalisée : si une clé a dérivé côté serveur,
+l'entrée d'historique vise la nouvelle clé pendant que la base porte encore
+l'ancienne, et l'`UPDATE` ne matche rien. La perte est définitive —
+`sync_play_counts` avance `last_history_sync` que des lignes aient matché ou
+non, donc ces passages ne sont jamais re-interrogés. Or `play_count` pilote
+`compute_rotation_tier`, le classement FADING/EXPIRED et le garde
+`min_plays_before_delete` : un morceau bloqué à 0 devient candidat à la
+suppression.
+
+Insérer donc le bloc suivant **au-dessus de la Phase 1** (avant
+`last_sync = track_db.get_last_sync_timestamp()`) :
 
 ```python
-    # --- Phase 2 : réconcilier puis classer par tier ---
-    # AzuraCast fait autorité. La réconciliation retire les fantômes,
-    # enregistre les fichiers inconnus et répare les clés ayant dérivé,
-    # avant tout calcul de tier — sinon les compteurs mentent.
+    # --- Phase 0 : réconcilier avant toute lecture d'état ---
+    # AzuraCast fait autorité. On retire les fantômes, on enregistre les
+    # fichiers inconnus et on répare les clés ayant dérivé AVANT la synchro
+    # des passages : sync_play_counts matche l'historique par clé, et une
+    # clé encore fausse fait perdre ces passages définitivement (le curseur
+    # last_history_sync avance qu'une ligne ait matché ou non).
     files = client.get_all_files()
     settings = get_settings()
     media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
     report = reconcile(files, track_db, media_dir=media_dir)
     _write_reconcile_report(report)
+```
+
+Puis, à l'emplacement de l'ancienne ligne `files = client.get_all_files()`
+(dans la phase de classement par tier), ne garder que :
+
+```python
     current_count = len(files)
     now = time.time()
 ```
