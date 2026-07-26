@@ -58,6 +58,15 @@ class LibraryStateError(Exception):
 # Le compromis est asymétrique, d'où les seuils : une suppression massive
 # volontaire est rare et se rattrape (relancer en desserrant le seuil) ; un
 # aléa réseau est fréquent et ce qu'il détruit ne se rattrape pas.
+#
+# Le plancher ne s'applique qu'aux bases qui comptent déjà au moins
+# RECONCILE_MIN_FILES lignes actives : en dessous, une liste courte est la
+# réalité, pas un symptôme. L'appliquer inconditionnellement condamnerait
+# une petite bibliothèque à lever chaque nuit — download.py sortirait en 1,
+# classify.py sauterait la rotation, plus rien ne serait téléchargé, et elle
+# ne pourrait donc jamais repasser au-dessus du plancher. Le ratio, lui,
+# reste armé à toute taille : c'est lui qui rattrape l'effondrement soudain
+# d'une petite bibliothèque.
 RECONCILE_MIN_FILES = 50
 RECONCILE_MIN_RATIO = 0.5
 
@@ -158,13 +167,26 @@ def _persist_report(report: ReconcileReport, path: Path) -> None:
         "disk_files": report.disk_files,
         "disk_drift": report.disk_drift,
     }
+    # La lecture de fusion a son propre garde : un fichier précédent illisible
+    # ou corrompu fait perdre le cumul, pas le rapport de la nuit. Les deux
+    # passes échoueraient sinon à écrire et le récap lirait le fichier
+    # corrompu — les corrections de la nuit ne seraient jamais rapportées.
+    cumulables = ("ghosts_cleared", "untracked_registered", "keys_repaired")
     try:
         if path.exists() and (time.time() - path.stat().st_mtime) < RECONCILE_REPORT_MERGE_WINDOW_S:
             previous = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(previous, dict):
-                for cumulative in ("ghosts_cleared", "untracked_registered",
-                                   "keys_repaired"):
-                    payload[cumulative] += int(previous.get(cumulative) or 0)
+                # Tout convertir avant d'ajouter quoi que ce soit : un champ
+                # illisible ne doit pas laisser un cumul à moitié appliqué.
+                report_precedent = {
+                    c: int(previous.get(c) or 0) for c in cumulables
+                }
+                for c in cumulables:
+                    payload[c] += report_precedent[c]
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("Rapport précédent %s illisible, cumul abandonné : %s", path, e)
+
+    try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except (OSError, ValueError, TypeError) as e:
@@ -209,14 +231,19 @@ def reconcile(
     active = track_db.get_active_tracks()
     report.db_active_before = len(active)
 
-    if report.db_active_before and (
-        len(files) < RECONCILE_MIN_FILES
-        or len(files) < RECONCILE_MIN_RATIO * report.db_active_before
-    ):
-        raise LibraryStateError(
-            f"liste AzuraCast suspecte : {len(files)} fichiers pour "
-            f"{report.db_active_before} lignes actives — réconciliation abandonnée"
+    if report.db_active_before:
+        # Plancher : seulement si la base est elle-même au-dessus du plancher,
+        # sinon une petite bibliothèque saine serait refusée à chaque run.
+        sous_le_plancher = (
+            report.db_active_before >= RECONCILE_MIN_FILES
+            and len(files) < RECONCILE_MIN_FILES
         )
+        sous_le_ratio = len(files) < RECONCILE_MIN_RATIO * report.db_active_before
+        if sous_le_plancher or sous_le_ratio:
+            raise LibraryStateError(
+                f"liste AzuraCast suspecte : {len(files)} fichiers pour "
+                f"{report.db_active_before} lignes actives — réconciliation abandonnée"
+            )
 
     by_file_id = {t["azuracast_file_id"]: t for t in active}
 

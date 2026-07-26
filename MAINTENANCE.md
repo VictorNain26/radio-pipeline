@@ -216,10 +216,16 @@ Réconcilier à la main.
 >
 > D'où le garde-fou **intégré à `reconcile()`** depuis juillet 2026, et donc
 > actif aussi bien ici que sur le chemin de nuit : en dessous de
-> `RECONCILE_MIN_FILES` (50) fichiers, ou de `RECONCILE_MIN_RATIO` (0,5) fois
-> le nombre de lignes actives, il lève `LibraryStateError` **avant toute
-> écriture**. `download.py` en fait un `exit 1` ; `classify.py` saute la
-> rotation et laisse les uploads se faire.
+> `RECONCILE_MIN_RATIO` (0,5) fois le nombre de lignes actives — ou, si la
+> base compte déjà au moins `RECONCILE_MIN_FILES` (50) lignes actives, en
+> dessous de `RECONCILE_MIN_FILES` fichiers — il lève `LibraryStateError`
+> **avant toute écriture**. `download.py` en fait un `exit 1` ; `classify.py`
+> saute la rotation et laisse les uploads se faire.
+>
+> Le plancher est conditionné à la taille de la base à dessein : une
+> bibliothèque de moins de 50 morceaux qui voit bien tous ses fichiers doit
+> se réconcilier normalement, sinon elle lèverait chaque nuit et ne pourrait
+> jamais grandir. C'est le ratio qui la protège.
 >
 > Une suppression massive volontaire est donc refusée elle aussi : c'est
 > voulu (rare, et rattrapable en desserrant `RECONCILE_MIN_RATIO` le temps

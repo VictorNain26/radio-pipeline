@@ -252,6 +252,26 @@ def test_an_unreadable_previous_report_never_aborts_the_run(tmp_path, db):
     assert report.untracked_registered == 1
 
 
+def test_a_corrupt_previous_report_is_replaced_not_suppressed(tmp_path, db):
+    """Un JSON illisible dans la fenêtre ne doit pas empêcher d'écrire la nuit.
+
+    La lecture de fusion et l'écriture partageaient le même `try` : le
+    `json.loads` levait avant `write_text`, donc les deux passes de la nuit
+    laissaient le fichier corrompu en place et le récap ne voyait rien des
+    corrections faites.
+    """
+    path = tmp_path / "last_reconcile.json"
+    path.write_text("{ pas du json", encoding="utf-8")
+    db.record_upload("fantome - x", "Fantome", "X", file_id=99)
+
+    reconcile([_file(1, "A", "B")], db, report_path=path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["ghosts_cleared"] == 1
+    assert payload["untracked_registered"] == 1
+    assert payload["az_files"] == 1
+
+
 def test_an_unwritable_report_path_never_aborts_the_run(tmp_path, db):
     # Un dossier là où on attend un fichier : l'écriture échoue à coup sûr.
     path = tmp_path / "last_reconcile.json"
@@ -363,6 +383,33 @@ def test_guard_does_not_block_a_fresh_database(db, monkeypatch):
     _armer(monkeypatch)
     report = reconcile([_file(1, "A", "B")], db)
     assert report.untracked_registered == 1
+
+
+def test_a_small_library_seeing_all_its_files_is_not_blocked(db, monkeypatch):
+    """30 lignes, 30 fichiers présents : le plancher ne doit pas s'appliquer.
+
+    Sinon amorçage neuf et bibliothèque volontairement réduite lèvent chaque
+    nuit — download.py sort en 1, rien ne se télécharge, et la bibliothèque
+    ne peut plus repasser au-dessus du plancher toute seule.
+    """
+    _armer(monkeypatch)
+    _fill(db, 30)
+
+    report = reconcile([_file(i + 1, f"A{i}", "B") for i in range(30)], db)
+
+    assert report.ghosts_cleared == 0
+    assert len(db.get_active_tracks()) == 30
+
+
+def test_a_small_library_losing_most_of_its_files_still_aborts(db, monkeypatch):
+    """5 fichiers pour 30 lignes : sous le plancher ET sous le ratio."""
+    _armer(monkeypatch)
+    _fill(db, 30)
+
+    with pytest.raises(LibraryStateError):
+        reconcile([_file(i + 1, f"A{i}", "B") for i in range(5)], db)
+
+    assert len(db.get_active_tracks()) == 30
 
 
 def test_non_list_payload_is_rejected(db):
