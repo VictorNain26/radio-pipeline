@@ -38,6 +38,25 @@ def test_untracked_file_is_registered(db):
     assert db.get_track_by_file_id(51)["track_key"] == "inconnu - morceau"
 
 
+def test_untracked_file_keeps_its_real_age(db):
+    """uploaded_at pilote le tiering et n'est écrit qu'une fois : pas de now() hâtif."""
+    report = reconcile(
+        [
+            _file(1, "A", "B", uploaded_at=1_600_000_000),
+            # À défaut d'uploaded_at, mtime porte l'âge réel du fichier.
+            {"id": 2, "artist": "C", "title": "D", "mtime": 1_600_000_001},
+            # Une date illisible ne fait pas échouer la réconciliation.
+            {"id": 3, "artist": "E", "title": "F", "uploaded_at": "2026-07-26T12:00:00Z"},
+        ],
+        db,
+    )
+
+    assert report.untracked_registered == 3
+    assert db.get_track_by_file_id(1)["uploaded_at"] == 1_600_000_000.0
+    assert db.get_track_by_file_id(2)["uploaded_at"] == 1_600_000_001.0
+    assert db.get_track_by_file_id(3)["uploaded_at"] > 1_700_000_000.0
+
+
 def test_drifted_metadata_repairs_key_without_duplicating(db):
     """Incident 18/07 : AzuraCast a réécrit le titre, la clé doit suivre."""
     db.record_upload("artiste - titre original", "Artiste", "Titre Original", file_id=12)
@@ -60,6 +79,23 @@ def test_files_without_metadata_are_ignored_not_registered(db):
     report = reconcile([{"id": 9, "artist": "", "title": ""}], db)
     assert report.untracked_registered == 0
     assert report.library_keys == set()
+
+
+def test_present_file_without_metadata_is_never_a_ghost(db):
+    """Un fichier qu'AzuraCast renvoie existe, même sans tags lisibles.
+
+    Le déclarer fantôme annulerait son azuracast_file_id : la ligne
+    serait orpheline pour toujours, son embedding CLAP purgé, et le
+    morceau re-téléchargé en doublon alors qu'il passe encore à l'antenne.
+    """
+    db.record_upload("otto - i am", "Otto", "(I am)", file_id=77)
+
+    report = reconcile([{"id": 77, "artist": "", "title": ""}], db)
+
+    assert report.ghosts_cleared == 0
+    active = db.get_active_tracks()
+    assert len(active) == 1
+    assert active[0]["azuracast_file_id"] == 77
 
 
 def test_counts_are_reported(db):

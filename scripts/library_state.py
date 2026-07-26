@@ -108,15 +108,26 @@ def reconcile(
 
     for f in files:
         file_id = f.get("id")
+
+        # Marquer le fichier comme vu AVANT tout garde : sa présence est
+        # établie par son id, indépendamment de la lisibilité de ses tags.
+        # Sortir plus tôt le ferait passer pour un fantôme dans la boucle
+        # finale, qui annulerait son azuracast_file_id — la ligne serait
+        # alors définitivement orpheline, son embedding CLAP purgé, et le
+        # morceau re-téléchargé en doublon alors qu'il est toujours à
+        # l'antenne. C'est exactement le scénario de l'incident du 18/07.
+        if file_id is not None:
+            seen_ids.add(file_id)
+
         artist = (f.get("artist") or "").strip()
         title = (f.get("title") or "").strip()
 
         if not (artist and title):
-            # Sans métadonnées, aucune clé fiable : le fichier existe à
-            # l'antenne mais on ne peut ni le suivre ni s'en servir pour
-            # dédupliquer.
+            # Sans métadonnées on ne peut ni construire de clé ni dédupliquer.
+            # Le fichier reste à l'antenne, il est simplement invisible ici —
+            # mais il n'est pas déclaré disparu.
             logger.warning(
-                "Fichier AzuraCast sans artiste/titre (id=%s), ignoré", file_id
+                "Fichier AzuraCast sans artiste/titre (id=%s) — ignoré", file_id
             )
             continue
 
@@ -125,18 +136,32 @@ def reconcile(
 
         if file_id is None:
             continue
-        seen_ids.add(file_id)
 
         known = by_file_id.get(file_id)
         if known is None:
             # Fichier présent côté serveur sans ligne locale : upload
             # manuel, suppression accidentelle de la ligne, ou base repartie
             # de zéro. On l'adopte pour ne pas le retélécharger.
+            # uploaded_at n'est écrit qu'une fois (register_untracked_file ne
+            # le rafraîchit pas) et pilote l'âge, donc le tiering : on prend
+            # la date la plus fidèle disponible avant de se rabattre sur
+            # maintenant.
+            raw_uploaded_at = f.get("uploaded_at") or f.get("mtime")
+            try:
+                uploaded_at = float(raw_uploaded_at) if raw_uploaded_at else time.time()
+            except (TypeError, ValueError):
+                # Une date non numérique renvoyée par l'API ne doit pas faire
+                # échouer la réconciliation.
+                logger.warning(
+                    "uploaded_at illisible pour file_id=%s : %r",
+                    file_id, raw_uploaded_at,
+                )
+                uploaded_at = time.time()
             track_db.register_untracked_file(
                 key,
                 artist,
                 title,
-                float(f.get("uploaded_at") or time.time()),
+                uploaded_at,
                 file_id,
             )
             report.untracked_registered += 1
