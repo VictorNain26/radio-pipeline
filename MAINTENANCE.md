@@ -184,8 +184,11 @@ un cache : il conserve seulement ce qu'AzuraCast ignore (date d'upload
 propre au pipeline, compteur de lectures, tier, mood, empreinte).
 
 `scripts/library_state.reconcile()` aligne les deux au début de `download.py`
-et de `classify.py`. Il retire les lignes dont le fichier a disparu du
-serveur (« fantômes »), enregistre les fichiers inconnus, et répare les clés
+et de `classify.py`. Il désactive les lignes dont le fichier a disparu du
+serveur (« fantômes ») en posant `deleted_at` et en annulant
+`azuracast_file_id` — **sans les supprimer** : `play_count`, `mood`, `tier` et
+l'empreinte survivent, et la ligne peut être réadoptée si le fichier
+réapparaît. Il enregistre aussi les fichiers inconnus, et répare les clés
 dont les métadonnées ont dérivé côté AzuraCast (sanitization — cf. incident
 du 18/07). L'opération est idempotente : relancée aussitôt, elle ne corrige
 plus rien.
@@ -196,7 +199,26 @@ Il n'est jamais utilisé pour supprimer quoi que ce soit. Non renseigné dans
 `.env`, le contrôle est simplement sauté (`disk_files = None`) : le run
 n'échoue pas.
 
-Réconcilier à la main :
+Réconcilier à la main.
+
+> ⚠️ **Cette commande écrit dans `data/tracks.db`.** `reconcile()` désactive
+> *toute* ligne active dont le `file_id` est absent de la liste renvoyée par
+> l'API — il n'a ni plancher, ni garde de ratio, ni dry-run. Si AzuraCast
+> répond 200 avec une liste tronquée ou vide (instance dégradée,
+> `AZURACAST_STATION_ID` erroné, station renommée), la bibliothèque entière
+> est désactivée d'un coup. Or c'est précisément en situation d'incident,
+> quand l'API n'est pas fiable, qu'on est tenté de lancer ce bloc.
+>
+> Les lignes restent réadoptables, mais la perte n'est pas entièrement
+> réversible : le prochain `classify.py` purge le store CLAP contre les
+> morceaux actifs, donc les embeddings des lignes désactivées en masse sont
+> détruits et ne se recalculent qu'à 3-5 s/morceau, modèle et fichiers
+> sources en main.
+>
+> D'où les deux gardes ci-dessous, qui reproduisent celles du chemin de
+> production (`download.py`) : `health_check()` avant tout, puis un plancher
+> sur la taille de la liste. **Ne pas les retirer**, et ajuster le seuil si la
+> bibliothèque change d'ordre de grandeur.
 
 ```bash
 python3 -c "
@@ -209,12 +231,21 @@ from library_state import reconcile
 s = get_settings()
 c = AzuraCastClient(base_url=s.azuracast_url, api_key=s.azuracast_api_key,
                     station_id=s.azuracast_station_id, timeout=s.http_timeout)
+assert c.health_check(), 'AzuraCast injoignable — ne pas réconcilier'
+files = c.get_station_files()
+print(f'{len(files)} fichiers vus par l\'API')
+assert len(files) > 500, 'liste AzuraCast suspecte — ne pas réconcilier'
 db = TrackDB('data/tracks.db')
-print(reconcile(c.get_station_files(), db,
+print(reconcile(files, db,
                 media_dir=Path(s.azuracast_media_dir) if s.azuracast_media_dir else None))
 db.close()
 "
 ```
+
+Si un `assert` casse, **c'est l'API qu'il faut réparer, pas le seuil.** Pour
+seulement regarder sans rien écrire, exécuter les lignes jusqu'au `print` du
+nombre de fichiers et s'arrêter là : rien n'est modifié avant l'appel à
+`reconcile()`.
 
 Compter les lignes actives, avant et après :
 
@@ -233,17 +264,39 @@ Vérifié le 26/07/2026 : 674 lignes actives pour 666 fichiers AzuraCast,
 8 fantômes retirés, base ramenée à 666.
 
 Comparer l'API et le disque à la main (le dossier média vit sur la machine
-qui héberge AzuraCast) :
+qui héberge AzuraCast). Vérifier d'abord que le glob désigne bien **une seule**
+station — sinon `find` ne parcourt rien et renvoie `0`, ce qui se lit comme une
+dérive catastrophique alors que le chemin est simplement faux (station
+renommée, dossier déplacé) :
 
 ```bash
+ls -d ~/azuracast/stations/*/media
 find ~/azuracast/stations/*/media -name '*.mp3' | wc -l
 ```
 
+---
+
 ## Registre des verdicts
 
-Tout rejet est inscrit dans la table `verdicts` de `data/tracks.db`, avec
-son motif. `download.py` la consulte en phase à froid : un morceau déjà
-jugé n'est jamais retéléchargé.
+Tout rejet portant sur un morceau **identifiable** est inscrit dans la table
+`verdicts` de `data/tracks.db`, avec son motif. `download.py` la consulte en
+phase à froid : un morceau déjà jugé n'est jamais retéléchargé.
+
+Le registre n'est délibérément pas exhaustif — deux familles de rejets n'y
+sont pas écrites, pour que le morceau puisse retenter sa chance :
+
+- **morceau non identifiable** : sans artiste/titre exploitables il n'y a pas
+  de clé, donc rien à mémoriser (`classify.record_rejection`, `analyze.py`).
+  On ne condamne pas ce qu'on n'a pas su identifier ;
+- **absence de tags** quand `GENRE_FILTER.require_tags` est actif
+  (`download.py`) : l'absence est transitoire (morceau trop récent, sources
+  muettes). L'inscrire bannirait à vie un morceau pour un silence du réseau,
+  il n'est donc écarté que pour la nuit.
+
+Conséquence pratique : **un morceau peut être rejeté nuit après nuit sans
+jamais apparaître dans `verdicts`.** Une table qui ne mentionne pas un morceau
+récurrent n'est pas cassée — c'est l'un de ces deux cas. Chercher plutôt le
+motif dans les logs du run.
 
 Les verdicts `rejected_taste` périment après `TASTE_FILTER.verdict_ttl_days`
 (90 jours) — le profil de goût évolue, un morceau écarté sous l'ancien
@@ -281,10 +334,13 @@ con.close()
 "
 ```
 
+---
+
 ## Budget de téléchargement
 
-`download.py` ne télécharge que `max_uploads_per_night × download_margin`
-moins le nombre de `.mp3` déjà présents dans `downloads/`. Avec 24 fichiers
+`download.py` ne télécharge que `ROTATION.max_uploads_per_night ×
+ROTATION.download_margin` moins le nombre de `.mp3` déjà présents dans
+`downloads/`. Avec 24 fichiers
 en carryover pour un quota de 6 et une marge de 2.0 (soit 12), le budget
 vaut zéro et aucune nuit de téléchargement n'a lieu : le stock suffit.
 C'est le comportement attendu, pas une panne.
