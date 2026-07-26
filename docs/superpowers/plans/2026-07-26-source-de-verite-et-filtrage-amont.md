@@ -1162,7 +1162,7 @@ def db(tmp_path):
     d.close()
 
 
-def _track(artist, title, source="RSSSource"):
+def _track(artist, title, source="rss"):
     return {"id": f"{artist}-{title}", "artist": artist, "title": title,
             "cover": None, "search": f"{artist} - {title}", "source": source}
 
@@ -1256,24 +1256,33 @@ def test_prefilter_drops_tracks_in_cooldown(db):
 
 
 def test_prefilter_orders_by_source_priority(db):
+    """Les libellés sont ceux que discovery_sources écrit réellement."""
     from download import prefilter_candidates
 
     survivors, _ = prefilter_candidates(
         [
-            _track("A", "Un", source="LastFMTagSource"),
-            _track("B", "Deux", source="ManualPicksSource"),
-            _track("C", "Trois", source="PersonalArtistsSource"),
+            _track("A", "Un", source="lastfm:post-punk"),
+            _track("B", "Deux", source="manual"),
+            _track("C", "Trois", source="personal"),
+            _track("D", "Quatre", source="hypem"),
+            _track("E", "Cinq", source="Le Grand Mix"),  # label RSS libre
         ],
         library_keys=set(), track_db=db, genre_client=None,
     )
 
-    assert [t["title"] for t in survivors] == ["Deux", "Trois", "Un"]
+    assert [t["title"] for t in survivors] == [
+        "Deux",    # manual   0
+        "Trois",   # personal 1
+        "Cinq",    # RSS      3 (défaut)
+        "Quatre",  # hypem    4
+        "Un",      # lastfm:  5
+    ]
 
 
 def test_prefilter_is_stable_within_a_source(db):
     from download import prefilter_candidates
 
-    tracks = [_track("A", str(i), source="RSSSource") for i in range(5)]
+    tracks = [_track("A", str(i), source="rss") for i in range(5)]
     survivors, _ = prefilter_candidates(
         tracks, library_keys=set(), track_db=db, genre_client=None,
     )
@@ -1324,6 +1333,13 @@ Dans `RotationConfig`, après `gold_max_pct: float = 40.0` :
 
 Après la ligne `TASTE_DISCOVERY_TRACKS_PER_ARTIST: int = 2` :
 
+Attention aux clés : les libellés réellement portés par `Track["source"]` sont
+ceux que `discovery_sources._make_track` reçoit, pas les noms de classe. Ce
+sont `manual`, `personal`, `custom`, `hypem`, `lastfm:<tag>` (préfixé, tag
+variable) et, pour les flux RSS, `feed_cfg.label or "rss"` — un label libre
+qu'on ne peut pas énumérer. D'où le préfixe traité à part et le défaut placé
+au niveau RSS.
+
 ```python
 
 # Ordre de dépense du budget de téléchargement. Un choix explicite de
@@ -1331,15 +1347,25 @@ Après la ligne `TASTE_DISCOVERY_TRACKS_PER_ARTIST: int = 2` :
 # découverte éditoriale, qui passe avant un chart de tag. Cet ordre ne
 # rejette rien : il décide seulement qui est servi en premier quand le
 # budget est plus court que la liste de candidats.
+#
+# Les clés sont les libellés que discovery_sources._make_track écrit dans
+# Track["source"]. Les flux RSS portent un label libre (feed_cfg.label),
+# donc inénumérable : ils tombent sur le défaut, calé à leur niveau.
 SOURCE_PRIORITY: dict[str, int] = {
-    "ManualPicksSource": 0,
-    "PersonalArtistsSource": 1,
-    "CustomFeedsSource": 2,
-    "RSSSource": 3,
-    "HypeMachineSource": 4,
-    "LastFMTagSource": 5,
+    "manual": 0,
+    "personal": 1,
+    "custom": 2,
+    "hypem": 4,
 }
-SOURCE_PRIORITY_DEFAULT: int = 9
+SOURCE_PRIORITY_LASTFM: int = 5
+SOURCE_PRIORITY_DEFAULT: int = 3   # flux RSS et libellés inconnus
+
+
+def source_priority(source: str) -> int:
+    """Priorité de dépense du budget pour un libellé de source."""
+    if source.startswith("lastfm:"):
+        return SOURCE_PRIORITY_LASTFM
+    return SOURCE_PRIORITY.get(source, SOURCE_PRIORITY_DEFAULT)
 ```
 
 - [ ] **Step 4 : Implémenter `compute_budget` et `prefilter_candidates`**
@@ -1354,9 +1380,8 @@ try:
         GENRE_FILTER,
         LOUDNORM,
         ROTATION,
-        SOURCE_PRIORITY,
-        SOURCE_PRIORITY_DEFAULT,
         TASTE_FILTER,
+        source_priority,
         format_duration,
     )
 except ImportError as e:
@@ -1443,9 +1468,7 @@ def prefilter_candidates(
         survivors.append(track)
 
     # Tri stable : à priorité égale, l'ordre de découverte est conservé.
-    survivors.sort(
-        key=lambda t: SOURCE_PRIORITY.get(t.get("source", ""), SOURCE_PRIORITY_DEFAULT)
-    )
+    survivors.sort(key=lambda t: source_priority(t.get("source", "")))
     return survivors, counts
 ```
 
@@ -1487,10 +1510,18 @@ Après la construction du `genre_client` et de `stats`, insérer les deux phases
     candidates, prefilter_counts = prefilter_candidates(
         tracks, existing_library, track_db, genre_client
     )
+    # Compteurs de la phase à froid, dans leurs propres clés : la boucle
+    # parallèle incrémente `skipped` et `blocked` pour ses propres motifs
+    # (fichier déjà sur disque, collision de clé entre workers), donc y
+    # écrire ici ferait un double comptage et le récap publierait un
+    # chiffre qui ne veut plus rien dire.
     stats["prefiltered"] = sum(prefilter_counts.values())
-    stats["skipped"] = prefilter_counts["already_in_library"] + prefilter_counts["cooldown"]
-    stats["known_verdict"] = prefilter_counts["known_verdict"]
-    stats["blocked"] = prefilter_counts["blocked_genre"]
+    stats["pre_already_known"] = (
+        prefilter_counts["already_in_library"] + prefilter_counts["cooldown"]
+    )
+    stats["pre_known_verdict"] = prefilter_counts["known_verdict"]
+    stats["pre_blocked_genre"] = prefilter_counts["blocked_genre"]
+    stats["pre_no_metadata"] = prefilter_counts["no_metadata"]
     logger.info(
         "Filtrage à froid : %d candidats → %d retenus (%d déjà en librairie, "
         "%d en cooldown, %d déjà jugés, %d genre bloqué)",
@@ -1518,8 +1549,13 @@ Ajouter les trois compteurs neufs à l'initialisation de `stats` :
 
 ```python
         # Phase à froid (2026-07) : ce qui a été écarté sans rien télécharger.
+        # Préfixe `pre_` pour ne pas collisionner avec les compteurs que la
+        # boucle parallèle incrémente (`skipped`, `blocked`, `filtered`).
         "prefiltered": 0,
-        "known_verdict": 0,
+        "pre_already_known": 0,
+        "pre_known_verdict": 0,
+        "pre_blocked_genre": 0,
+        "pre_no_metadata": 0,
         "budget": 0,
         "carryover_on_disk": 0,
 ```
@@ -1547,16 +1583,29 @@ Les tags Last.fm restent nécessaires à l'écriture ID3. Les récupérer depuis
 
 Conserver intacte la déduplication par clé sous `_download_lock` : elle protège contre deux workers visant la même clé, ce que la phase à froid ne couvre pas.
 
-- [ ] **Step 9 : Inscrire au registre les durées hors bornes**
+- [ ] **Step 9 : Ne PAS inscrire de verdict pour la durée côté téléchargement**
 
-Dans `download_track`, aux deux `return DownloadOutcome('filtered', match_source)` du contrôle de durée, insérer juste avant :
+`download_track` juge la durée du **candidat retenu par la recherche**, pas
+celle du morceau. Un candidat suffit à `score >= MATCH_SCORE_THRESHOLD` (0,60)
+pour être choisi : un extended mix, un live set ou un album entier passe ce
+seuil et sort des bornes. Comme `filtered_duration` est permanent, inscrire
+ici bannirait définitivement un morceau légitime, sans expiration ni
+réparation — un faux positif silencieux, exactement ce que ce plan doit
+éviter. Décision de Victor : ne rien inscrire ici.
+
+`classify.py` inscrit déjà `filtered_duration` à partir de la durée du fichier
+réellement téléchargé (Task 4) : là, le signal juge le morceau. Le candidat
+hors bornes reste simplement écarté pour la nuit, comme avant.
+
+Ajouter ce commentaire aux deux `return DownloadOutcome('filtered', match_source)`
+du contrôle de durée pour que l'intention reste lisible :
 
 ```python
-            if track_db is not None:
-                track_db.record_verdict(
-                    track_key, "filtered_duration",
-                    reason=f"{int(match['duration'])}s hors bornes",
-                )
+            # Pas de verdict ici : cette durée est celle du candidat trouvé
+            # par la recherche (retenu dès 0,60 de similarité), pas celle du
+            # morceau. Un mix ou un live mal apparié bannirait un morceau
+            # légitime pour toujours. classify.py inscrit filtered_duration
+            # sur le fichier réellement téléchargé, où le signal est solide.
 ```
 
 - [ ] **Step 10 : Mettre à jour le résumé de fin**
@@ -1568,10 +1617,12 @@ Remplacer le bloc de `logger.info("\n=== Results ===")` par :
     logger.info("Candidats : %d → retenus %d → budget %d",
                 len(tracks), len(candidates), budget)
     logger.info("Écartés avant téléchargement : %d", stats['prefiltered'])
-    logger.info("  → déjà en librairie ou cooldown : %d", stats['skipped'])
-    logger.info("  → déjà jugés (registre)         : %d", stats['known_verdict'])
-    logger.info("  → genre bloqué                  : %d", stats['blocked'])
+    logger.info("  → déjà en librairie ou cooldown : %d", stats['pre_already_known'])
+    logger.info("  → déjà jugés (registre)         : %d", stats['pre_known_verdict'])
+    logger.info("  → genre bloqué                  : %d", stats['pre_blocked_genre'])
+    logger.info("  → métadonnées illisibles        : %d", stats['pre_no_metadata'])
     logger.info("Téléchargés : %d", stats['downloaded'])
+    logger.info("Sautés dans la boucle (fichier présent, collision) : %d", stats['skipped'])
     logger.info("  → depuis YouTube    : %d", stats['source_youtube'])
     logger.info("  → depuis SoundCloud : %d", stats['source_soundcloud'])
     if stats['source_other']:
