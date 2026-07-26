@@ -12,7 +12,7 @@ def db(tmp_path):
     d.close()
 
 
-def _track(artist, title, source="RSSSource"):
+def _track(artist, title, source="rss"):
     return {"id": f"{artist}-{title}", "artist": artist, "title": title,
             "cover": None, "search": f"{artist} - {title}", "source": source}
 
@@ -53,6 +53,22 @@ def test_prefilter_drops_tracks_already_in_library(db):
 
     assert [t["title"] for t in survivors] == ["Titre"]
     assert counts["already_in_library"] == 1
+
+
+def test_prefilter_counts_intra_batch_duplicates_separately(db):
+    """Listé deux fois ce soir n'est pas la même chose que déjà à l'antenne."""
+    from download import prefilter_candidates
+
+    survivors, counts = prefilter_candidates(
+        [_track("Double", "Mise"), _track("Double", "Mise")],
+        library_keys=set(),
+        track_db=db,
+        genre_client=None,
+    )
+
+    assert len(survivors) == 1
+    assert counts["duplicate_in_batch"] == 1
+    assert counts["already_in_library"] == 0
 
 
 def test_prefilter_drops_tracks_with_active_verdict(db):
@@ -106,24 +122,33 @@ def test_prefilter_drops_tracks_in_cooldown(db):
 
 
 def test_prefilter_orders_by_source_priority(db):
+    """Les libellés sont ceux que discovery_sources écrit réellement."""
     from download import prefilter_candidates
 
     survivors, _ = prefilter_candidates(
         [
-            _track("A", "Un", source="LastFMTagSource"),
-            _track("B", "Deux", source="ManualPicksSource"),
-            _track("C", "Trois", source="PersonalArtistsSource"),
+            _track("A", "Un", source="lastfm:post-punk"),
+            _track("B", "Deux", source="manual"),
+            _track("C", "Trois", source="personal"),
+            _track("D", "Quatre", source="hypem"),
+            _track("E", "Cinq", source="Le Grand Mix"),  # label RSS libre
         ],
         library_keys=set(), track_db=db, genre_client=None,
     )
 
-    assert [t["title"] for t in survivors] == ["Deux", "Trois", "Un"]
+    assert [t["title"] for t in survivors] == [
+        "Deux",    # manual   0
+        "Trois",   # personal 1
+        "Cinq",    # RSS      3 (défaut)
+        "Quatre",  # hypem    4
+        "Un",      # lastfm:  5
+    ]
 
 
 def test_prefilter_is_stable_within_a_source(db):
     from download import prefilter_candidates
 
-    tracks = [_track("A", str(i), source="RSSSource") for i in range(5)]
+    tracks = [_track("A", str(i), source="rss") for i in range(5)]
     survivors, _ = prefilter_candidates(
         tracks, library_keys=set(), track_db=db, genre_client=None,
     )

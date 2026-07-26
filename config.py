@@ -860,15 +860,25 @@ TASTE_DISCOVERY_TRACKS_PER_ARTIST: int = 2
 # découverte éditoriale, qui passe avant un chart de tag. Cet ordre ne
 # rejette rien : il décide seulement qui est servi en premier quand le
 # budget est plus court que la liste de candidats.
+#
+# Les clés sont les libellés que discovery_sources._make_track écrit dans
+# Track["source"]. Les flux RSS portent un label libre (feed_cfg.label),
+# donc inénumérable : ils tombent sur le défaut, calé à leur niveau.
 SOURCE_PRIORITY: dict[str, int] = {
-    "ManualPicksSource": 0,
-    "PersonalArtistsSource": 1,
-    "CustomFeedsSource": 2,
-    "RSSSource": 3,
-    "HypeMachineSource": 4,
-    "LastFMTagSource": 5,
+    "manual": 0,
+    "personal": 1,
+    "custom": 2,
+    "hypem": 4,
 }
-SOURCE_PRIORITY_DEFAULT: int = 9
+SOURCE_PRIORITY_LASTFM: int = 5
+SOURCE_PRIORITY_DEFAULT: int = 3   # flux RSS et libellés inconnus
+
+
+def source_priority(source: str) -> int:
+    """Priorité de dépense du budget pour un libellé de source."""
+    if source.startswith("lastfm:"):
+        return SOURCE_PRIORITY_LASTFM
+    return SOURCE_PRIORITY.get(source, SOURCE_PRIORITY_DEFAULT)
 
 # =============================================================================
 # FONCTIONS UTILITAIRES

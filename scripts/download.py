@@ -30,7 +30,7 @@ from typing import Literal, NamedTuple, TypedDict
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from http_client import AzuraCastClient
+from http_client import AzuraCastClient, ClientError, HTTPConnectionError, ServerError
 from audio_fingerprint import compute_fingerprint, fingerprint_hash
 from genre_client import GenreClient, create_genre_client
 from settings import get_settings, validate_environment
@@ -42,10 +42,9 @@ try:
         GENRE_FILTER,
         LOUDNORM,
         ROTATION,
-        SOURCE_PRIORITY,
-        SOURCE_PRIORITY_DEFAULT,
         TASTE_FILTER,
         format_duration,
+        source_priority,
     )
 except ImportError as e:
     print(f"Error: config.py not found or invalid in pipeline root: {e}")
@@ -985,19 +984,19 @@ def download_track(
     if match["duration"] > 0:
         if AUDIO_FILTERS.duration_min and match["duration"] <= AUDIO_FILTERS.duration_min:
             logger.info("  Filtered (too short: %s)", format_duration(int(match['duration'])))
-            if track_db is not None:
-                track_db.record_verdict(
-                    track_key, "filtered_duration",
-                    reason=f"{int(match['duration'])}s hors bornes",
-                )
+            # Pas de verdict ici : cette durée est celle du candidat trouvé
+            # par la recherche (retenu dès 0,60 de similarité), pas celle du
+            # morceau. Un mix ou un live mal apparié bannirait un morceau
+            # légitime pour toujours. classify.py inscrit filtered_duration
+            # sur le fichier réellement téléchargé, où le signal est solide.
             return DownloadOutcome('filtered', match_source)
         if AUDIO_FILTERS.duration_max and match["duration"] >= AUDIO_FILTERS.duration_max:
             logger.info("  Filtered (too long: %s)", format_duration(int(match['duration'])))
-            if track_db is not None:
-                track_db.record_verdict(
-                    track_key, "filtered_duration",
-                    reason=f"{int(match['duration'])}s hors bornes",
-                )
+            # Pas de verdict ici : cette durée est celle du candidat trouvé
+            # par la recherche (retenu dès 0,60 de similarité), pas celle du
+            # morceau. Un mix ou un live mal apparié bannirait un morceau
+            # légitime pour toujours. classify.py inscrit filtered_duration
+            # sur le fichier réellement téléchargé, où le signal est solide.
             return DownloadOutcome('filtered', match_source)
 
     # Phase 2: Download the specific matched URL (thread-safe temp dir)
@@ -1207,6 +1206,7 @@ def prefilter_candidates(
     """
     counts = {
         "already_in_library": 0,
+        "duplicate_in_batch": 0,
         "cooldown": 0,
         "known_verdict": 0,
         "blocked_genre": 0,
@@ -1224,8 +1224,12 @@ def prefilter_candidates(
 
         key = normalize_track_key(artist, title)
 
-        if key in library_keys or key in seen:
+        if key in library_keys:
             counts["already_in_library"] += 1
+            continue
+        if key in seen:
+            # Listé deux fois ce soir : ce n'est pas « déjà à l'antenne ».
+            counts["duplicate_in_batch"] += 1
             continue
         if track_db.is_in_cooldown(key, ROTATION.cooldown_days):
             counts["cooldown"] += 1
@@ -1242,7 +1246,10 @@ def prefilter_candidates(
                 counts["blocked_genre"] += 1
                 continue
             if GENRE_FILTER.require_tags and not result.tags:
-                track_db.record_verdict(key, "blocked_genre", reason="aucun tag de genre")
+                # Pas de verdict : une absence de tags est transitoire (le
+                # morceau est trop récent, ou les sources n'ont pas répondu).
+                # L'inscrire bannirait à vie un morceau pour un silence du
+                # réseau. On l'écarte pour cette nuit seulement.
                 counts["blocked_genre"] += 1
                 continue
 
@@ -1250,9 +1257,7 @@ def prefilter_candidates(
         survivors.append(track)
 
     # Tri stable : à priorité égale, l'ordre de découverte est conservé.
-    survivors.sort(
-        key=lambda t: SOURCE_PRIORITY.get(t.get("source", ""), SOURCE_PRIORITY_DEFAULT)
-    )
+    survivors.sort(key=lambda t: source_priority(t.get("source", "")))
     return survivors, counts
 
 
@@ -1311,7 +1316,18 @@ def main() -> int:
     db_path = Path(__file__).parent.parent / "data" / "tracks.db"
     track_db = TrackDB(db_path)
     media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
-    report = reconcile(client.get_station_files(), track_db, media_dir=media_dir)
+    try:
+        files = client.get_station_files()
+    except ClientError as e:
+        logger.error("AzuraCast authentication error: %s", e)
+        track_db.close()
+        return 1
+    except (ServerError, HTTPConnectionError) as e:
+        logger.error("Cannot connect to AzuraCast: %s", e)
+        logger.error("Aborting to prevent duplicates. Fix connection and retry.")
+        track_db.close()
+        return 1
+    report = reconcile(files, track_db, media_dir=media_dir)
     existing_library = report.library_keys
 
     # Create Last.fm client for genre filtering (REQUIRED when enabled)
@@ -1362,25 +1378,45 @@ def main() -> int:
         "loudnorm_failed": 0,
         "fingerprint_failed": 0,
         # Phase à froid (2026-07) : ce qui a été écarté sans rien télécharger.
+        # Préfixe `pre_` pour ne pas collisionner avec les compteurs que la
+        # boucle parallèle incrémente (`skipped`, `blocked`, `filtered`).
         "prefiltered": 0,
-        "known_verdict": 0,
+        "pre_already_known": 0,
+        "pre_duplicate_in_batch": 0,
+        "pre_known_verdict": 0,
+        "pre_blocked_genre": 0,
+        "pre_no_metadata": 0,
         "budget": 0,
         "carryover_on_disk": 0,
     }
 
     # --- Phase à froid : rien n'est téléchargé ---
+    # Elle tourne entièrement avant que le budget soit connu : à budget 0 on
+    # paie donc les recherches de genre pour rien. C'est assumé — le cache de
+    # genres et le registre des verdicts en profitent pour les nuits suivantes.
     candidates, prefilter_counts = prefilter_candidates(
         tracks, existing_library, track_db, genre_client
     )
+    # Compteurs de la phase à froid, dans leurs propres clés : la boucle
+    # parallèle incrémente `skipped` et `blocked` pour ses propres motifs
+    # (fichier déjà sur disque, collision de clé entre workers), donc y
+    # écrire ici ferait un double comptage et le récap publierait un
+    # chiffre qui ne veut plus rien dire.
     stats["prefiltered"] = sum(prefilter_counts.values())
-    stats["skipped"] = prefilter_counts["already_in_library"] + prefilter_counts["cooldown"]
-    stats["known_verdict"] = prefilter_counts["known_verdict"]
-    stats["blocked"] = prefilter_counts["blocked_genre"]
+    stats["pre_already_known"] = (
+        prefilter_counts["already_in_library"] + prefilter_counts["cooldown"]
+    )
+    stats["pre_duplicate_in_batch"] = prefilter_counts["duplicate_in_batch"]
+    stats["pre_known_verdict"] = prefilter_counts["known_verdict"]
+    stats["pre_blocked_genre"] = prefilter_counts["blocked_genre"]
+    stats["pre_no_metadata"] = prefilter_counts["no_metadata"]
     logger.info(
         "Filtrage à froid : %d candidats → %d retenus (%d déjà en librairie, "
-        "%d en cooldown, %d déjà jugés, %d genre bloqué)",
+        "%d en double dans le lot, %d en cooldown, %d déjà jugés, "
+        "%d genre bloqué)",
         len(tracks), len(candidates),
-        prefilter_counts["already_in_library"], prefilter_counts["cooldown"],
+        prefilter_counts["already_in_library"],
+        prefilter_counts["duplicate_in_batch"], prefilter_counts["cooldown"],
         prefilter_counts["known_verdict"], prefilter_counts["blocked_genre"],
     )
 
@@ -1409,7 +1445,7 @@ def main() -> int:
         if outcome.status == 'downloaded':
             logger.info("  OK (%s)", outcome.source or "?")
         elif outcome.status == 'skipped':
-            logger.info("  Skipped (duplicate or cooldown)")
+            logger.info("  Skipped (file already on disk, or key claimed by another worker)")
 
         return f"{artist} - {title}", outcome
 
@@ -1449,14 +1485,17 @@ def main() -> int:
     logger.info("Candidats : %d → retenus %d → budget %d",
                 len(tracks), len(candidates), budget)
     logger.info("Écartés avant téléchargement : %d", stats['prefiltered'])
-    logger.info("  → déjà en librairie ou cooldown : %d", stats['skipped'])
-    logger.info("  → déjà jugés (registre)         : %d", stats['known_verdict'])
-    logger.info("  → genre bloqué                  : %d", stats['blocked'])
+    logger.info("  → déjà en librairie ou cooldown : %d", stats['pre_already_known'])
+    logger.info("  → en double dans le lot         : %d", stats['pre_duplicate_in_batch'])
+    logger.info("  → déjà jugés (registre)         : %d", stats['pre_known_verdict'])
+    logger.info("  → genre bloqué                  : %d", stats['pre_blocked_genre'])
+    logger.info("  → métadonnées illisibles        : %d", stats['pre_no_metadata'])
     logger.info("Téléchargés : %d", stats['downloaded'])
     logger.info("  → depuis YouTube    : %d", stats['source_youtube'])
     logger.info("  → depuis SoundCloud : %d", stats['source_soundcloud'])
     if stats['source_other']:
         logger.info("  → depuis autre      : %d", stats['source_other'])
+    logger.info("Sautés dans la boucle (fichier présent, collision) : %d", stats['skipped'])
     logger.info("Doublon audio (empreinte) : %d", stats['duplicate'])
     logger.info("Filtré (durée) : %d", stats['filtered'])
     logger.info("Échecs : %d", stats['failed'])
