@@ -242,6 +242,14 @@ class RotationConfig:
     gold_min_taste: float = 0.70
     gold_max_pct: float = 40.0
 
+    # --- Budget de téléchargement (2026-07) ------------------------------
+    # On ne télécharge que ce qu'on peut espérer diffuser. Le budget d'une
+    # nuit vaut max_uploads_per_night × download_margin, moins les fichiers
+    # déjà en attente dans downloads/. La marge absorbe les rejets du filtre
+    # de goût et les échecs yt-dlp. Avec 24 en carryover pour un quota de 6,
+    # le budget tombe à zéro : c'est voulu, le stock suffit.
+    download_margin: float = 2.0
+
 
 @dataclass
 class GenreFilterConfig:
@@ -846,6 +854,21 @@ TASTE_FILTER = TasteFilterConfig()
 TASTE_DISCOVERY_SEEDS_PER_RUN: int = 15
 TASTE_DISCOVERY_SIMILAR_PER_SEED: int = 4
 TASTE_DISCOVERY_TRACKS_PER_ARTIST: int = 2
+
+# Ordre de dépense du budget de téléchargement. Un choix explicite de
+# Victor passe avant une piste dérivée de son profil, qui passe avant une
+# découverte éditoriale, qui passe avant un chart de tag. Cet ordre ne
+# rejette rien : il décide seulement qui est servi en premier quand le
+# budget est plus court que la liste de candidats.
+SOURCE_PRIORITY: dict[str, int] = {
+    "ManualPicksSource": 0,
+    "PersonalArtistsSource": 1,
+    "CustomFeedsSource": 2,
+    "RSSSource": 3,
+    "HypeMachineSource": 4,
+    "LastFMTagSource": 5,
+}
+SOURCE_PRIORITY_DEFAULT: int = 9
 
 # =============================================================================
 # FONCTIONS UTILITAIRES
