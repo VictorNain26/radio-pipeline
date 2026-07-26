@@ -824,6 +824,7 @@ class TasteFilterConfig:
     k: int = 5
     threshold: float = 0.62   # calibrated 2026-07-17, see above
     min_profile_size: int = 200
+    verdict_ttl_days: int = 90
 
 
 ACOUSTID_DEDUP = AcoustIDDedupConfig()
