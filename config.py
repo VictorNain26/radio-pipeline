@@ -824,6 +824,12 @@ class TasteFilterConfig:
     k: int = 5
     threshold: float = 0.62   # calibrated 2026-07-17, see above
     min_profile_size: int = 200
+
+    # Péremption du verdict `rejected_taste` au registre (track_db.verdicts).
+    # Le profil de goût est reconstruit périodiquement : un morceau écarté
+    # sous l'ancien profil doit pouvoir retenter sa chance, sinon un faux
+    # négatif devient définitif. Les verdicts portant sur une propriété
+    # stable de l'enregistrement (parole, genre, durée) ne périment jamais.
     verdict_ttl_days: int = 90
 
 

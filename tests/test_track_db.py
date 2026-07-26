@@ -84,7 +84,7 @@ def test_fingerprint_roundtrip(db):
 
 
 def test_concurrent_access_is_safe(db):
-    """3 download workers hammer the same connection - must not raise."""
+    """3 download workers hammer the same connection — must not raise."""
     errors: list[Exception] = []
 
     def work(n: int) -> None:
@@ -95,7 +95,7 @@ def test_concurrent_access_is_safe(db):
                 db.is_in_cooldown(key, 60)
                 db.record_fingerprint(key, f"h{n}-{i}", 100)
                 db.find_by_fingerprint(f"h{n}-{i}")
-        except Exception as e:  # noqa: BLE001 - the test asserts none occur
+        except Exception as e:  # noqa: BLE001 — the test asserts none occur
             errors.append(e)
 
     threads = [threading.Thread(target=work, args=(n,)) for n in range(3)]
@@ -108,18 +108,15 @@ def test_concurrent_access_is_safe(db):
 
 
 def test_normalize_track_key_unifies_unicode_quotes():
-    """Unicode apostrophes (ID3 tags) and ASCII (AzuraCast metadata)
+    """U+2019 curly apostrophes (ID3 tags) and ASCII ' (AzuraCast metadata)
     must produce the same key, else play-count sync silently misses tracks
     (Abdullah Abdelkader stuck at 0 plays for 37 days, 2026-07-19)."""
     from track_db import normalize_track_key
-    assert normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It's Your Time)") == \
+    assert normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It’s Your Time)") == \
            normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It's Your Time)")
-    assert normalize_track_key("Kool and Together", "Sittin' On A Red Hot Stove") == \
+    assert normalize_track_key("Kool and Together", "Sittin’ On A Red Hot Stove") == \
            "kool and together - sittin on a red hot stove"
-    # Smart quotes and curly apostrophes must normalize
-    assert normalize_track_key("X", '"Quoted" Title') == normalize_track_key("X", '"Quoted" Title')
-
-
+    assert normalize_track_key("X", "“Quoted” ‘Title´") == normalize_track_key("X", '"Quoted" Title')
 # ---------------------------------------------------------------------------
 # Verdicts (rejection registry for cold-phase download)
 # ---------------------------------------------------------------------------
