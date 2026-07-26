@@ -397,6 +397,23 @@ def test_files_without_metadata_are_ignored_not_registered(db):
     assert report.library_keys == set()
 
 
+def test_present_file_without_metadata_is_never_a_ghost(db):
+    """Un fichier qu'AzuraCast renvoie existe, même sans tags lisibles.
+
+    Le déclarer fantôme annulerait son azuracast_file_id : la ligne
+    serait orpheline pour toujours, son embedding CLAP purgé, et le
+    morceau re-téléchargé en doublon alors qu'il passe encore à l'antenne.
+    """
+    db.record_upload("otto - i am", "Otto", "(I am)", file_id=77)
+
+    report = reconcile([{"id": 77, "artist": "", "title": ""}], db)
+
+    assert report.ghosts_cleared == 0
+    active = db.get_active_tracks()
+    assert len(active) == 1
+    assert active[0]["azuracast_file_id"] == 77
+
+
 def test_counts_are_reported(db):
     db.record_upload("fantome - un", "Fantome", "Un", file_id=90)
     report = reconcile([_file(1, "A", "B")], db)
@@ -548,12 +565,24 @@ def reconcile(
 
     for f in files:
         file_id = f.get("id")
-        artist = f.get("artist", "") or ""
-        title = f.get("title", "") or ""
+
+        # Marquer le fichier comme vu AVANT tout garde : sa présence est
+        # établie par son id, indépendamment de la lisibilité de ses tags.
+        # Sortir plus tôt le ferait passer pour un fantôme dans la boucle
+        # finale, qui annulerait son azuracast_file_id — la ligne serait
+        # alors définitivement orpheline, son embedding CLAP purgé, et le
+        # morceau re-téléchargé en doublon alors qu'il est toujours à
+        # l'antenne. C'est exactement le scénario de l'incident du 18/07.
+        if file_id is not None:
+            seen_ids.add(file_id)
+
+        artist = (f.get("artist") or "").strip()
+        title = (f.get("title") or "").strip()
 
         if not (artist and title):
             # Sans métadonnées on ne peut ni construire de clé ni dédupliquer.
-            # Le fichier reste à l'antenne, il est simplement invisible ici.
+            # Le fichier reste à l'antenne, il est simplement invisible ici —
+            # mais il n'est pas déclaré disparu.
             logger.warning("Fichier AzuraCast sans artiste/titre (id=%s) — ignoré", file_id)
             continue
 
@@ -562,7 +591,6 @@ def reconcile(
 
         if file_id is None:
             continue
-        seen_ids.add(file_id)
 
         known = by_file_id.get(file_id)
         if known is None:
