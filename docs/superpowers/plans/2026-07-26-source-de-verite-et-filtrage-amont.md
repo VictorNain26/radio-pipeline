@@ -1494,8 +1494,11 @@ def test_message_stays_within_url_budget():
 def test_truncate_cuts_on_a_line_boundary():
     text = "ligne un\nligne deux\nligne trois"
     out = truncate(text, 20)
-    assert out.endswith("…")
-    assert "ligne deux" not in out or len(out) <= 21
+    assert out == "ligne un…"
+
+
+def test_truncate_leaves_short_text_alone():
+    assert truncate("court", 20) == "court"
 ```
 
 - [ ] **Step 2 : Lancer les tests et vérifier qu'ils échouent**
