@@ -692,11 +692,11 @@ RSS_FEEDS: tuple[RSSFeedSpec, ...] = (
 # seule. Mesuré le 2026-08-19 : les 30 candidats de tracks-to-download.json
 # étaient hypem à 100 %.
 #
-# Désactiver Last.fm ne « rend » donc aucun volume aux flux RSS : HypeMachine
-# reprend simplement les mêmes 30 places. Le vrai défaut est ailleurs et reste
-# ouvert — le cap ignore SOURCE_PRIORITY, qui n'est appliqué qu'ensuite dans
-# download.py, sur une liste déjà homogène. Tant que ce n'est pas corrigé, ni
-# les blogs RSS, ni PersonalArtists, ni les picks manuels n'alimentent l'antenne.
+# Désactiver Last.fm ne « rendait » donc aucun volume aux flux RSS : HypeMachine
+# reprenait simplement les mêmes 30 places. Ce défaut-là — le cap servi dans
+# l'ordre d'ajout des sources — a été corrigé le même jour : `_dedupe_and_cap`
+# sert désormais les sources en tourniquet selon SOURCE_PRIORITY, si bien
+# qu'aucune ne peut plus monopoliser la fournée.
 #
 # Le mécanisme reste en place : remettre des tags ici le réarme (discover.py
 # teste `if settings.lastfm_api_key and LASTFM_TAGS`). Ne pas confondre avec
