@@ -225,6 +225,22 @@ class RotationConfig:
     # non-retenus partent en cooldown.
     max_uploads_per_night: int = 6
 
+    # --- Plafond de suppressions par nuit (2026-08) -----------------------
+    # La bibliothèque ne doit jamais pouvoir se vider plus vite qu'elle ne se
+    # remplit. Sans ce plafond, toute interruption d'alimentation se solde par
+    # une purge de rattrapage : du 1er au 18 août 2026, 18 nuits sans
+    # acquisition (DNS coupé à 03:00) ont fait tomber la bibliothèque de 626 à
+    # 333 morceaux en une seule nuit, dont 31 que Victor avait likés.
+    #
+    # Geler l'éviction pendant la panne ne suffit pas : les morceaux vieillissent
+    # quand même, et la première nuit de retour les supprimerait tous d'un coup.
+    # Le plafond, lui, protège de TOUTES les famines — réseau, sources mortes,
+    # yt-dlp cassé — et pas seulement de celle qu'on vient de vivre.
+    #
+    # 2 × max_uploads_per_night : la bibliothèque peut décroître, mais deux fois
+    # moins vite qu'elle ne grandit à plein régime, donc jamais brutalement.
+    max_deletions_per_night: int = 12
+
     # Filet anti-pépite : un candidat non retenu par le quota mais dans la
     # couleur (taste >= TASTE_FILTER.threshold) reste dans le dossier de
     # téléchargement et reconcourt la nuit suivante contre la nouvelle
@@ -660,19 +676,33 @@ RSS_FEEDS: tuple[RSSFeedSpec, ...] = (
 
 
 # Tags Last.fm dont on tire les top tracks (gettoptracks).
-# Mix indie / electro / ambient + hip-hop demandé.
-# Chaque tag retourne jusqu'à LASTFM_TAG_LIMIT tracks par run.
-LASTFM_TAGS: tuple[str, ...] = (
-    "indie",
-    "electronic",
-    "ambient",
-    "hip-hop",
-    "downtempo",
-    "dream pop",
-    "trip hop",
-    "indietronica",
-    "shoegaze",
-)
+#
+# DÉSACTIVÉ le 2026-08-19. `tag.gettoptracks` renvoie les morceaux les plus
+# écoutés *de tous les temps* pour un genre, pas les sorties récentes : les
+# mêmes chaque nuit, et les chevaux de bataille canoniques du genre. Mesuré
+# ce jour-là sur les 9 tags actifs : indie → The Neighbourhood « Sweater
+# Weather » (2012), electronic → Kavinsky « Nightcall » (2010), ambient →
+# quatre fois C418 (bande-son de Minecraft), dream pop → Taylor Swift,
+# shoegaze → Slowdive (1993).
+#
+# Cette source pesait 135 candidats/nuit, soit 37 % du volume BRUT — mais
+# attention : ce volume n'atteignait jamais le téléchargement. `_dedupe_and_cap`
+# parcourt les sources dans leur ordre d'ajout et coupe à DISCOVER_MAX_TRACKS ;
+# HypeMachine, ajoutée en premier avec 50 morceaux, sature le cap de 30 à elle
+# seule. Mesuré le 2026-08-19 : les 30 candidats de tracks-to-download.json
+# étaient hypem à 100 %.
+#
+# Désactiver Last.fm ne « rend » donc aucun volume aux flux RSS : HypeMachine
+# reprend simplement les mêmes 30 places. Le vrai défaut est ailleurs et reste
+# ouvert — le cap ignore SOURCE_PRIORITY, qui n'est appliqué qu'ensuite dans
+# download.py, sur une liste déjà homogène. Tant que ce n'est pas corrigé, ni
+# les blogs RSS, ni PersonalArtists, ni les picks manuels n'alimentent l'antenne.
+#
+# Le mécanisme reste en place : remettre des tags ici le réarme (discover.py
+# teste `if settings.lastfm_api_key and LASTFM_TAGS`). Ne pas confondre avec
+# le tag ID3 « LASTFM_TAGS » écrit par analyze.py, qui est un genre et n'a
+# rien à voir.
+LASTFM_TAGS: tuple[str, ...] = ()
 LASTFM_TAG_LIMIT: int = 15
 
 # Plafond global de tracks remontées par l'étape discover (toutes sources

@@ -14,7 +14,7 @@ import pytest
 
 from classify import compute_rotation_tier, tier_filter_dayparts, TIER_RANK  # type: ignore[import-not-found]
 from config import (  # type: ignore[import-not-found]
-    DaypartSegment, ROTATION_CATEGORIES,
+    DaypartSegment, ROTATION, ROTATION_CATEGORIES,
 )
 
 
@@ -278,4 +278,99 @@ def test_rotation_clears_ghost_rows(tmp_path, monkeypatch):
     enforce_tiered_rotation(_FakeClient(), db, new_tracks_count=0)
 
     assert [t["track_key"] for t in db.get_active_tracks()] == ["vivant - y"]
+    db.close()
+
+
+# --- Famine : gel réseau et plafond de suppressions ---------------------------
+# Ajoutés après l'incident du 1er-18 août 2026. Une coupure DNS à 03:00
+# (rafraîchissement du snap Docker) a privé le pipeline d'acquisition 18 nuits
+# de suite pendant que la rotation continuait de purger : 626 morceaux tombés à
+# 333 en une nuit de rattrapage, dont 31 likés par Victor.
+#
+# Ces deux tests appellent réellement enforce_tiered_rotation et comptent les
+# suppressions : retirer un garde-fou les fait échouer.
+
+
+def _station_expiree(nb):
+    """Monte une station jouet dont tous les morceaux sont EXPIRED."""
+    vieux = time.time() - (ROTATION.max_age_days + 50) * 86400
+    return [{"id": i, "artist": f"A{i}", "title": f"T{i}", "uploaded_at": vieux}
+            for i in range(1, nb + 1)]
+
+
+def _rotation_jouet(tmp_path, monkeypatch, nb_morceaux):
+    """Câblage commun : client factice traçant, base jouet, effets de bord neutralisés."""
+    import audio_embeddings
+    import classify
+    import library_state
+    from track_db import TrackDB
+
+    supprimes = []
+    fichiers = _station_expiree(nb_morceaux)
+
+    class _FakeClient:
+        def get_all_files(self):
+            return fichiers
+
+        def get_history_since(self, since):
+            return []
+
+        def get_playlists_map(self):
+            return {}
+
+        def assign_playlists(self, file_id, playlist_ids):
+            return True
+
+        def delete_file(self, file_id):
+            supprimes.append(file_id)
+            return True
+
+    monkeypatch.setattr(classify, "RECONCILE_REPORT_PATH", tmp_path / "r.json")
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_FILES", 0)
+    monkeypatch.setattr(library_state, "RECONCILE_MIN_RATIO", 0.0)
+
+    class _NoopStore:
+        def __init__(self, data_dir):
+            pass
+
+        def prune(self, valid_keys):
+            return 0
+
+    monkeypatch.setattr(audio_embeddings, "EmbeddingStore", _NoopStore)
+
+    db = TrackDB(tmp_path / "t.db")
+    vieux = time.time() - (ROTATION.max_age_days + 50) * 86400
+    for f in fichiers:
+        cle = f"{f['artist'].lower()} - {f['title'].lower()}"
+        db.record_upload(cle, f["artist"], f["title"], file_id=f["id"])
+        # record_upload horodate à maintenant : on vieillit la ligne pour
+        # qu'elle tombe réellement dans EXPIRED.
+        db.conn.execute("UPDATE tracks SET uploaded_at=? WHERE track_key=?", (vieux, cle))
+    db.conn.commit()
+    return _FakeClient(), db, supprimes
+
+
+def test_gel_reseau_ne_supprime_rien(tmp_path, monkeypatch):
+    """Sans réseau, aucune suppression — même avec une station 100 % expirée."""
+    from classify import enforce_tiered_rotation
+
+    monkeypatch.setenv("PIPELINE_NETWORK_DOWN", "1")
+    client, db, supprimes = _rotation_jouet(tmp_path, monkeypatch, 20)
+    enforce_tiered_rotation(client, db, new_tracks_count=0)
+    assert supprimes == []
+    db.close()
+
+
+def test_plafond_limite_la_purge_de_rattrapage(tmp_path, monkeypatch):
+    """Réseau OK : la purge ne peut pas dépasser max_deletions_per_night.
+
+    C'est ce qui empêche une famine de se solder par un massacre à la reprise.
+    """
+    from classify import enforce_tiered_rotation
+
+    monkeypatch.delenv("PIPELINE_NETWORK_DOWN", raising=False)
+    client, db, supprimes = _rotation_jouet(tmp_path, monkeypatch, 60)
+    enforce_tiered_rotation(client, db, new_tracks_count=0)
+    assert len(supprimes) <= ROTATION.max_deletions_per_night
+    assert len(supprimes) > 0, "sans gel, la rotation doit tout de même travailler"
     db.close()

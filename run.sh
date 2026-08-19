@@ -181,6 +181,47 @@ check_dependencies() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Connectivité externe
+# -----------------------------------------------------------------------------
+# Toutes les sources de découverte avalent leurs erreurs réseau et renvoient
+# une liste vide : en aval, « le DNS est mort » est indiscernable de « rien de
+# neuf ce soir ». C'est ce qui a fait passer 18 nuits consécutives sans un
+# seul morceau (1er au 18 août 2026) pendant que la rotation continuait
+# d'évincer — la bibliothèque a fondu de 626 à 333.
+#
+# Le contrôle est volontairement patient : la coupure observée durait une
+# vingtaine de minutes (redémarrage du démon Docker par un rafraîchissement
+# snap), donc attendre coûte moins cher qu'abandonner la nuit.
+# 16 tentatives = 15 pauses de 90 s = 22,5 min d'attente réelle. La coupure
+# observée durait une vingtaine de minutes : un budget plus court abandonnerait
+# la nuit juste avant le retour du réseau. `+ 0` force l'arithmétique : une
+# valeur non numérique venue de .env ferait échouer le test de boucle et
+# déclarerait le réseau mort sans une seule tentative.
+INTERNET_MAX_ATTEMPTS=$(( ${INTERNET_MAX_ATTEMPTS:-16} + 0 ))
+INTERNET_RETRY_DELAY=$(( ${INTERNET_RETRY_DELAY:-90} + 0 ))
+
+check_internet() {
+    local attempt=1
+    while [ "$attempt" -le "$INTERNET_MAX_ATTEMPTS" ]; do
+        # Deux hôtes indépendants : la panne de l'un ne doit pas faire
+        # conclure à une panne du réseau.
+        if curl -s --max-time 10 -o /dev/null "https://api.github.com" 2>/dev/null \
+           || curl -s --max-time 10 -o /dev/null "https://pitchfork.com/" 2>/dev/null; then
+            if [ "$attempt" -gt 1 ]; then
+                log_info "Connectivité externe rétablie (tentative $attempt)"
+            fi
+            return 0
+        fi
+        log_warn "Pas de connectivité externe (tentative $attempt/$INTERNET_MAX_ATTEMPTS)"
+        if [ "$attempt" -lt "$INTERNET_MAX_ATTEMPTS" ]; then
+            sleep "$INTERNET_RETRY_DELAY"
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 check_azuracast() {
     log_info "Checking AzuraCast connectivity..."
 
@@ -256,23 +297,48 @@ main() {
     # Health check
     check_azuracast
 
+    # AzuraCast tourne en local : son health check reste vert alors que le
+    # réseau externe est mort. Il faut donc un second contrôle, distinct.
+    # État dérivé de CE run, jamais hérité. Sans ce désarmement, la variable
+    # posée une fois — dans .env (que run.sh source avec `set -a`), dans un
+    # shell interactif, ou dans l'unité systemd — gèlerait l'éviction pour
+    # toujours et sans bruit : le repli silencieux, dans l'autre sens.
+    unset PIPELINE_NETWORK_DOWN
+
+    NETWORK_OK=true
+    if ! check_internet; then
+        NETWORK_OK=false
+        # Lu par classify.py : une nuit sans acquisition possible ne doit pas
+        # être une nuit d'éviction, sinon une panne réseau vide la radio.
+        export PIPELINE_NETWORK_DOWN=1
+        log_error "Réseau externe indisponible — découverte et téléchargement sautés"
+        notify "AubeSonore : réseau indisponible" \
+            "Aucune connectivité externe après $(( (INTERNET_MAX_ATTEMPTS - 1) * INTERNET_RETRY_DELAY / 60 )) min. Découverte sautée ; la rotation ne supprimera rien cette nuit." \
+            "urgent" "warning"
+    fi
+
     # Step 1: Discover tracks (multi-source : HypeMachine + RSS + Last.fm + manual picks)
     echo ""
     echo "┌─────────────────────────────────────────────────────────────────┐"
     echo "│ STEP 1/4: DISCOVER (multi-source)                              │"
     echo "└─────────────────────────────────────────────────────────────────┘"
 
-    if ! python3 scripts/discover.py; then
-        log_error "Discover step failed"
-        exit 1
-    fi
-
     DOWNLOAD_COUNT=0
     HAS_TRACKS=false
-    if [ -f "tracks-to-download.json" ]; then
-        HAS_TRACKS=true
+
+    if [ "$NETWORK_OK" = true ]; then
+        if ! python3 scripts/discover.py; then
+            log_error "Discover step failed"
+            exit 1
+        fi
+
+        if [ -f "tracks-to-download.json" ]; then
+            HAS_TRACKS=true
+        else
+            log_info "No tracks-to-download.json (all sources empty)"
+        fi
     else
-        log_info "No tracks-to-download.json (all sources empty)"
+        log_warn "Découverte sautée : pas de réseau externe"
     fi
 
     # Step 2: Download (yt-dlp, multi-quality-gates: AcoustID dedup + speech filter + loudnorm)
@@ -333,7 +399,14 @@ except Exception:
     # Upload count as written by classify.py (single source of truth).
     UPLOAD_COUNT=$(cat data/last_upload_count.txt 2>/dev/null || echo 0)
 
-    write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
+    # Le statut distingue une nuit gelée d'une nuit calme : sans ça, rien dans
+    # pipeline_stats.json ne permet de reconstituer une panne après coup — c'est
+    # ce qui a laissé 18 nuits passer inaperçues.
+    if [ "$NETWORK_OK" = false ]; then
+        write_stats "network_down" 0 0 "Réseau externe indisponible ; éviction gelée"
+    else
+        write_stats "success" "${DOWNLOAD_COUNT:-0}" "${UPLOAD_COUNT:-0}"
+    fi
 
     # Recap quotidien WhatsApp (CallMeBot) — best-effort, jamais bloquant.
     python3 scripts/send_daily_recap.py || log_warn "Recap WhatsApp failed (non-blocking)"
@@ -383,9 +456,19 @@ except Exception:
         log_warn "CLAP embedding failures: $CLAP_FAIL (non-blocking, smart_queue coverage drops)"
     fi
 
-    notify "AubeSonore Pipeline OK" \
-        "Pipeline OK. DL:${DOWNLOAD_COUNT:-0} UL:${UPLOAD_COUNT:-0} loudnorm_fail:${LOUDNORM_FAIL:-0} fp_fail:${FINGERPRINT_FAIL:-0}" \
-        "low" "white_check_mark"
+    # L'alerte de panne réseau part elle-même par le réseau : quand le DNS est
+    # mort, elle n'arrive jamais. On la rejoue ici, une fois la connectivité
+    # éventuellement revenue — sinon une nuit gelée serait indiscernable d'une
+    # nuit calme, c'est-à-dire exactement la panne d'origine décalée d'un cran.
+    if [ "$NETWORK_OK" = false ]; then
+        notify "AubeSonore : nuit SANS RÉSEAU" \
+            "Découverte et téléchargement sautés, éviction gelée. Aucun morceau ajouté cette nuit." \
+            "high" "warning"
+    else
+        notify "AubeSonore Pipeline OK" \
+            "Pipeline OK. DL:${DOWNLOAD_COUNT:-0} UL:${UPLOAD_COUNT:-0} loudnorm_fail:${LOUDNORM_FAIL:-0} fp_fail:${FINGERPRINT_FAIL:-0}" \
+            "low" "white_check_mark"
+    fi
 
     log_info "Pipeline completed successfully"
 }

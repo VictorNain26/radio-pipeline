@@ -13,6 +13,7 @@ Features v2.0:
 
 import json
 import logging
+import os
 import sys
 import time
 import unicodedata
@@ -846,6 +847,21 @@ def process_track(
         return "failed", []
 
 
+def is_eviction_frozen(env: dict[str, str] | None = None) -> bool:
+    """
+    L'éviction est-elle gelée pour ce run ?
+
+    `run.sh` pose PIPELINE_NETWORK_DOWN=1 quand le contrôle de connectivité
+    externe a échoué. Vieillir et purger n'a de sens que si le renouvellement
+    fonctionne : sans ce gel, une panne réseau prolongée vide la radio sans
+    que rien ne s'y oppose.
+
+    Toute nouvelle phase de suppression dans enforce_tiered_rotation doit
+    consulter ce drapeau, sinon elle rouvre la brèche.
+    """
+    return (env if env is not None else os.environ).get("PIPELINE_NETWORK_DOWN") == "1"
+
+
 def enforce_tiered_rotation(
     client: ClassifyClient,
     track_db: TrackDB,
@@ -1016,6 +1032,23 @@ def enforce_tiered_rotation(
 
     deleted_count = 0
 
+    # Une panne réseau gèle l'éviction. Sans ce gel, une coupure prolongée
+    # vide la radio : du 1er au 18 août 2026, 18 nuits sans acquisition ont
+    # laissé la rotation purger seule — 626 morceaux tombés à 333 en une
+    # nuit de rattrapage, dont 31 que Victor avait likés. Le vieillissement
+    # n'est légitime que si le renouvellement fonctionne ; sinon la radio se
+    # mange elle-même. run.sh pose ce drapeau après échec du contrôle de
+    # connectivité. Le re-tiering (phase 6) reste actif : il ne supprime rien.
+    eviction_frozen = is_eviction_frozen()
+    if eviction_frozen:
+        logger.warning(
+            "  ÉVICTION GELÉE : pas de réseau cette nuit, aucune suppression")
+
+    # Plafond dur, indépendant du gel : la bibliothèque ne peut jamais perdre
+    # plus vite qu'elle ne se remplit. C'est lui qui empêche la purge de
+    # rattrapage après une famine — le gel seul ne fait que la reporter.
+    deletion_cap = ROTATION.max_deletions_per_night
+
     # --- Phase 3: EXPIRED (>max_age_days) — graduate to GOLD or delete ---
     # Radio practice: proven, on-color tracks become permanent catalogue
     # instead of dying at max_age_days. Everything else is deleted.
@@ -1023,9 +1056,16 @@ def enforce_tiered_rotation(
     gold_count = len(tiers["GOLD"])
     graduated = 0
     # Best candidates graduate first while the cap has room.
-    expired_ranked = sorted(
+    # Gel réseau : on ne fait ni graduation ni suppression, les EXPIRED
+    # attendent la nuit suivante. Leur âge n'a pas de sens quand rien n'entre.
+    expired_ranked = [] if eviction_frozen else sorted(
         tiers["EXPIRED"], key=lambda e: e["play_count"], reverse=True)
     for entry in expired_ranked:
+        # La graduation GOLD ne supprime rien : elle reste permise au-delà du
+        # plafond, seule la suppression s'arrête.
+        if deleted_count >= deletion_cap and gold_count >= gold_cap:
+            logger.info("  Plafond de suppressions atteint (%d) — le reste attend demain", deletion_cap)
+            break
         taste_score = check_taste(entry["track_key"]) if entry["track_key"] else None
         if (
             gold_count < gold_cap
@@ -1051,6 +1091,8 @@ def enforce_tiered_rotation(
                 if ids:
                     client.assign_playlists(entry["file_id"], ids)
             continue
+        if deleted_count >= deletion_cap:
+            continue        # plafond atteint : ce morceau retente sa chance demain
         if client.delete_file(entry["file_id"]):
             logger.info("  EXPIRED: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
             if entry["track_key"]:
@@ -1061,12 +1103,15 @@ def enforce_tiered_rotation(
 
     # --- Phase 4: Cap FADING to fading_max_pct% of library ---
     fading_max_count = int(max_tracks * fading_max_pct / 100)
-    fading_excess = len(tiers["FADING"]) - fading_max_count
+    fading_excess = 0 if eviction_frozen else len(tiers["FADING"]) - fading_max_count
 
     if fading_excess > 0:
         # Sort by play_count ascending: least-played leave first (failed to get traction)
         fading_sorted = sorted(tiers["FADING"], key=lambda x: x["play_count"], reverse=False)
         for entry in fading_sorted[:fading_excess]:
+            if deleted_count >= deletion_cap:
+                logger.info("  Plafond de suppressions atteint (%d) — cap FADING reporté", deletion_cap)
+                break
             if client.delete_file(entry["file_id"]):
                 logger.info("  FADING cap: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
                 if entry["track_key"]:
@@ -1080,7 +1125,7 @@ def enforce_tiered_rotation(
     # leaving the library floating at 680-690 instead of max_tracks.
     expected_additions = min(new_tracks_count, ROTATION.max_uploads_per_night)
     remaining = current_count - deleted_count + expected_additions
-    overflow = max(0, remaining - max_tracks)
+    overflow = 0 if eviction_frozen else max(0, remaining - max_tracks)
 
     if overflow > 0:
         # Candidates: CURRENT with plays >= min_plays, oldest first
@@ -1090,6 +1135,9 @@ def enforce_tiered_rotation(
         )
         for entry in candidates:
             if overflow <= 0:
+                break
+            if deleted_count >= deletion_cap:
+                logger.info("  Plafond de suppressions atteint (%d) — overflow reporté", deletion_cap)
                 break
             if client.delete_file(entry["file_id"]):
                 logger.info("  CURRENT overflow: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
