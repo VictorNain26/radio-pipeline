@@ -38,7 +38,7 @@ Les scripts d'audit/maintenance toujours utiles :
 ### 1. Séparation AzuraCast (mensuel ou après modification de `config.SEPARATION`)
 
 ```bash
-cd /home/victormoi/radio-pipeline
+cd /home/victormoi/radio/pipeline
 set -a && source .env && set +a
 python3 scripts/audit_separation.py
 ```
@@ -285,8 +285,8 @@ dérive catastrophique alors que le chemin est simplement faux (station
 renommée, dossier déplacé) :
 
 ```bash
-ls -d ~/azuracast/stations/*/media
-find ~/azuracast/stations/*/media -name '*.mp3' | wc -l
+ls -d ~/radio/azuracast/stations/*/media
+find ~/radio/azuracast/stations/*/media -name '*.mp3' | wc -l
 ```
 
 ---

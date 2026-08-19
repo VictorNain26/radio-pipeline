@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-LOG_FILE="/home/victormoi/radio-pipeline/ytdlp-update.log"
+LOG_FILE="/home/victormoi/radio/pipeline/ytdlp-update.log"
 YTDLP_PATH="/home/victormoi/.local/bin/yt-dlp"
 DOWNLOAD_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 
