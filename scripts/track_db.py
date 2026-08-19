@@ -19,7 +19,10 @@ def normalize_track_key(artist: str, title: str) -> str:
     """Create normalized key for track comparison (mirrors download.normalize_track_key)."""
     artist = artist.lower().strip()
     title = title.lower().strip()
-    for char in ['(', ')', '[', ']', '"', "'"]:
+    # Unicode quotes/apostrophes must strip like their ASCII forms: ID3 tags
+    # often carry ’ where AzuraCast metadata has ' — divergent keys break
+    # play-count sync (tracks stuck at 0 plays forever).
+    for char in ['(', ')', '[', ']', '"', "'", '’', '‘', '“', '”', '´', '`']:
         artist = artist.replace(char, '')
         title = title.replace(char, '')
     artist = ' '.join(artist.split())
@@ -41,6 +44,9 @@ def _synchronized(method):
 
 class TrackDB:
     """SQLite-backed track database for rotation tracking."""
+
+    # Only taste verdicts are perishable: the taste profile evolves over time.
+    PERISHABLE_VERDICTS = frozenset({"rejected_taste"})
 
     def __init__(self, db_path: str | Path):
         db_path = Path(db_path)
@@ -74,7 +80,12 @@ class TrackDB:
                 -- config.ROTATION_CATEGORIES). New tracks start HEAVY
                 -- (grace period); enforce_tiered_rotation re-tiers them
                 -- up or down on every run based on age and play rate.
-                tier TEXT DEFAULT 'DISCOVERY'
+                tier TEXT DEFAULT 'DISCOVERY',
+                -- Source de découverte (hypem, personal, manual, un label de
+                -- flux RSS...). Elle était calculée chaque nuit puis jetée :
+                -- sans elle, impossible de croiser les likes avec l'origine, et
+                -- donc de donner à SOURCE_PRIORITY des valeurs mesurées.
+                source TEXT
             );
 
             -- Idempotent migration : on existing DBs, ensure the new column
@@ -97,12 +108,22 @@ class TrackDB:
             );
             CREATE INDEX IF NOT EXISTS idx_fp_hash
                 ON audio_fingerprints(fingerprint_hash);
+
+            CREATE TABLE IF NOT EXISTS verdicts (
+                track_key TEXT PRIMARY KEY,
+                verdict TEXT NOT NULL,
+                reason TEXT,
+                score REAL,
+                decided_at REAL NOT NULL
+            );
         """)
         # Ensure tier column exists on legacy DBs (idempotent).
         try:
             cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}
             if "tier" not in cols:
                 self.conn.execute("ALTER TABLE tracks ADD COLUMN tier TEXT DEFAULT 'DISCOVERY'")
+            if "source" not in cols:
+                self.conn.execute("ALTER TABLE tracks ADD COLUMN source TEXT")
         except sqlite3.OperationalError:
             pass
         self.conn.commit()
@@ -142,26 +163,147 @@ class TrackDB:
         ).fetchone()
         return dict(row) if row else None
 
+    # ------------------------------------------------------------------
+    # Verdicts (rejection registry for cold-phase download)
+    # ------------------------------------------------------------------
+
+    @_synchronized
+    def record_verdict(
+        self, track_key: str, verdict: str,
+        reason: str | None = None, score: float | None = None,
+    ) -> None:
+        """Record a verdict for a track (idempotent)."""
+        self.conn.execute(
+            """INSERT INTO verdicts (track_key, verdict, reason, score, decided_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(track_key) DO UPDATE SET
+                   verdict = excluded.verdict,
+                   reason = excluded.reason,
+                   score = excluded.score,
+                   decided_at = excluded.decided_at""",
+            (track_key, verdict, reason, score, time.time()),
+        )
+        self.conn.commit()
+
+    @_synchronized
+    def get_verdict(self, track_key: str) -> dict[str, Any] | None:
+        """Retrieve a verdict for a track, or None if not found."""
+        row = self.conn.execute(
+            "SELECT * FROM verdicts WHERE track_key = ?",
+            (track_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    @_synchronized
+    def has_active_verdict(self, track_key: str, taste_ttl_days: int) -> bool:
+        """Check if a track has an active (non-expired) verdict.
+
+        Perishable verdicts (those about taste) expire after taste_ttl_days.
+        Non-perishable verdicts are always active.
+
+        Args:
+            track_key: The normalized track key
+            taste_ttl_days: TTL in days for taste-based verdicts
+
+        Returns:
+            True if the verdict exists and is still active, False otherwise.
+        """
+        row = self.conn.execute(
+            "SELECT verdict, decided_at FROM verdicts WHERE track_key = ?",
+            (track_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["verdict"] in self.PERISHABLE_VERDICTS:
+            return (time.time() - row["decided_at"]) < taste_ttl_days * 86400
+        return True
+
+    @_synchronized
+    def repair_track_key(self, old_key: str, new_key: str) -> bool:
+        """Repair a track key when AzuraCast metadata drifts.
+
+        Updates the track_key in tracks, audio_fingerprints, and verdicts tables.
+        If new_key is held by a row that is no longer live (no AzuraCast
+        file_id), that row is deleted to free the key. If it is held by a
+        LIVE row, nothing is repaired: see below.
+
+        Args:
+            old_key: The current (drifted) track key
+            new_key: The corrected track key
+
+        Returns:
+            True if a row was repaired, False otherwise.
+        """
+        if old_key == new_key or not old_key or not new_key:
+            return False
+        if self.conn.execute(
+            "SELECT 1 FROM tracks WHERE track_key = ?", (old_key,)
+        ).fetchone() is None:
+            return False
+
+        # Deux fichiers AzuraCast distincts peuvent normaliser vers la même
+        # clé. Écraser la ligne vivante détruirait ses passages, son tier,
+        # son mood et son empreinte, et laisserait ce fichier bien vivant
+        # sans ligne — invisible pour reconcile, dont l'id est pourtant vu
+        # par l'API. Au run suivant il adopterait la ligne de l'autre par
+        # ON CONFLICT, et les deux se la disputeraient indéfiniment.
+        # On préfère ne rien réparer et le dire : un doublon visible vaut
+        # mieux qu'une donnée détruite en silence.
+        collision = self.conn.execute(
+            "SELECT azuracast_file_id FROM tracks WHERE track_key = ?", (new_key,)
+        ).fetchone()
+        if collision is not None and collision["azuracast_file_id"] is not None:
+            logger.warning(
+                "Réparation de clé refusée : %r viserait %r, déjà tenue par "
+                "un fichier vivant (file_id=%s). Les deux morceaux portent la "
+                "même clé normalisée — à arbitrer à la main.",
+                old_key, new_key, collision["azuracast_file_id"],
+            )
+            return False
+
+        # Libérer la clé cible : la ligne qui l'occupe n'est plus à l'antenne.
+        self.conn.execute("DELETE FROM tracks WHERE track_key = ?", (new_key,))
+        self.conn.execute(
+            "UPDATE tracks SET track_key = ? WHERE track_key = ?", (new_key, old_key)
+        )
+        self.conn.execute("DELETE FROM audio_fingerprints WHERE track_key = ?", (new_key,))
+        self.conn.execute(
+            "UPDATE audio_fingerprints SET track_key = ? WHERE track_key = ?",
+            (new_key, old_key),
+        )
+        self.conn.execute("DELETE FROM verdicts WHERE track_key = ?", (new_key,))
+        self.conn.execute(
+            "UPDATE verdicts SET track_key = ? WHERE track_key = ?", (new_key, old_key)
+        )
+        self.conn.commit()
+        return True
+
     @_synchronized
     def record_upload(
         self, track_key: str, artist: str, title: str, file_id: int,
         mood: str | None = None, tier: str = "DISCOVERY",
+        source: str | None = None,
     ) -> None:
         """Record a track upload (or re-upload)."""
         now = time.time()
         self.conn.execute(
             """INSERT INTO tracks (track_key, artist, title, uploaded_at, deleted_at,
-                                   azuracast_file_id, play_count, mood, tier)
-               VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?)
+                                   azuracast_file_id, play_count, mood, tier, source)
+               VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?, ?)
                ON CONFLICT(track_key) DO UPDATE SET
                    uploaded_at = excluded.uploaded_at,
                    deleted_at = NULL,
                    azuracast_file_id = excluded.azuracast_file_id,
                    play_count = 0,
                    mood = excluded.mood,
-                   tier = excluded.tier""",
-            (track_key, artist, title, now, file_id, mood, tier),
+                   tier = excluded.tier,
+                   -- Un ré-upload sans provenance (réanalyse, backfill) ne doit
+                   -- pas effacer une origine déjà connue.
+                   source = COALESCE(excluded.source, tracks.source)""",
+            (track_key, artist, title, now, file_id, mood, tier, source),
         )
+        # A track that goes live is not a rejection
+        self.conn.execute("DELETE FROM verdicts WHERE track_key = ?", (track_key,))
         self.conn.commit()
 
     @_synchronized

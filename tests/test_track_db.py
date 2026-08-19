@@ -105,3 +105,176 @@ def test_concurrent_access_is_safe(db):
         t.join()
     assert not errors
     assert len(db.get_active_tracks()) == 300
+
+
+def test_normalize_track_key_unifies_unicode_quotes():
+    """U+2019 curly apostrophes (ID3 tags) and ASCII ' (AzuraCast metadata)
+    must produce the same key, else play-count sync silently misses tracks
+    (Abdullah Abdelkader stuck at 0 plays for 37 days, 2026-07-19)."""
+    from track_db import normalize_track_key
+    assert normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It’s Your Time)") == \
+           normalize_track_key("Abdullah Abdelkader", "Al Zaman Zamanak (It's Your Time)")
+    assert normalize_track_key("Kool and Together", "Sittin’ On A Red Hot Stove") == \
+           "kool and together - sittin on a red hot stove"
+    assert normalize_track_key("X", "“Quoted” ‘Title´") == normalize_track_key("X", '"Quoted" Title')
+# ---------------------------------------------------------------------------
+# Verdicts (rejection registry for cold-phase download)
+# ---------------------------------------------------------------------------
+
+def test_record_and_get_verdict(db):
+    """Record a verdict and retrieve it."""
+    db.record_verdict("a - b", "rejected_taste", reason="0.41 < 0.62", score=0.41)
+    v = db.get_verdict("a - b")
+    assert v is not None
+    assert v["verdict"] == "rejected_taste"
+    assert v["reason"] == "0.41 < 0.62"
+    assert v["score"] == 0.41
+    assert "decided_at" in v
+
+
+def test_record_verdict_without_optional_fields(db):
+    """Record a verdict with only required fields."""
+    db.record_verdict("a - b", "rejected_taste", score=0.41)
+    v = db.get_verdict("a - b")
+    assert v is not None
+    assert v["verdict"] == "rejected_taste"
+    assert v["reason"] is None
+    assert v["score"] == 0.41
+
+
+def test_get_nonexistent_verdict(db):
+    """Getting a verdict that doesn't exist returns None."""
+    assert db.get_verdict("nonexistent - key") is None
+
+
+def test_has_active_verdict_nonperishable(db):
+    """Non-perishable verdicts are always active."""
+    db.record_verdict("a - b", "some_verdict", score=0.5)
+    # Even with taste_ttl_days=0, non-perishable verdicts stay active
+    assert db.has_active_verdict("a - b", taste_ttl_days=0) is True
+
+
+def test_has_active_verdict_perishable_fresh(db):
+    """Fresh perishable verdicts are active."""
+    db.record_verdict("a - b", "rejected_taste", score=0.41)
+    # Just recorded, should be active
+    assert db.has_active_verdict("a - b", taste_ttl_days=30) is True
+
+
+def test_has_active_verdict_perishable_stale(db):
+    """Old perishable verdicts expire."""
+    import time
+    db.record_verdict("a - b", "rejected_taste", score=0.41)
+
+    # Manually update decided_at to simulate an old verdict
+    old_time = time.time() - (31 * 86400)  # 31 days ago
+    db.conn.execute(
+        "UPDATE verdicts SET decided_at = ? WHERE track_key = ?",
+        (old_time, "a - b")
+    )
+    db.conn.commit()
+
+    # With taste_ttl_days=30, the verdict is now stale
+    assert db.has_active_verdict("a - b", taste_ttl_days=30) is False
+
+
+def test_has_active_verdict_nonexistent(db):
+    """Non-existent verdicts return False."""
+    assert db.has_active_verdict("nonexistent - key", taste_ttl_days=30) is False
+
+
+def test_verdict_cleared_on_upload(db):
+    """A verdict is deleted when the track is uploaded."""
+    db.record_verdict("a - b", "rejected_taste", score=0.41)
+    assert db.get_verdict("a - b") is not None
+
+    # Upload the track
+    db.record_upload("a - b", "A", "B", file_id=7)
+
+    # Verdict should be gone
+    assert db.get_verdict("a - b") is None
+
+
+# ---------------------------------------------------------------------------
+# Track key repair (handle AzuraCast metadata drift)
+# ---------------------------------------------------------------------------
+
+def test_repair_track_key_basic(db):
+    """Repair a track key when metadata drifts."""
+    db.record_upload("ancien - titre", "Ancien", "Titre", file_id=7)
+    db.record_fingerprint("ancien - titre", "HASH", 200)
+
+    assert db.repair_track_key("ancien - titre", "nouveau - titre") is True
+
+    # Track should be at new key
+    track = db.get_track_by_file_id(7)
+    assert track is not None
+    assert track["track_key"] == "nouveau - titre"
+
+    # Fingerprint should also move
+    fp = db.find_by_fingerprint("HASH")
+    assert fp is not None
+    assert fp["track_key"] == "nouveau - titre"
+
+
+def test_repair_track_key_no_old_track(db):
+    """Repair fails if old key doesn't exist."""
+    assert db.repair_track_key("nonexistent - key", "new - key") is False
+
+
+def test_repair_track_key_same_key(db):
+    """Repair fails if old and new keys are the same."""
+    db.record_upload("a - b", "A", "B", file_id=7)
+    assert db.repair_track_key("a - b", "a - b") is False
+
+
+def test_repair_track_key_empty_keys(db):
+    """Repair fails if either key is empty."""
+    db.record_upload("a - b", "A", "B", file_id=7)
+    assert db.repair_track_key("", "new - key") is False
+    assert db.repair_track_key("a - b", "") is False
+
+
+def test_repair_track_key_with_dead_collision(db):
+    """La clé cible est occupée par une ligne morte : on la libère."""
+    db.record_upload("ancien - titre", "Ancien", "Titre", file_id=7)
+    db.record_fingerprint("ancien - titre", "HASH1", 200)
+
+    db.record_upload("nouveau - titre", "Nouveau", "Titre", file_id=99)
+    db.record_fingerprint("nouveau - titre", "HASH2", 180)
+    db.record_deletion("nouveau - titre")  # plus de file_id : ligne d'archive
+
+    assert db.repair_track_key("ancien - titre", "nouveau - titre") is True
+
+    rows = db.conn.execute(
+        "SELECT track_key, azuracast_file_id FROM tracks WHERE track_key = 'nouveau - titre'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["azuracast_file_id"] == 7
+
+
+def test_repair_track_key_refuses_to_destroy_a_live_collision(db):
+    """Deux fichiers AzuraCast distincts normalisent vers la même clé.
+
+    Écraser la ligne vivante détruirait ses passages, son tier et son
+    empreinte, et laisserait un fichier bien vivant sans ligne — invisible
+    pour reconcile, puisque son id est bien vu par l'API. Les deux lignes
+    s'échangeraient ensuite la même clé à chaque run.
+    """
+    db.record_upload("ancien - titre", "Ancien", "Titre", file_id=7)
+    db.record_upload("nouveau - titre", "Nouveau", "Titre", file_id=99)
+    db.conn.execute(
+        "UPDATE tracks SET play_count = 42, tier = 'GOLD' WHERE track_key = 'nouveau - titre'"
+    )
+    db.conn.commit()
+
+    assert db.repair_track_key("ancien - titre", "nouveau - titre") is False
+
+    # Rien n'a bougé : les deux lignes sont intactes.
+    vivante = db.get_track_by_file_id(99)
+    assert vivante["track_key"] == "nouveau - titre"
+    assert vivante["play_count"] == 42
+    assert vivante["tier"] == "GOLD"
+    assert db.get_track_by_file_id(7)["track_key"] == "ancien - titre"
+
+

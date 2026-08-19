@@ -42,7 +42,9 @@ try:
         GENRE_FILTER,
         LOUDNORM,
         ROTATION,
+        TASTE_FILTER,
         format_duration,
+        source_priority,
     )
 except ImportError as e:
     print(f"Error: config.py not found or invalid in pipeline root: {e}")
@@ -62,6 +64,7 @@ PIPELINE_DIR = SCRIPT_DIR.parent
 TRACKS_FILE = PIPELINE_DIR / "tracks-to-download.json"
 DOWNLOAD_DIR = PIPELINE_DIR / "downloads"
 TEMP_DIR = PIPELINE_DIR / "temp"
+RECONCILE_REPORT_PATH = PIPELINE_DIR / "data" / "last_reconcile.json"
 
 MAX_FILENAME_LENGTH = 200
 REQUEST_TIMEOUT = 30
@@ -73,7 +76,7 @@ _download_lock = Lock()
 # Output filenames claimed by in-flight downloads (guarded by _download_lock)
 _claimed_paths: set[str] = set()
 
-DownloadResult = Literal["downloaded", "skipped", "filtered", "blocked", "failed", "duplicate"]
+DownloadResult = Literal["downloaded", "skipped", "filtered", "failed", "duplicate"]
 
 
 class DownloadOutcome(NamedTuple):
@@ -92,7 +95,7 @@ class DownloadOutcome(NamedTuple):
                             on a future run.
 
     Both default to False so all the pre-download returns
-    ('skipped'/'blocked'/'failed-before-probe'/...) keep their concise
+    ('skipped'/'filtered'/'failed-before-probe'/...) keep their concise
     constructor shape.
     """
     status: DownloadResult
@@ -295,41 +298,6 @@ def normalize_track_key(artist: str, title: str) -> str:
     # Import from canonical source to avoid divergence
     from track_db import normalize_track_key as _normalize
     return _normalize(artist, title)
-
-
-def fetch_azuracast_library(client: AzuraCastClient) -> set[str]:
-    """
-    Fetch existing tracks from AzuraCast.
-
-    Args:
-        client: Configured AzuraCast client.
-
-    Returns:
-        Set of normalized "artist - title" keys.
-    """
-    try:
-        files = client.get_station_files()
-        existing = set()
-
-        for f in files:
-            artist = f.get("artist", "") or ""
-            title = f.get("title", "") or ""
-
-            if artist and title:
-                key = normalize_track_key(artist, title)
-                existing.add(key)
-
-        logger.info("AzuraCast library: %d tracks", len(existing))
-        return existing
-
-    except ClientError as e:
-        logger.error("AzuraCast authentication error: %s", e)
-        raise SystemExit(1)
-
-    except (ServerError, HTTPConnectionError) as e:
-        logger.error("Cannot connect to AzuraCast: %s", e)
-        logger.error("Aborting to prevent duplicates. Fix connection and retry.")
-        raise SystemExit(1)
 
 
 def sanitize_filename(name: str) -> str:
@@ -798,6 +766,7 @@ def write_id3_tags(
     cover_path: Path | None = None,
     has_lastfm_tags: bool = False,
     lastfm_tags_str: str = "",
+    discovery_source: str = "",
 ) -> bool:
     """
     Write ID3 tags using mutagen.
@@ -847,6 +816,20 @@ def write_id3_tags(
                 type=3,
                 desc='Cover',
                 data=cover_data
+            ))
+
+        # Provenance : la source de découverte était calculée chaque nuit puis
+        # jetée après le tri de prefilter_candidates. Sans elle, impossible de
+        # savoir laquelle produit les morceaux que Victor like — donc impossible
+        # de donner à SOURCE_PRIORITY des valeurs mesurées plutôt que devinées.
+        # Elle voyage dans le fichier comme le mood : écrite ici, relue par
+        # classify.py au moment de l'upload.
+        audio.delall('TXXX:DISCOVERY_SOURCE')
+        if discovery_source:
+            audio.add(TXXX(
+                encoding=3,
+                desc='DISCOVERY_SOURCE',
+                text=[discovery_source]
             ))
 
         # Add HAS_LASTFM_TAGS flag for aggressive filter in classify.py
@@ -948,14 +931,18 @@ def download_track(
     - Validates audio integrity after download
     - Retries automatically if file is corrupted
     - Computes checksum for tracking
-    - Checks cooldown via TrackDB (skip recently deleted tracks)
+
+    Library, cooldown and genre filtering now happen in prefilter_candidates,
+    before any byte is transferred. What remains here is the per-key dedup
+    under _download_lock, which the cold phase cannot cover: two workers can
+    still target the same key within a single run.
 
     Args:
         track: Track data from HypeMachine.
         existing_library: Set of normalized "artist - title" already in AzuraCast.
-        genre_client: Optional Last.fm client for genre filtering.
+        genre_client: Optional Last.fm client, read from cache for ID3 tags.
         _retry_count: Internal retry counter.
-        track_db: Optional persistent track database for cooldown checks.
+        track_db: Optional persistent track database for fingerprints and verdicts.
 
     Returns:
         Download result status.
@@ -975,30 +962,14 @@ def download_track(
                 return DownloadOutcome('skipped', None)
             existing_library.add(track_key)
 
-    # Check cooldown (skip recently deleted tracks)
-    if track_db and track_db.is_in_cooldown(track_key, ROTATION.cooldown_days):
-        logger.info("  Cooldown: recently deleted, skipping")
-        return DownloadOutcome('skipped', None)
-
-    # Genre filtering via Last.fm (before download to save bandwidth)
+    # Tags pour l'ID3 : la phase à froid a déjà rempli le cache de genres,
+    # cet appel est servi localement.
     has_lastfm_tags = False
     lastfm_tags_str = ""
     if genre_client and GENRE_FILTER.enabled:
         genre_result = genre_client.check_genre(artist, title)
         has_lastfm_tags = bool(genre_result.tags)
         lastfm_tags_str = ", ".join(genre_result.tags) if genre_result.tags else ""
-        if genre_result.is_blocked:
-            # Track name in the message: workers log in parallel, so without
-            # it a block line lands under another track's header (a blocked
-            # Smirk once read as a blocked Cramps in the night log).
-            logger.info("  Blocked [%s - %s]: %s",
-                        artist, title, genre_result.blocked_reason)
-            return DownloadOutcome('blocked', None)
-        if genre_result.top_tag:
-            logger.debug("  Genre: %s", genre_result.top_tag)
-        if GENRE_FILTER.require_tags and not genre_result.tags:
-            logger.info("  Blocked: No genre tags found")
-            return DownloadOutcome('blocked', None)
 
     # Create safe filename
     safe_name = sanitize_filename(f"{artist} - {title}")
@@ -1029,9 +1000,19 @@ def download_track(
     if match["duration"] > 0:
         if AUDIO_FILTERS.duration_min and match["duration"] <= AUDIO_FILTERS.duration_min:
             logger.info("  Filtered (too short: %s)", format_duration(int(match['duration'])))
+            # Pas de verdict ici : cette durée est celle du candidat trouvé
+            # par la recherche (retenu dès 0,60 de similarité), pas celle du
+            # morceau. Un mix ou un live mal apparié bannirait un morceau
+            # légitime pour toujours. classify.py inscrit filtered_duration
+            # sur le fichier réellement téléchargé, où le signal est solide.
             return DownloadOutcome('filtered', match_source)
         if AUDIO_FILTERS.duration_max and match["duration"] >= AUDIO_FILTERS.duration_max:
             logger.info("  Filtered (too long: %s)", format_duration(int(match['duration'])))
+            # Pas de verdict ici : cette durée est celle du candidat trouvé
+            # par la recherche (retenu dès 0,60 de similarité), pas celle du
+            # morceau. Un mix ou un live mal apparié bannirait un morceau
+            # légitime pour toujours. classify.py inscrit filtered_duration
+            # sur le fichier réellement téléchargé, où le signal est solide.
             return DownloadOutcome('filtered', match_source)
 
     # Phase 2: Download the specific matched URL (thread-safe temp dir)
@@ -1168,7 +1149,8 @@ def download_track(
             logger.info("  Cover: iTunes fallback OK")
 
     # Write ID3 tags (including Last.fm tags for multi-signal filter)
-    if write_id3_tags(final_path, artist, title, cover_path, has_lastfm_tags, lastfm_tags_str):
+    if write_id3_tags(final_path, artist, title, cover_path, has_lastfm_tags,
+                      lastfm_tags_str, track.get("source", "")):
         logger.info("  Tags: artist=%s, title=%s", artist, title)
         if not has_lastfm_tags:
             logger.debug("  Note: No Last.fm tags (will use audio analysis for filtering)")
@@ -1206,6 +1188,103 @@ def load_tracks() -> list[Track]:
     except (json.JSONDecodeError, OSError) as e:
         logger.error("Failed to load tracks: %s", e)
         return []
+
+
+def compute_budget(carryover_files: int) -> int:
+    """
+    Nombre de morceaux qu'il est utile de télécharger cette nuit.
+
+    On ne télécharge que ce qu'on peut espérer diffuser : le quota de la
+    nuit, majoré d'une marge qui absorbe les rejets et les échecs, moins
+    ce qui dort déjà dans downloads/.
+    """
+    full = int(ROTATION.max_uploads_per_night * ROTATION.download_margin)
+    return max(0, full - carryover_files)
+
+
+def prefilter_candidates(
+    tracks: list[Track],
+    library_keys: set[str],
+    track_db: "TrackDB",
+    genre_client: GenreClient | None,
+) -> tuple[list[Track], dict[str, int]]:
+    """
+    Phase à froid : écarter tout ce qui est décidable sans télécharger.
+
+    Aucun octet d'audio n'est transféré ici. Les seuls appels réseau
+    possibles sont les recherches de genre, servies par data/genre_cache.json
+    dans la grande majorité des cas.
+
+    Le tri final n'écarte rien : il décide de l'ordre dans lequel le budget
+    sera dépensé.
+
+    Returns:
+        (candidats retenus et ordonnés, compteurs par motif d'exclusion).
+    """
+    counts = {
+        "already_in_library": 0,
+        "duplicate_in_batch": 0,
+        "cooldown": 0,
+        "known_verdict": 0,
+        "blocked_genre": 0,
+        "no_metadata": 0,
+    }
+    survivors: list[Track] = []
+    seen: set[str] = set()
+
+    for track in tracks:
+        artist = track.get("artist") or ""
+        title = track.get("title") or ""
+        if not (artist and title):
+            counts["no_metadata"] += 1
+            continue
+
+        key = normalize_track_key(artist, title)
+
+        if key in library_keys:
+            counts["already_in_library"] += 1
+            continue
+        if key in seen:
+            # Listé deux fois ce soir : ce n'est pas « déjà à l'antenne ».
+            counts["duplicate_in_batch"] += 1
+            continue
+        if track_db.is_in_cooldown(key, ROTATION.cooldown_days):
+            counts["cooldown"] += 1
+            continue
+        if track_db.has_active_verdict(key, TASTE_FILTER.verdict_ttl_days):
+            counts["known_verdict"] += 1
+            continue
+
+        if genre_client is not None and GENRE_FILTER.enabled:
+            result = genre_client.check_genre(artist, title)
+            if result.is_blocked:
+                logger.info("  Bloqué [%s - %s] : %s", artist, title, result.blocked_reason)
+                # Pas de verdict ici : ce genre vient d'une recherche floue
+                # par métadonnées (MusicBrainz / Discogs / Last.fm), sans que
+                # l'audio ait jamais été entendu. Une collision de nom entre
+                # deux artistes homonymes bannirait un morceau à vie, sans
+                # trace visible. Même raisonnement que filtered_duration en
+                # phase de téléchargement. Ne pas réinscrire : le coût de
+                # l'oubli est une recherche dans data/genre_cache.json, pas
+                # un appel réseau.
+                counts["blocked_genre"] += 1
+                continue
+            if GENRE_FILTER.require_tags and not result.tags:
+                # Pas de verdict : une absence de tags est transitoire (le
+                # morceau est trop récent, ou les sources n'ont pas répondu).
+                # L'inscrire bannirait à vie un morceau pour un silence du
+                # réseau. On l'écarte pour cette nuit seulement.
+                counts["blocked_genre"] += 1
+                continue
+
+        seen.add(key)
+        survivors.append(track)
+
+    # Tri stable : à priorité égale, l'ordre de découverte est conservé.
+    # `or ""` et non un défaut de get() : une source explicitement nulle
+    # dans le JSON de découverte ferait un AttributeError dans le tri.
+    survivors.sort(key=lambda t: source_priority(t.get("source") or ""))
+    return survivors, counts
 
 
 def main() -> int:
@@ -1255,83 +1334,164 @@ def main() -> int:
         logger.error("AzuraCast is not reachable. Aborting.")
         return 1
 
-    # Fetch existing library (REQUIRED to prevent duplicates)
-    existing_library = fetch_azuracast_library(client)
-
-    # Create Last.fm client for genre filtering (REQUIRED when enabled)
-    genre_client: GenreClient | None = None
-    if GENRE_FILTER.enabled:
-        # Multi-source genre filter: MusicBrainz + Discogs + Last.fm.
-        # None of them is strictly required (each is best-effort), but we want
-        # at least one signal — warn loudly if Last.fm is missing since it's the
-        # broadest coverage for obscure indie artists.
-        if not settings.lastfm_api_key:
-            logger.warning(
-                "LASTFM_API_KEY not set — relying on MusicBrainz + Discogs only "
-                "(coverage may drop for obscure artists)"
-            )
-        genre_client = create_genre_client(
-            lastfm_api_key=settings.lastfm_api_key,
-            discogs_token=settings.discogs_token,
-            blocked_genres=list(GENRE_FILTER.blocked_genres),
-        )
-        sources = [
-            s for s, on in (
-                ("MusicBrainz", True),
-                ("Discogs", True),
-                ("Last.fm", bool(settings.lastfm_api_key)),
-            ) if on
-        ]
-        logger.info(
-            "Genre filter: %d blocked | sources: %s",
-            len(GENRE_FILTER.blocked_genres),
-            ", ".join(sources),
-        )
-
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-    # Initialize TrackDB for cooldown checks
+    # AzuraCast fait autorité : on réconcilie avant tout, et les clés de
+    # déduplication sortent du rapport plutôt que d'un fetch parallèle.
+    from library_state import LibraryStateError, reconcile
     from track_db import TrackDB
+
     db_path = Path(__file__).parent.parent / "data" / "tracks.db"
+    # genre_client est nommé avant le try : le finally s'en sert, et une
+    # sortie avant son affectation ne doit pas y devenir un NameError.
+    genre_client: GenreClient | None = None
     track_db = TrackDB(db_path)
-
-    stats = {
-        # Primary status counts (one of these is incremented per track)
-        "downloaded": 0, "skipped": 0, "filtered": 0, "blocked": 0,
-        "failed": 0, "duplicate": 0,
-        # Per-source download counts. Filled by download_track via the
-        # match["source"] returned from find_best_audio_match.
-        "source_youtube": 0,
-        "source_soundcloud": 0,
-        "source_other": 0,
-        # Post-download step failures (logged + counted, no silent skips).
-        # These were the 3 silent fallback paths identified in the
-        # 2026-05-14 audit. loudnorm_failed > 0 fires an ntfy alert from
-        # run.sh because that's broadcast-quality critical.
-        "loudnorm_failed": 0,
-        "fingerprint_failed": 0,
-    }
-
-    def _process_track(idx_track: tuple[int, Track]) -> tuple[str, DownloadOutcome]:
-        i, track = idx_track
-        artist = track.get('artist', 'Unknown')
-        title = track.get('title', 'Unknown')
-        logger.info("\n[%d/%d] %s - %s", i, len(tracks), artist, title)
-
-        outcome = download_track(track, existing_library, genre_client, track_db=track_db)
-
-        if outcome.status == 'downloaded':
-            logger.info("  OK (%s)", outcome.source or "?")
-        elif outcome.status == 'skipped':
-            logger.info("  Skipped (duplicate or cooldown)")
-
-        return f"{artist} - {title}", outcome
-
+    # Un seul try/finally couvre toute la vie de la connexion : une
+    # exception dans reconcile() ou prefilter_candidates() laissait
+    # jusqu'ici la base et ses fichiers WAL ouverts.
     try:
+        media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
+        try:
+            files = client.get_station_files()
+        except ClientError as e:
+            logger.error("AzuraCast authentication error: %s", e)
+            return 1
+        except (ServerError, HTTPConnectionError) as e:
+            logger.error("Cannot connect to AzuraCast: %s", e)
+            logger.error("Aborting to prevent duplicates. Fix connection and retry.")
+            return 1
+        try:
+            report = reconcile(
+                files, track_db, media_dir=media_dir,
+                report_path=RECONCILE_REPORT_PATH,
+            )
+        except LibraryStateError as e:
+            # Rien n'a été modifié. Poursuivre reviendrait à télécharger
+            # contre une librairie fantôme et à tout retélécharger en double.
+            logger.error("Réconciliation refusée : %s", e)
+            return 1
+        existing_library = report.library_keys
+
+        # Create Last.fm client for genre filtering (REQUIRED when enabled)
+        if GENRE_FILTER.enabled:
+            # Multi-source genre filter: MusicBrainz + Discogs + Last.fm.
+            # None of them is strictly required (each is best-effort), but we want
+            # at least one signal — warn loudly if Last.fm is missing since it's the
+            # broadest coverage for obscure indie artists.
+            if not settings.lastfm_api_key:
+                logger.warning(
+                    "LASTFM_API_KEY not set — relying on MusicBrainz + Discogs only "
+                    "(coverage may drop for obscure artists)"
+                )
+            genre_client = create_genre_client(
+                lastfm_api_key=settings.lastfm_api_key,
+                discogs_token=settings.discogs_token,
+                blocked_genres=list(GENRE_FILTER.blocked_genres),
+            )
+            sources = [
+                s for s, on in (
+                    ("MusicBrainz", True),
+                    ("Discogs", True),
+                    ("Last.fm", bool(settings.lastfm_api_key)),
+                ) if on
+            ]
+            logger.info(
+                "Genre filter: %d blocked | sources: %s",
+                len(GENRE_FILTER.blocked_genres),
+                ", ".join(sources),
+            )
+
+        DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+        stats = {
+            # Primary status counts (one of these is incremented per track)
+            "downloaded": 0, "skipped": 0, "filtered": 0,
+            "failed": 0, "duplicate": 0,
+            # Per-source download counts. Filled by download_track via the
+            # match["source"] returned from find_best_audio_match.
+            "source_youtube": 0,
+            "source_soundcloud": 0,
+            "source_other": 0,
+            # Post-download step failures (logged + counted, no silent skips).
+            # These were the 3 silent fallback paths identified in the
+            # 2026-05-14 audit. loudnorm_failed > 0 fires an ntfy alert from
+            # run.sh because that's broadcast-quality critical.
+            "loudnorm_failed": 0,
+            "fingerprint_failed": 0,
+            # Phase à froid (2026-07) : ce qui a été écarté sans rien télécharger.
+            # Préfixe `pre_` pour ne pas collisionner avec les compteurs que la
+            # boucle parallèle incrémente (`skipped`, `filtered`, `duplicate`).
+            "prefiltered": 0,
+            "pre_already_known": 0,
+            "pre_duplicate_in_batch": 0,
+            "pre_known_verdict": 0,
+            "pre_blocked_genre": 0,
+            "pre_no_metadata": 0,
+            "budget": 0,
+            "carryover_on_disk": 0,
+        }
+
+        # --- Phase à froid : rien n'est téléchargé ---
+        # Elle tourne entièrement avant que le budget soit connu : à budget 0 on
+        # paie donc les recherches de genre pour rien. C'est assumé — le cache de
+        # genres et le registre des verdicts en profitent pour les nuits suivantes.
+        candidates, prefilter_counts = prefilter_candidates(
+            tracks, existing_library, track_db, genre_client
+        )
+        # Compteurs de la phase à froid, dans leurs propres clés : la boucle
+        # parallèle incrémente `skipped` et `filtered` pour ses propres motifs
+        # (fichier déjà sur disque, collision de clé entre workers), donc y
+        # écrire ici ferait un double comptage et le récap publierait un
+        # chiffre qui ne veut plus rien dire.
+        stats["prefiltered"] = sum(prefilter_counts.values())
+        stats["pre_already_known"] = (
+            prefilter_counts["already_in_library"] + prefilter_counts["cooldown"]
+        )
+        stats["pre_duplicate_in_batch"] = prefilter_counts["duplicate_in_batch"]
+        stats["pre_known_verdict"] = prefilter_counts["known_verdict"]
+        stats["pre_blocked_genre"] = prefilter_counts["blocked_genre"]
+        stats["pre_no_metadata"] = prefilter_counts["no_metadata"]
+        logger.info(
+            "Filtrage à froid : %d candidats → %d retenus (%d déjà en librairie, "
+            "%d en double dans le lot, %d en cooldown, %d déjà jugés, "
+            "%d genre bloqué)",
+            len(tracks), len(candidates),
+            prefilter_counts["already_in_library"],
+            prefilter_counts["duplicate_in_batch"], prefilter_counts["cooldown"],
+            prefilter_counts["known_verdict"], prefilter_counts["blocked_genre"],
+        )
+
+        # --- Budget : on ne télécharge que ce qu'on peut espérer diffuser ---
+        carryover_on_disk = len(list(DOWNLOAD_DIR.glob("*.mp3")))
+        budget = compute_budget(carryover_on_disk)
+        stats["carryover_on_disk"] = carryover_on_disk
+        stats["budget"] = budget
+        logger.info(
+            "Budget de la nuit : %d (quota %d × marge %.1f − %d en attente sur disque)",
+            budget, ROTATION.max_uploads_per_night, ROTATION.download_margin,
+            carryover_on_disk,
+        )
+        if budget == 0:
+            logger.info("Stock suffisant : aucun téléchargement cette nuit.")
+        tracks_to_download = candidates[:budget]
+
+        def _process_track(idx_track: tuple[int, Track]) -> tuple[str, DownloadOutcome]:
+            i, track = idx_track
+            artist = track.get('artist', 'Unknown')
+            title = track.get('title', 'Unknown')
+            logger.info("\n[%d/%d] %s - %s", i, len(tracks_to_download), artist, title)
+
+            outcome = download_track(track, existing_library, genre_client, track_db=track_db)
+
+            if outcome.status == 'downloaded':
+                logger.info("  OK (%s)", outcome.source or "?")
+            elif outcome.status == 'skipped':
+                logger.info("  Skipped (file already on disk, or key claimed by another worker)")
+
+            return f"{artist} - {title}", outcome
+
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_DOWNLOADS) as executor:
             futures = {
                 executor.submit(_process_track, (i, track)): track
-                for i, track in enumerate(tracks, 1)
+                for i, track in enumerate(tracks_to_download, 1)
             }
             for future in as_completed(futures):
                 try:
@@ -1352,38 +1512,45 @@ def main() -> int:
                 except Exception as e:
                     logger.error("  Unexpected download error: %s", e)
                     stats["failed"] += 1
+
+        cleanup_temp()
+
+        logger.info("\n=== Results ===")
+        logger.info("Candidats : %d → retenus %d → budget %d",
+                    len(tracks), len(candidates), budget)
+        logger.info("Écartés avant téléchargement : %d", stats['prefiltered'])
+        logger.info("  → déjà en librairie ou cooldown : %d", stats['pre_already_known'])
+        logger.info("  → en double dans le lot         : %d", stats['pre_duplicate_in_batch'])
+        logger.info("  → déjà jugés (registre)         : %d", stats['pre_known_verdict'])
+        logger.info("  → genre bloqué                  : %d", stats['pre_blocked_genre'])
+        logger.info("  → métadonnées illisibles        : %d", stats['pre_no_metadata'])
+        logger.info("Téléchargés : %d", stats['downloaded'])
+        logger.info("  → depuis YouTube    : %d", stats['source_youtube'])
+        logger.info("  → depuis SoundCloud : %d", stats['source_soundcloud'])
+        if stats['source_other']:
+            logger.info("  → depuis autre      : %d", stats['source_other'])
+        logger.info("Sautés dans la boucle (fichier présent, collision) : %d", stats['skipped'])
+        logger.info("Doublon audio (empreinte) : %d", stats['duplicate'])
+        logger.info("Filtré (durée) : %d", stats['filtered'])
+        logger.info("Échecs : %d", stats['failed'])
+        if stats['loudnorm_failed']:
+            logger.warning("Loudnorm en échec (uploads non normalisés) : %d", stats['loudnorm_failed'])
+        if stats['fingerprint_failed']:
+            logger.warning("Empreinte en échec (dédup sautée) : %d", stats['fingerprint_failed'])
+
+        # Persist for run.sh aggregation.
+        stats_path = Path(__file__).parent.parent / "data" / "last_download_stats.json"
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+        except OSError:
+            logger.warning("Could not write last_download_stats.json")
+
+        return 0
     finally:
         track_db.close()
         if genre_client is not None:
             genre_client.flush_cache()
-
-    cleanup_temp()
-
-    logger.info("\n=== Results ===")
-    logger.info("Downloaded: %d", stats['downloaded'])
-    logger.info("  → from YouTube   : %d", stats['source_youtube'])
-    logger.info("  → from SoundCloud: %d", stats['source_soundcloud'])
-    if stats['source_other']:
-        logger.info("  → from other     : %d", stats['source_other'])
-    logger.info("Skipped (artist/title or cooldown): %d", stats['skipped'])
-    logger.info("Duplicate (audio fingerprint): %d", stats['duplicate'])
-    logger.info("Blocked (genre): %d", stats['blocked'])
-    logger.info("Filtered (duration): %d", stats['filtered'])
-    logger.info("Failed: %d", stats['failed'])
-    if stats['loudnorm_failed']:
-        logger.warning("Loudnorm failed (un-normalised uploads): %d", stats['loudnorm_failed'])
-    if stats['fingerprint_failed']:
-        logger.warning("Fingerprint failed (dedup skipped): %d", stats['fingerprint_failed'])
-
-    # Persist for run.sh aggregation.
-    stats_path = Path(__file__).parent.parent / "data" / "last_download_stats.json"
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-    except OSError:
-        logger.warning("Could not write last_download_stats.json")
-
-    return 0
 
 
 if __name__ == "__main__":

@@ -225,6 +225,22 @@ class RotationConfig:
     # non-retenus partent en cooldown.
     max_uploads_per_night: int = 6
 
+    # --- Plafond de suppressions par nuit (2026-08) -----------------------
+    # La bibliothèque ne doit jamais pouvoir se vider plus vite qu'elle ne se
+    # remplit. Sans ce plafond, toute interruption d'alimentation se solde par
+    # une purge de rattrapage : du 1er au 18 août 2026, 18 nuits sans
+    # acquisition (DNS coupé à 03:00) ont fait tomber la bibliothèque de 626 à
+    # 333 morceaux en une seule nuit, dont 31 que Victor avait likés.
+    #
+    # Geler l'éviction pendant la panne ne suffit pas : les morceaux vieillissent
+    # quand même, et la première nuit de retour les supprimerait tous d'un coup.
+    # Le plafond, lui, protège de TOUTES les famines — réseau, sources mortes,
+    # yt-dlp cassé — et pas seulement de celle qu'on vient de vivre.
+    #
+    # 2 × max_uploads_per_night : la bibliothèque peut décroître, mais deux fois
+    # moins vite qu'elle ne grandit à plein régime, donc jamais brutalement.
+    max_deletions_per_night: int = 12
+
     # Filet anti-pépite : un candidat non retenu par le quota mais dans la
     # couleur (taste >= TASTE_FILTER.threshold) reste dans le dossier de
     # téléchargement et reconcourt la nuit suivante contre la nouvelle
@@ -241,6 +257,14 @@ class RotationConfig:
     # gold_max_pct % de la library.
     gold_min_taste: float = 0.70
     gold_max_pct: float = 40.0
+
+    # --- Budget de téléchargement (2026-07) ------------------------------
+    # On ne télécharge que ce qu'on peut espérer diffuser. Le budget d'une
+    # nuit vaut max_uploads_per_night × download_margin, moins les fichiers
+    # déjà en attente dans downloads/. La marge absorbe les rejets du filtre
+    # de goût et les échecs yt-dlp. Avec 24 en carryover pour un quota de 6,
+    # le budget tombe à zéro : c'est voulu, le stock suffit.
+    download_margin: float = 2.0
 
 
 @dataclass
@@ -559,8 +583,35 @@ class RotationCategoryConfig:
     medium_daypart_count: int = 2
     light_daypart_count: int = 1
 
+    # --- Playlists pondérées Discovery/Library (2026-07) -----------------
+    # Chaque daypart existe en deux variantes AzuraCast partageant le même
+    # schedule horaire :
+    #   "<Zone>-Discovery" (poids fort)  ← FRESH + HEAVY prouvés
+    #   "<Zone>"           (poids faible) ← MEDIUM / LIGHT / GOLD
+    # C'est le modèle Currents/Gold des radios tradi : à l'intérieur d'une
+    # playlist AzuraCast tous les titres sont équiprobables, donc la seule
+    # façon d'avoir un tier "heavy" qui tourne réellement plus vite est de
+    # le mettre dans une playlist séparée plus pondérée. Ratio 6:2 → un
+    # titre Discovery passe ~3× plus souvent qu'un titre Library (modulo
+    # la taille relative des deux pools).
+    discovery_suffix: str = "-Discovery"
+    discovery_weight: int = 6
+    library_weight: int = 2
+
 
 ROTATION_CATEGORIES = RotationCategoryConfig()
+
+
+def playlist_name_for_tier(daypart: "DaypartSegment", tier: str) -> str:
+    """
+    Nom de la playlist AzuraCast pour (zone, tier de rotation).
+
+    HEAVY (grace period + hits prouvés) → variante "-Discovery" (poids fort).
+    MEDIUM / LIGHT / GOLD / legacy DISCOVERY → playlist de base (poids faible).
+    """
+    if tier == "HEAVY":
+        return f"{daypart.value}{ROTATION_CATEGORIES.discovery_suffix}"
+    return daypart.value
 
 # =============================================================================
 # DISCOVERY — Sources de découverte multi-RSS + Last.fm
@@ -625,19 +676,33 @@ RSS_FEEDS: tuple[RSSFeedSpec, ...] = (
 
 
 # Tags Last.fm dont on tire les top tracks (gettoptracks).
-# Mix indie / electro / ambient + hip-hop demandé.
-# Chaque tag retourne jusqu'à LASTFM_TAG_LIMIT tracks par run.
-LASTFM_TAGS: tuple[str, ...] = (
-    "indie",
-    "electronic",
-    "ambient",
-    "hip-hop",
-    "downtempo",
-    "dream pop",
-    "trip hop",
-    "indietronica",
-    "shoegaze",
-)
+#
+# DÉSACTIVÉ le 2026-08-19. `tag.gettoptracks` renvoie les morceaux les plus
+# écoutés *de tous les temps* pour un genre, pas les sorties récentes : les
+# mêmes chaque nuit, et les chevaux de bataille canoniques du genre. Mesuré
+# ce jour-là sur les 9 tags actifs : indie → The Neighbourhood « Sweater
+# Weather » (2012), electronic → Kavinsky « Nightcall » (2010), ambient →
+# quatre fois C418 (bande-son de Minecraft), dream pop → Taylor Swift,
+# shoegaze → Slowdive (1993).
+#
+# Cette source pesait 135 candidats/nuit, soit 37 % du volume BRUT — mais
+# attention : ce volume n'atteignait jamais le téléchargement. `_dedupe_and_cap`
+# parcourt les sources dans leur ordre d'ajout et coupe à DISCOVER_MAX_TRACKS ;
+# HypeMachine, ajoutée en premier avec 50 morceaux, sature le cap de 30 à elle
+# seule. Mesuré le 2026-08-19 : les 30 candidats de tracks-to-download.json
+# étaient hypem à 100 %.
+#
+# Désactiver Last.fm ne « rendait » donc aucun volume aux flux RSS : HypeMachine
+# reprenait simplement les mêmes 30 places. Ce défaut-là — le cap servi dans
+# l'ordre d'ajout des sources — a été corrigé le même jour : `_dedupe_and_cap`
+# sert désormais les sources en tourniquet selon SOURCE_PRIORITY, si bien
+# qu'aucune ne peut plus monopoliser la fournée.
+#
+# Le mécanisme reste en place : remettre des tags ici le réarme (discover.py
+# teste `if settings.lastfm_api_key and LASTFM_TAGS`). Ne pas confondre avec
+# le tag ID3 « LASTFM_TAGS » écrit par analyze.py, qui est un genre et n'a
+# rien à voir.
+LASTFM_TAGS: tuple[str, ...] = ()
 LASTFM_TAG_LIMIT: int = 15
 
 # Plafond global de tracks remontées par l'étape discover (toutes sources
@@ -798,6 +863,13 @@ class TasteFilterConfig:
     threshold: float = 0.62   # calibrated 2026-07-17, see above
     min_profile_size: int = 200
 
+    # Péremption du verdict `rejected_taste` au registre (track_db.verdicts).
+    # Le profil de goût est reconstruit périodiquement : un morceau écarté
+    # sous l'ancien profil doit pouvoir retenter sa chance, sinon un faux
+    # négatif devient définitif. Les verdicts portant sur une propriété
+    # stable de l'enregistrement (parole, genre, durée) ne périment jamais.
+    verdict_ttl_days: int = 90
+
 
 ACOUSTID_DEDUP = AcoustIDDedupConfig()
 SPEECH_FILTER = SpeechFilterConfig()
@@ -812,6 +884,31 @@ TASTE_FILTER = TasteFilterConfig()
 TASTE_DISCOVERY_SEEDS_PER_RUN: int = 15
 TASTE_DISCOVERY_SIMILAR_PER_SEED: int = 4
 TASTE_DISCOVERY_TRACKS_PER_ARTIST: int = 2
+
+# Ordre de dépense du budget de téléchargement. Un choix explicite de
+# Victor passe avant une piste dérivée de son profil, qui passe avant une
+# découverte éditoriale, qui passe avant un chart de tag. Cet ordre ne
+# rejette rien : il décide seulement qui est servi en premier quand le
+# budget est plus court que la liste de candidats.
+#
+# Les clés sont les libellés que discovery_sources._make_track écrit dans
+# Track["source"]. Les flux RSS portent un label libre (feed_cfg.label),
+# donc inénumérable : ils tombent sur le défaut, calé à leur niveau.
+SOURCE_PRIORITY: dict[str, int] = {
+    "manual": 0,
+    "personal": 1,
+    "custom": 2,
+    "hypem": 4,
+}
+SOURCE_PRIORITY_LASTFM: int = 5
+SOURCE_PRIORITY_DEFAULT: int = 3   # flux RSS et libellés inconnus
+
+
+def source_priority(source: str) -> int:
+    """Priorité de dépense du budget pour un libellé de source."""
+    if source.startswith("lastfm:"):
+        return SOURCE_PRIORITY_LASTFM
+    return SOURCE_PRIORITY.get(source, SOURCE_PRIORITY_DEFAULT)
 
 # =============================================================================
 # FONCTIONS UTILITAIRES
@@ -1001,8 +1098,15 @@ def should_reject_track(features: dict[str, Any]) -> tuple[bool, str | None]:
 
 
 def get_all_playlist_names() -> list[str]:
-    """Génère les noms des zones playlists actuellement actives."""
-    return [daypart.value for daypart in get_enabled_dayparts()]
+    """
+    Noms des playlists actives : pour chaque zone, la variante Library
+    (nom de base) et la variante Discovery (pondérée).
+    """
+    names: list[str] = []
+    for daypart in get_enabled_dayparts():
+        names.append(daypart.value)
+        names.append(f"{daypart.value}{ROTATION_CATEGORIES.discovery_suffix}")
+    return names
 
 
 def format_duration(seconds: int) -> str:

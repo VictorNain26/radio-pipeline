@@ -113,28 +113,20 @@ def reanalyze_track(
     # Cleanup temp file (no re-upload needed)
     temp_file.unlink(missing_ok=True)
 
-    # 3. Assign playlists based on mood
-    from config import get_dayparts_for_mood
-    dayparts = get_dayparts_for_mood(features.mood)
-    playlist_ids = [
-        playlist_map[seg.value]
-        for seg in dayparts
-        if seg.value in playlist_map
+    # 3. Assign playlists based on mood + rotation tier (Discovery/Library)
+    from classify import target_playlist_names
+
+    tier = track_db.get_tier(track_key) or "MEDIUM"
+    playlist_names = [
+        n for n in target_playlist_names(features.mood, tier) if n in playlist_map
     ]
+    playlist_ids = [playlist_map[n] for n in playlist_names]
 
     if playlist_ids:
-        try:
-            response = client.put(
-                f"/api/station/{client.station_id}/file/{file_id}",
-                json={"playlists": playlist_ids},
-            )
-            if response.status_code == 200:
-                playlist_names = [seg.value for seg in dayparts if seg.value in playlist_map]
-                logger.info("    Playlists: %s", ", ".join(playlist_names))
-            else:
-                logger.warning("    Playlist assignment: HTTP %s", response.status_code)
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning("    Playlist assignment error: %s", e)
+        if client.assign_playlists(file_id, playlist_ids):
+            logger.info("    Playlists: %s", ", ".join(playlist_names))
+        else:
+            logger.warning("    Playlist assignment failed")
 
     # 6. Update tracks.db
     track_db.update_mood(track_key, features.mood)

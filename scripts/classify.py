@@ -13,6 +13,7 @@ Features v2.0:
 
 import json
 import logging
+import os
 import sys
 import time
 import unicodedata
@@ -28,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from http_client import AzuraCastClient as BaseAzuraCastClient, ClientError, HTTPConnectionError, ServerError, compute_file_hashes
 from settings import get_settings, validate_environment
 from track_db import TrackDB, normalize_track_key
+from library_state import LibraryStateError, reconcile
 
 try:
     from config import (
@@ -44,6 +46,7 @@ try:
         get_enabled_dayparts,
         get_current_day_type,
         get_all_playlist_names,
+        playlist_name_for_tier,
         should_reject_track,
         is_mood_enabled,
         format_duration,
@@ -176,6 +179,19 @@ def tier_filter_dayparts(
     # LIGHT (or legacy DISCOVERY)
     return list(mood_dayparts)[: ROTATION_CATEGORIES.light_daypart_count]
 
+
+def target_playlist_names(mood: "MoodCategory | str", tier: str) -> list[str]:
+    """
+    Expected AzuraCast playlist names for a track, from its mood and
+    rotation tier.
+
+    Single source of truth shared by upload, re-tier, GOLD graduation,
+    zero-play remediation and reanalysis: the tier picks how many dayparts
+    (tier_filter_dayparts) and which weight variant (playlist_name_for_tier).
+    """
+    dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), tier)
+    return [playlist_name_for_tier(dp, tier) for dp in dayparts]
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -186,6 +202,9 @@ logger = logging.getLogger(__name__)
 
 # Constants
 UPLOAD_TIMEOUT = 180
+# Rapport de réconciliation de la nuit, cumulé entre download.py et classify.py
+# et lu par send_daily_recap.py.
+RECONCILE_REPORT_PATH = Path(__file__).parent.parent / "data" / "last_reconcile.json"
 
 
 def _normalize_filename(name: str) -> str:
@@ -224,23 +243,6 @@ class ClassifyClient(BaseAzuraCastClient):
 
     Inherits robust HTTP handling from BaseAzuraCastClient.
     """
-
-    def get_playlists_map(self) -> dict[str, int]:
-        """
-        Get playlist name to ID mapping.
-
-        Returns:
-            Dictionary of playlist names to IDs.
-
-        Raises:
-            HTTPConnectionError: If AzuraCast is unreachable.
-        """
-        try:
-            data = self.get_playlists()
-            return {p["name"]: p["id"] for p in data}
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.error("Failed to fetch playlists: %s", e)
-            raise
 
     def get_existing_track_keys(self) -> set[str]:
         """
@@ -388,27 +390,6 @@ class ClassifyClient(BaseAzuraCastClient):
             logger.warning("  File read error: %s", e)
             return None
 
-    def assign_playlists(self, file_id: int, playlist_ids: list[int]) -> bool:
-        """
-        Assign file to multiple playlists.
-
-        Args:
-            file_id: File ID.
-            playlist_ids: List of playlist IDs.
-
-        Returns:
-            True if successful.
-        """
-        try:
-            response = self.put(
-                f"/api/station/{self.station_id}/file/{file_id}",
-                json={"playlists": playlist_ids},
-            )
-            return response.status_code == 200
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning("Failed to assign playlists: %s", e)
-            return False
-
 
 def get_features_from_tags(filepath: str) -> TrackFeatures | None:
     """
@@ -448,6 +429,7 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
         genre_top = ""
         genre_top_prob = 0.0
         lastfm_tags = ""
+        discovery_source = ""
 
         # Read TXXX frames (custom tags)
         for frame in tags.getall("TXXX"):
@@ -475,6 +457,8 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
                     genre_top_prob = float(value)
                 elif desc == "LASTFM_TAGS":
                     lastfm_tags = value
+                elif desc == "DISCOVERY_SOURCE":
+                    discovery_source = value
 
             except (ValueError, IndexError):
                 continue
@@ -493,6 +477,7 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
             "genre_top": genre_top,
             "genre_top_prob": genre_top_prob,
             "lastfm_tags": lastfm_tags,
+            "discovery_source": discovery_source,
         }
     except (MutagenError, OSError) as e:
         logger.debug("Failed to read tags: %s", e)
@@ -625,6 +610,33 @@ def _track_key_of_file(filepath: Path) -> str | None:
     return normalize_track_key(artist, title)
 
 
+def _is_duration_out_of_bounds(duration: int) -> bool:
+    """Tell a duration rejection apart from the other should_reject_track motives."""
+    return bool(
+        (AUDIO_FILTERS.duration_min and duration < AUDIO_FILTERS.duration_min)
+        or (AUDIO_FILTERS.duration_max and duration > AUDIO_FILTERS.duration_max)
+    )
+
+
+def record_rejection(
+    track_db: TrackDB | None,
+    track_key: str | None,
+    verdict: str,
+    reason: str,
+    score: float | None = None,
+) -> None:
+    """
+    Inscrire un rejet au registre pour ne jamais retélécharger ce morceau.
+
+    Sans clé (métadonnées illisibles) il n'y a rien à mémoriser : le
+    morceau repassera par le téléchargement, ce qui est le comportement
+    voulu — on ne condamne pas ce qu'on n'a pas su identifier.
+    """
+    if track_db is None or not track_key:
+        return
+    track_db.record_verdict(track_key, verdict, reason=reason, score=score)
+
+
 def _should_carry_over(
     filepath: Path, taste_score: float, already_carried: int,
 ) -> bool:
@@ -687,7 +699,11 @@ def process_track(
 
     Returns:
         Tuple of (status, playlists_assigned).
-        Status: "uploaded", "rejected", "skipped", or "failed".
+        Status: "uploaded", "rejected_taste", "rejected", "skipped", or
+        "failed". Le rejet de goût a son propre statut : c'est le seul qui
+        juge la couleur du morceau, et le récap l'annonce sous ce libellé.
+        Les autres ("rejected") jugent la configuration du moment ou un
+        signal technique — les additionner mentirait sur ce qu'ils mesurent.
     """
     filename = filepath.name
     logger.info("\n%s", filename)
@@ -739,6 +755,13 @@ def process_track(
     reject, reason = should_reject_track(reject_features)
     if reject:
         logger.info("  Rejected: %s", reason)
+        # Seule la durée est une propriété du morceau lui-même : elle seule
+        # vaut un verdict. Les autres motifs de should_reject_track (mood
+        # désactivé, BPM hors bornes, aucun créneau pour ce mood) jugent la
+        # configuration du moment ; un verdict permanent bannirait à tort un
+        # morceau qui redeviendrait éligible au prochain réglage.
+        if _is_duration_out_of_bounds(duration):
+            record_rejection(track_db, track_key, "filtered_duration", reason)
         filepath.unlink()
         return "rejected", []
 
@@ -751,6 +774,9 @@ def process_track(
         reject_ms, reason_ms = should_reject_multisignal(features)
         if reject_ms:
             logger.info("  Rejected (multi-signal): %s", reason_ms)
+            record_rejection(
+                track_db, track_key, "rejected_multisignal", reason_ms,
+            )
             filepath.unlink()
             return "rejected", []
 
@@ -766,21 +792,23 @@ def process_track(
         if not on_color and not TASTE_FILTER.log_only:
             logger.info("  Rejected: trop éloigné du profil de goût (%.3f < %.3f)",
                         taste_score, TASTE_FILTER.threshold)
+            record_rejection(
+                track_db, track_key, "rejected_taste",
+                f"{taste_score:.2f} < {TASTE_FILTER.threshold:.2f}",
+                taste_score,
+            )
             filepath.unlink()
-            return "rejected", []
+            return "rejected_taste", []
 
     # Assign to daypart playlists. NEW tracks land in HEAVY tier because
     # they're in the grace period (age=0) — full exposure so listeners can
     # actually discover them. They'll be re-tiered after grace_period_days
     # by enforce_tiered_rotation's re-tier pass.
     initial_tier = compute_rotation_tier(play_count=0, age_days=0.0)  # → HEAVY
-    mood_dayparts = get_dayparts_for_mood(mood)
-    tier_dayparts = tier_filter_dayparts(mood_dayparts, initial_tier)
-    assigned_playlists: list[str] = []
-    for segment in tier_dayparts:
-        playlist_name = segment.value
-        if playlist_name in playlists and playlist_name not in assigned_playlists:
-            assigned_playlists.append(playlist_name)
+    assigned_playlists = [
+        name for name in dict.fromkeys(target_playlist_names(mood, initial_tier))
+        if name in playlists
+    ]
 
     if not assigned_playlists:
         logger.warning("  Failed: no playlists found for mood '%s'", mood)
@@ -801,6 +829,7 @@ def process_track(
         track_key = normalize_track_key(artist, title)
         track_db.record_upload(
             track_key, artist, title, file_id, mood, tier=initial_tier,
+            source=features.get("discovery_source") or None,
         )
 
     # Assign to all applicable playlists
@@ -821,6 +850,21 @@ def process_track(
                        "will be reassigned by next rotation pass)", file_id)
         filepath.unlink()
         return "failed", []
+
+
+def is_eviction_frozen(env: dict[str, str] | None = None) -> bool:
+    """
+    L'éviction est-elle gelée pour ce run ?
+
+    `run.sh` pose PIPELINE_NETWORK_DOWN=1 quand le contrôle de connectivité
+    externe a échoué. Vieillir et purger n'a de sens que si le renouvellement
+    fonctionne : sans ce gel, une panne réseau prolongée vide la radio sans
+    que rien ne s'y oppose.
+
+    Toute nouvelle phase de suppression dans enforce_tiered_rotation doit
+    consulter ce drapeau, sinon elle rouvre la brèche.
+    """
+    return (env if env is not None else os.environ).get("PIPELINE_NETWORK_DOWN") == "1"
 
 
 def enforce_tiered_rotation(
@@ -856,6 +900,22 @@ def enforce_tiered_rotation(
     fading_max_pct = ROTATION.fading_max_pct
     min_plays = ROTATION.min_plays_before_delete
 
+    # --- Phase 0 : réconcilier avant toute lecture d'état ---
+    # AzuraCast fait autorité. On retire les fantômes, on enregistre les
+    # fichiers inconnus et on répare les clés ayant dérivé AVANT la synchro
+    # des passages : sync_play_counts matche l'historique par clé, et une
+    # clé encore fausse fait perdre ces passages définitivement (le curseur
+    # last_history_sync avance qu'une ligne ait matché ou non).
+    files = client.get_all_files()
+    settings = get_settings()
+    media_dir = Path(settings.azuracast_media_dir) if settings.azuracast_media_dir else None
+    # reconcile persiste elle-même le rapport, en cumulant sur celui qu'a
+    # déjà écrit download.py plus tôt dans la nuit : cette passe-ci ne trouve
+    # plus rien à corriger, et l'écraser rendrait l'alerte du récap muette.
+    report = reconcile(
+        files, track_db, media_dir=media_dir, report_path=RECONCILE_REPORT_PATH,
+    )
+
     # --- Phase 1: Sync play counts ---
     last_sync = track_db.get_last_sync_timestamp()
     history = client.get_history_since(last_sync)  # returns [] on API error
@@ -863,7 +923,6 @@ def enforce_tiered_rotation(
         track_db.sync_play_counts(history)
 
     # --- Phase 2: Classify tracks into tiers ---
-    files = client.get_all_files()
     current_count = len(files)
     now = time.time()
 
@@ -890,15 +949,14 @@ def enforce_tiered_rotation(
             mood = db_track.get("mood")
             tier_stored = db_track.get("tier") or "DISCOVERY"
         else:
-            # Auto-register untracked files using AzuraCast's uploaded_at
+            # reconcile() vient d'enregistrer tout fichier inconnu : ne peut
+            # rester ici que le cas des fichiers sans métadonnées, qu'on
+            # ne peut pas cléer. Ils traversent la rotation en DISCOVERY.
             uploaded_at = f.get("uploaded_at") or f.get("mtime") or now
             play_count = 0
             track_key = normalize_track_key(artist, title) if artist and title else ""
             mood = None
             tier_stored = "DISCOVERY"
-            # Persist into TrackDB so future runs have accurate data
-            if track_key and file_id:
-                track_db.register_untracked_file(track_key, artist, title, uploaded_at, file_id)
 
         age_days = (now - uploaded_at) / 86400
 
@@ -938,19 +996,63 @@ def enforce_tiered_rotation(
     logger.info("  Expected plays/day: %.2f (measured; config fallback %.2f)",
                 expected_rate, ROTATION_CATEGORIES.expected_plays_per_day)
 
-    # --- Monitor: warn about active tracks with 0 plays after 7+ days ---
+    # Playlist name→id map, shared by the zero-play remediation below and
+    # the GOLD graduation shrink. Non-fatal on failure: both consumers
+    # degrade to their previous warn-only behaviour.
+    playlist_map: dict[str, int] = {}
+    try:
+        playlist_map = client.get_playlists_map()
+    except (ClientError, ServerError, HTTPConnectionError) as e:
+        logger.warning("  Playlist map unavailable (remediation/GOLD shrink skipped): %s", e)
+
+    # --- Monitor: active tracks with 0 plays after 7+ days ---
+    # A track AutoDJ can never pick has two known causes: it lost its
+    # playlist assignment (remediable here), or its play counts don't sync
+    # (metadata key drift — fixed at the normalize_track_key level).
     zero_play_old = [
         e for e in (tiers["CURRENT"] + tiers["FADING"])
         if e["play_count"] == 0 and e["age_days"] > 7
     ]
     if zero_play_old:
-        logger.warning("  ⚠ %s tracks actives > 7j avec 0 plays (possible problème AzuraCast scheduling):", len(zero_play_old))
+        logger.warning("  ⚠ %s tracks actives > 7j avec 0 plays:", len(zero_play_old))
         for e in zero_play_old[:10]:
             logger.warning("    - %s - %s (%.0fj)", e["artist"], e["title"], e["age_days"])
         if len(zero_play_old) > 10:
             logger.warning("    ... et %s autres", len(zero_play_old) - 10)
 
+        # Remediation: re-assert the expected assignment for tracks that
+        # have no playlist at all — those can never be scheduled by AutoDJ.
+        if playlist_map:
+            for e in zero_play_old:
+                if e["playlist_names"] or not e["mood"]:
+                    continue
+                ids = [
+                    playlist_map[name]
+                    for name in target_playlist_names(e["mood"], e["tier_stored"])
+                    if name in playlist_map
+                ]
+                if ids and client.assign_playlists(e["file_id"], ids):
+                    logger.info("    Réassigné (aucune playlist): %s - %s",
+                                e["artist"], e["title"])
+
     deleted_count = 0
+
+    # Une panne réseau gèle l'éviction. Sans ce gel, une coupure prolongée
+    # vide la radio : du 1er au 18 août 2026, 18 nuits sans acquisition ont
+    # laissé la rotation purger seule — 626 morceaux tombés à 333 en une
+    # nuit de rattrapage, dont 31 que Victor avait likés. Le vieillissement
+    # n'est légitime que si le renouvellement fonctionne ; sinon la radio se
+    # mange elle-même. run.sh pose ce drapeau après échec du contrôle de
+    # connectivité. Le re-tiering (phase 6) reste actif : il ne supprime rien.
+    eviction_frozen = is_eviction_frozen()
+    if eviction_frozen:
+        logger.warning(
+            "  ÉVICTION GELÉE : pas de réseau cette nuit, aucune suppression")
+
+    # Plafond dur, indépendant du gel : la bibliothèque ne peut jamais perdre
+    # plus vite qu'elle ne se remplit. C'est lui qui empêche la purge de
+    # rattrapage après une famine — le gel seul ne fait que la reporter.
+    deletion_cap = ROTATION.max_deletions_per_night
 
     # --- Phase 3: EXPIRED (>max_age_days) — graduate to GOLD or delete ---
     # Radio practice: proven, on-color tracks become permanent catalogue
@@ -958,16 +1060,17 @@ def enforce_tiered_rotation(
     gold_cap = int(current_count * ROTATION.gold_max_pct / 100)
     gold_count = len(tiers["GOLD"])
     graduated = 0
-    gold_map: dict[str, int] = {}
-    if tiers["EXPIRED"]:
-        try:
-            gold_map = client.get_playlists_map()
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning("  Playlist map unavailable for GOLD shrink: %s", e)
     # Best candidates graduate first while the cap has room.
-    expired_ranked = sorted(
+    # Gel réseau : on ne fait ni graduation ni suppression, les EXPIRED
+    # attendent la nuit suivante. Leur âge n'a pas de sens quand rien n'entre.
+    expired_ranked = [] if eviction_frozen else sorted(
         tiers["EXPIRED"], key=lambda e: e["play_count"], reverse=True)
     for entry in expired_ranked:
+        # La graduation GOLD ne supprime rien : elle reste permise au-delà du
+        # plafond, seule la suppression s'arrête.
+        if deleted_count >= deletion_cap and gold_count >= gold_cap:
+            logger.info("  Plafond de suppressions atteint (%d) — le reste attend demain", deletion_cap)
+            break
         taste_score = check_taste(entry["track_key"]) if entry["track_key"] else None
         if (
             gold_count < gold_cap
@@ -984,12 +1087,17 @@ def enforce_tiered_rotation(
             )
             # Soft rotation: shrink to LIGHT-style daypart membership.
             mood = entry["mood"]
-            if mood and gold_map:
-                target = tier_filter_dayparts(get_dayparts_for_mood(mood), "GOLD")
-                ids = [gold_map[dp.value] for dp in target if dp.value in gold_map]
+            if mood and playlist_map:
+                ids = [
+                    playlist_map[n]
+                    for n in target_playlist_names(mood, "GOLD")
+                    if n in playlist_map
+                ]
                 if ids:
                     client.assign_playlists(entry["file_id"], ids)
             continue
+        if deleted_count >= deletion_cap:
+            continue        # plafond atteint : ce morceau retente sa chance demain
         if client.delete_file(entry["file_id"]):
             logger.info("  EXPIRED: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
             if entry["track_key"]:
@@ -1000,12 +1108,15 @@ def enforce_tiered_rotation(
 
     # --- Phase 4: Cap FADING to fading_max_pct% of library ---
     fading_max_count = int(max_tracks * fading_max_pct / 100)
-    fading_excess = len(tiers["FADING"]) - fading_max_count
+    fading_excess = 0 if eviction_frozen else len(tiers["FADING"]) - fading_max_count
 
     if fading_excess > 0:
         # Sort by play_count ascending: least-played leave first (failed to get traction)
         fading_sorted = sorted(tiers["FADING"], key=lambda x: x["play_count"], reverse=False)
         for entry in fading_sorted[:fading_excess]:
+            if deleted_count >= deletion_cap:
+                logger.info("  Plafond de suppressions atteint (%d) — cap FADING reporté", deletion_cap)
+                break
             if client.delete_file(entry["file_id"]):
                 logger.info("  FADING cap: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
                 if entry["track_key"]:
@@ -1013,8 +1124,13 @@ def enforce_tiered_rotation(
                 deleted_count += 1
 
     # --- Phase 5: Cap total if library + new > max_tracks ---
-    remaining = current_count - deleted_count + new_tracks_count
-    overflow = max(0, remaining - max_tracks)
+    # new_tracks_count is the *staged* file count, but at most
+    # max_uploads_per_night of them are actually uploaded (quota curation);
+    # capping on the staged count over-deleted on carryover-heavy nights,
+    # leaving the library floating at 680-690 instead of max_tracks.
+    expected_additions = min(new_tracks_count, ROTATION.max_uploads_per_night)
+    remaining = current_count - deleted_count + expected_additions
+    overflow = 0 if eviction_frozen else max(0, remaining - max_tracks)
 
     if overflow > 0:
         # Candidates: CURRENT with plays >= min_plays, oldest first
@@ -1024,6 +1140,9 @@ def enforce_tiered_rotation(
         )
         for entry in candidates:
             if overflow <= 0:
+                break
+            if deleted_count >= deletion_cap:
+                logger.info("  Plafond de suppressions atteint (%d) — overflow reporté", deletion_cap)
                 break
             if client.delete_file(entry["file_id"]):
                 logger.info("  CURRENT overflow: %s - %s (%.0fd, %s plays)", entry['artist'], entry['title'], entry['age_days'], entry['play_count'])
@@ -1065,8 +1184,7 @@ def enforce_tiered_rotation(
                 new_tier = compute_rotation_tier(
                     entry["play_count"], entry["age_days"], expected=expected_rate)
 
-                target_dayparts = tier_filter_dayparts(get_dayparts_for_mood(mood), new_tier)
-                target_names = {dp.value for dp in target_dayparts}
+                target_names = set(target_playlist_names(mood, new_tier))
                 current_names = entry["playlist_names"]
 
                 # Only push the membership update if the set actually differs.
@@ -1246,6 +1364,12 @@ def _main_inner(
     logger.info("Existing files: %s", len(existing))
 
     # Enforce tiered rotation ALWAYS (even with 0 new files)
+    # Initialisé avant le try : une rotation en échec laissait la variable
+    # non liée, et la persistance des stats plus bas levait un
+    # UnboundLocalError hors du seul OSError qu'elle rattrape. classify
+    # sortait alors en erreur, run.sh coupait la nuit, et le récap — donc
+    # la seule preuve que tout s'est bien passé — n'était jamais envoyé.
+    rotation_deleted = 0
     try:
         pending_keys = {k for k in (_track_key_of_file(f) for f in files) if k}
         rotation_deleted = enforce_tiered_rotation(
@@ -1253,6 +1377,11 @@ def _main_inner(
     except (ClientError, ServerError, HTTPConnectionError) as e:
         logger.warning("Rotation check failed: %s", e)
         # Continue anyway - rotation is not critical
+    except LibraryStateError as e:
+        # La liste AzuraCast n'est pas crédible : rien n'a été touché en base.
+        # On saute la rotation (et le prune CLAP qu'elle déclenche), mais les
+        # uploads de la nuit doivent aboutir — ils ne dépendent pas d'elle.
+        logger.warning("Rotation sautée, état de librairie douteux : %s", e)
 
     # Refresh existing track keys after rotation
     try:
@@ -1268,6 +1397,13 @@ def _main_inner(
     # Initialize stats
     results: dict[str, int] = {
         "uploaded": 0,
+        # Deux motifs de rejet, jamais confondus : `rejected_taste` juge la
+        # couleur du morceau (c'est lui, et lui seul, que le récap annonce
+        # « hors couleur »), `rejected_other` couvre le mood désactivé, le
+        # BPM hors bornes, l'absence de créneau, la durée et le filtre
+        # multi-signal. `rejected` reste leur somme, pour compatibilité.
+        "rejected_taste": 0,
+        "rejected_other": 0,
         "rejected": 0,
         "skipped": 0,
         "failed": 0,
@@ -1292,6 +1428,8 @@ def _main_inner(
                 results["carryover"] += 1  # stays in place for next night
                 continue
             if track_key:
+                # Pas de verdict ici : l'éviction par quota juge le calendrier,
+                # pas le morceau. Le cooldown suffit à éviter le rebond.
                 track_db.record_deletion(track_key)  # cooldown: no re-download
             filepath.unlink()
             results["quota"] += 1
@@ -1299,16 +1437,22 @@ def _main_inner(
         status, assigned_playlists = process_track(
             filepath, client, playlists, existing, track_db
         )
-        results[status] += 1
+        results["rejected_other" if status == "rejected" else status] += 1
 
         # Count assignments per playlist
         for pl in assigned_playlists:
             playlist_counts[pl] = playlist_counts.get(pl, 0) + 1
 
+    # `rejected` n'est plus incrémenté nulle part : c'est la somme des deux
+    # motifs, conservée pour tout lecteur historique du fichier de stats.
+    results["rejected"] = results["rejected_taste"] + results["rejected_other"]
+
     # Print results
     logger.info("\n=== Results ===")
     logger.info("  Uploaded: %s", results['uploaded'])
-    logger.info("  Rejected: %s", results['rejected'])
+    logger.info("  Rejected: %s (hors couleur %s, autres motifs %s)",
+                results['rejected'], results['rejected_taste'],
+                results['rejected_other'])
     logger.info("  Skipped: %s", results['skipped'])
     logger.info("  Failed: %s", results['failed'])
     if results["quota"]:

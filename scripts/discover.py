@@ -52,6 +52,7 @@ try:
         TASTE_DISCOVERY_SEEDS_PER_RUN,
         TASTE_DISCOVERY_SIMILAR_PER_SEED,
         TASTE_DISCOVERY_TRACKS_PER_ARTIST,
+        source_priority,
     )
 except ImportError as e:
     print(f"Error: config.py missing discovery fields: {e}")
@@ -132,15 +133,55 @@ def _build_sources() -> list[DiscoverySource]:
 
 
 def _dedupe_and_cap(tracks: list[Track], cap: int) -> list[Track]:
+    """
+    Déduplique et plafonne en servant les sources en tourniquet.
+
+    L'ordre d'ajout faisait office de priorité : HypeMachine, ajoutée en
+    premier avec 50 morceaux, saturait à elle seule le cap de 30. Mesuré le
+    2026-08-19 — les 30 candidats retenus étaient hypem à 100 %. Les blogs
+    RSS, PersonalArtists et surtout les picks manuels de Victor étaient
+    calculés chaque nuit puis jetés sans jamais atteindre le téléchargement,
+    et SOURCE_PRIORITY, appliqué plus loin dans download.py, opérait sur une
+    liste déjà homogène : il était inerte.
+
+    Trier simplement par priorité ne réglerait rien — PersonalArtists et ses
+    116 candidats prendraient toutes les places à la place de HypeMachine.
+    Le tourniquet, lui, garantit que chaque source est représentée : on sert
+    un morceau par source à tour de rôle, dans l'ordre de SOURCE_PRIORITY,
+    jusqu'au cap. Une source pauvre (un pick manuel) passe donc en entier,
+    une source riche ne peut plus monopoliser.
+
+    En cas de doublon entre sources, la mieux classée l'emporte : elle est
+    servie la première.
+    """
+    buckets: dict[str, list[Track]] = {}
+    for t in tracks:
+        buckets.setdefault(t.get("source") or "", []).append(t)
+
+    # sorted() est stable : à priorité égale, l'ordre d'ajout des sources
+    # reste celui de discover.py.
+    ordre = sorted(buckets, key=source_priority)
+    curseurs = dict.fromkeys(ordre, 0)
+
     seen: set[str] = set()
     out: list[Track] = []
-    for t in tracks:
-        key = _normalize_key(t["artist"], t["title"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(t)
-        if len(out) >= cap:
+    while len(out) < cap:
+        servi = False
+        for source in ordre:
+            if len(out) >= cap:
+                break
+            bucket = buckets[source]
+            while curseurs[source] < len(bucket):
+                t = bucket[curseurs[source]]
+                curseurs[source] += 1
+                key = _normalize_key(t["artist"], t["title"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(t)
+                servi = True
+                break
+        if not servi:      # toutes les sources sont épuisées
             break
     return out
 

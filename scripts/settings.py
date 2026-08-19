@@ -76,6 +76,13 @@ class Settings(BaseSettings):
         description="WhatsApp phone number (+33...) for the daily recap",
     )
 
+    # AzuraCast media directory, for the read-only consistency check
+    # (library_state.count_media_files). Optional: if unset, the check is skipped.
+    azuracast_media_dir: str | None = Field(
+        default=None,
+        description="Path to the AzuraCast media directory (read-only consistency check)",
+    )
+
     # Pipeline settings
     http_timeout: int = Field(
         default=30,

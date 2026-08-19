@@ -35,10 +35,10 @@ try:
         MoodCategory,
         DaypartSegment,
         DAYPARTS,
+        ROTATION_CATEGORIES,
         get_enabled_dayparts,
-        get_all_playlist_names,
-        get_dayparts_for_mood,
     )
+    from track_db import TrackDB, normalize_track_key
 except ImportError as e:
     print(f"Error: config.py not found or invalid: {e}")
     sys.exit(1)
@@ -100,6 +100,18 @@ class PlaylistManager(AzuraCastClient):
             logger.error(f"Failed to create playlist '{name}': {e}")
             return None
 
+    def update_playlist_weight(self, playlist_id: int, weight: int) -> bool:
+        """Update an existing playlist's rotation weight."""
+        try:
+            response = self.put(
+                f"/api/station/{self.station_id}/playlist/{playlist_id}",
+                json={"weight": weight},
+            )
+            return response.status_code == 200
+        except (ClientError, ServerError, HTTPConnectionError) as e:
+            logger.warning(f"Failed to update playlist {playlist_id} weight: {e}")
+            return False
+
     def delete_playlist(self, playlist_id: int) -> bool:
         """
         Delete a playlist.
@@ -115,28 +127,6 @@ class PlaylistManager(AzuraCastClient):
             return response.status_code in (200, 204)
         except (ClientError, ServerError, HTTPConnectionError) as e:
             logger.warning(f"Failed to delete playlist {playlist_id}: {e}")
-            return False
-
-    def get_file_metadata(self, file_id: int) -> dict[str, Any] | None:
-        """Get file metadata including custom fields."""
-        try:
-            response = self.get(f"/api/station/{self.station_id}/file/{file_id}")
-            if response.status_code == 200:
-                return response.json()
-            return None
-        except (ClientError, ServerError, HTTPConnectionError):
-            return None
-
-    def assign_file_to_playlists(self, file_id: int, playlist_ids: list[int]) -> bool:
-        """Assign a file to multiple playlists."""
-        try:
-            response = self.put(
-                f"/api/station/{self.station_id}/file/{file_id}",
-                json={"playlists": playlist_ids},
-            )
-            return response.status_code == 200
-        except (ClientError, ServerError, HTTPConnectionError) as e:
-            logger.warning(f"Failed to assign file {file_id} to playlists: {e}")
             return False
 
 
@@ -322,45 +312,56 @@ def create_all_playlists(
     """
     logger.info("\n=== Creating Playlists ===")
 
-    all_names = get_all_playlist_names()
     created = 0
     skipped = 0
 
     playlist_map = dict(existing_playlists)
 
+    # Two variants per daypart, same schedule, different weights:
+    #   "<Zone>"           (Library)   ← MEDIUM/LIGHT/GOLD, poids faible
+    #   "<Zone>-Discovery" (Discovery) ← FRESH + HEAVY, poids fort
+    variants: list[tuple[str, DaypartSegment, int]] = []
     for daypart in get_enabled_dayparts():
-        name = daypart.value
+        variants.append((daypart.value, daypart, ROTATION_CATEGORIES.library_weight))
+        variants.append((
+            f"{daypart.value}{ROTATION_CATEGORIES.discovery_suffix}",
+            daypart,
+            ROTATION_CATEGORIES.discovery_weight,
+        ))
 
+    for name, daypart, weight in variants:
         if name in playlist_map:
-            logger.info(f"  {name}: exists (ID {playlist_map[name]})")
+            logger.info(f"  {name}: exists (ID {playlist_map[name]}) — syncing weight={weight}")
             skipped += 1
+            if not dry_run:
+                client.update_playlist_weight(playlist_map[name], weight)
             continue
 
         if dry_run:
-            logger.info(f"  {name}: [DRY-RUN] would create")
+            logger.info(f"  {name}: [DRY-RUN] would create (weight={weight})")
+            playlist_map[name] = -1  # placeholder so the assignment preview sees it
             created += 1
             continue
 
         # Get schedule configuration (covers all 7 days)
         schedule = get_schedule_for_daypart(daypart)
 
-        # Create playlist with schedule
         result = client.create_playlist(
             name=name,
             type_="default",
-            weight=3,
+            weight=weight,
             schedule_items=schedule,
         )
 
         if result:
             playlist_id = result.get("id")
             playlist_map[name] = playlist_id
-            logger.info(f"  {name}: created (ID {playlist_id})")
+            logger.info(f"  {name}: created (ID {playlist_id}, weight={weight})")
             created += 1
         else:
             logger.error(f"  {name}: FAILED to create")
 
-    logger.info(f"\nCreated: {created} | Skipped: {skipped}")
+    logger.info(f"\nCreated: {created} | Existing: {skipped}")
     return playlist_map
 
 
@@ -418,11 +419,18 @@ def assign_tracks_to_playlists(
     """
     import shutil
 
+    from classify import target_playlist_names
+
     logger.info("\n=== Assigning Tracks to Playlists ===")
 
     if not files:
         logger.info("No tracks to assign")
         return
+
+    # Tier par morceau depuis la DB de rotation. Un fichier inconnu de la
+    # DB part en Library (MEDIUM) : conservateur, le re-tier nocturne de
+    # classify.py corrigera si besoin.
+    track_db = TrackDB(Path(__file__).parent.parent / "data" / "tracks.db")
 
     # Create temp directory
     temp_dir = Path(__file__).parent.parent / "temp_playlist_setup"
@@ -441,7 +449,16 @@ def assign_tracks_to_playlists(
             # First try to get mood from API response
             mood = get_mood_from_file(file_info)
 
-            # If not in API, download and read ID3 tags
+            # Then the rotation DB (populated at upload since v2)
+            if not mood:
+                row = track_db.conn.execute(
+                    "SELECT mood FROM tracks WHERE track_key = ? AND deleted_at IS NULL",
+                    (normalize_track_key(artist, title),),
+                ).fetchone()
+                if row and row["mood"]:
+                    mood = row["mood"]
+
+            # Last resort: download and read ID3 tags
             if not mood and not dry_run:
                 logger.info(f"  [{i}/{len(files)}] {artist} - {title}: downloading to read tags...")
                 mood = download_and_get_mood(client, file_info, temp_dir)
@@ -459,13 +476,13 @@ def assign_tracks_to_playlists(
                 failed += 1
                 continue
 
-            # Find all playlists for this mood
-            assigned_playlists: list[str] = []
-
-            for segment in get_dayparts_for_mood(mood_cat):
-                playlist_name = segment.value
-                if playlist_name in playlist_map and playlist_name not in assigned_playlists:
-                    assigned_playlists.append(playlist_name)
+            # Tier from rotation DB → same playlist targets as the nightly
+            # pipeline (classify.target_playlist_names).
+            tier = track_db.get_tier(normalize_track_key(artist, title)) or "MEDIUM"
+            assigned_playlists = [
+                name for name in dict.fromkeys(target_playlist_names(mood_cat, tier))
+                if name in playlist_map
+            ]
 
             if not assigned_playlists:
                 logger.warning(f"  [{i}/{len(files)}] {artist} - {title}: no playlists for mood '{mood}'")
@@ -480,7 +497,7 @@ def assign_tracks_to_playlists(
 
             playlist_ids = [playlist_map[name] for name in assigned_playlists]
 
-            if client.assign_file_to_playlists(file_id, playlist_ids):
+            if client.assign_playlists(file_id, playlist_ids):
                 logger.info(f"  [{i}/{len(files)}] {artist} - {title} ({mood}): -> {len(assigned_playlists)} playlists")
                 assigned += 1
             else:
@@ -488,6 +505,7 @@ def assign_tracks_to_playlists(
                 failed += 1
 
     finally:
+        track_db.close()
         # Cleanup temp directory
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
