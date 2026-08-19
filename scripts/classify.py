@@ -429,6 +429,7 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
         genre_top = ""
         genre_top_prob = 0.0
         lastfm_tags = ""
+        discovery_source = ""
 
         # Read TXXX frames (custom tags)
         for frame in tags.getall("TXXX"):
@@ -456,6 +457,8 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
                     genre_top_prob = float(value)
                 elif desc == "LASTFM_TAGS":
                     lastfm_tags = value
+                elif desc == "DISCOVERY_SOURCE":
+                    discovery_source = value
 
             except (ValueError, IndexError):
                 continue
@@ -474,6 +477,7 @@ def get_features_from_tags(filepath: str) -> TrackFeatures | None:
             "genre_top": genre_top,
             "genre_top_prob": genre_top_prob,
             "lastfm_tags": lastfm_tags,
+            "discovery_source": discovery_source,
         }
     except (MutagenError, OSError) as e:
         logger.debug("Failed to read tags: %s", e)
@@ -825,6 +829,7 @@ def process_track(
         track_key = normalize_track_key(artist, title)
         track_db.record_upload(
             track_key, artist, title, file_id, mood, tier=initial_tier,
+            source=features.get("discovery_source") or None,
         )
 
     # Assign to all applicable playlists

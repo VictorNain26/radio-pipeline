@@ -766,6 +766,7 @@ def write_id3_tags(
     cover_path: Path | None = None,
     has_lastfm_tags: bool = False,
     lastfm_tags_str: str = "",
+    discovery_source: str = "",
 ) -> bool:
     """
     Write ID3 tags using mutagen.
@@ -815,6 +816,20 @@ def write_id3_tags(
                 type=3,
                 desc='Cover',
                 data=cover_data
+            ))
+
+        # Provenance : la source de découverte était calculée chaque nuit puis
+        # jetée après le tri de prefilter_candidates. Sans elle, impossible de
+        # savoir laquelle produit les morceaux que Victor like — donc impossible
+        # de donner à SOURCE_PRIORITY des valeurs mesurées plutôt que devinées.
+        # Elle voyage dans le fichier comme le mood : écrite ici, relue par
+        # classify.py au moment de l'upload.
+        audio.delall('TXXX:DISCOVERY_SOURCE')
+        if discovery_source:
+            audio.add(TXXX(
+                encoding=3,
+                desc='DISCOVERY_SOURCE',
+                text=[discovery_source]
             ))
 
         # Add HAS_LASTFM_TAGS flag for aggressive filter in classify.py
@@ -1134,7 +1149,8 @@ def download_track(
             logger.info("  Cover: iTunes fallback OK")
 
     # Write ID3 tags (including Last.fm tags for multi-signal filter)
-    if write_id3_tags(final_path, artist, title, cover_path, has_lastfm_tags, lastfm_tags_str):
+    if write_id3_tags(final_path, artist, title, cover_path, has_lastfm_tags,
+                      lastfm_tags_str, track.get("source", "")):
         logger.info("  Tags: artist=%s, title=%s", artist, title)
         if not has_lastfm_tags:
             logger.debug("  Note: No Last.fm tags (will use audio analysis for filtering)")

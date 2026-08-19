@@ -80,7 +80,12 @@ class TrackDB:
                 -- config.ROTATION_CATEGORIES). New tracks start HEAVY
                 -- (grace period); enforce_tiered_rotation re-tiers them
                 -- up or down on every run based on age and play rate.
-                tier TEXT DEFAULT 'DISCOVERY'
+                tier TEXT DEFAULT 'DISCOVERY',
+                -- Source de découverte (hypem, personal, manual, un label de
+                -- flux RSS...). Elle était calculée chaque nuit puis jetée :
+                -- sans elle, impossible de croiser les likes avec l'origine, et
+                -- donc de donner à SOURCE_PRIORITY des valeurs mesurées.
+                source TEXT
             );
 
             -- Idempotent migration : on existing DBs, ensure the new column
@@ -117,6 +122,8 @@ class TrackDB:
             cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(tracks)").fetchall()}
             if "tier" not in cols:
                 self.conn.execute("ALTER TABLE tracks ADD COLUMN tier TEXT DEFAULT 'DISCOVERY'")
+            if "source" not in cols:
+                self.conn.execute("ALTER TABLE tracks ADD COLUMN source TEXT")
         except sqlite3.OperationalError:
             pass
         self.conn.commit()
@@ -275,21 +282,25 @@ class TrackDB:
     def record_upload(
         self, track_key: str, artist: str, title: str, file_id: int,
         mood: str | None = None, tier: str = "DISCOVERY",
+        source: str | None = None,
     ) -> None:
         """Record a track upload (or re-upload)."""
         now = time.time()
         self.conn.execute(
             """INSERT INTO tracks (track_key, artist, title, uploaded_at, deleted_at,
-                                   azuracast_file_id, play_count, mood, tier)
-               VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?)
+                                   azuracast_file_id, play_count, mood, tier, source)
+               VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?, ?)
                ON CONFLICT(track_key) DO UPDATE SET
                    uploaded_at = excluded.uploaded_at,
                    deleted_at = NULL,
                    azuracast_file_id = excluded.azuracast_file_id,
                    play_count = 0,
                    mood = excluded.mood,
-                   tier = excluded.tier""",
-            (track_key, artist, title, now, file_id, mood, tier),
+                   tier = excluded.tier,
+                   -- Un ré-upload sans provenance (réanalyse, backfill) ne doit
+                   -- pas effacer une origine déjà connue.
+                   source = COALESCE(excluded.source, tracks.source)""",
+            (track_key, artist, title, now, file_id, mood, tier, source),
         )
         # A track that goes live is not a rejection
         self.conn.execute("DELETE FROM verdicts WHERE track_key = ?", (track_key,))
